@@ -249,3 +249,6 @@ iconutil -c icns "$ICONSET_DIR" -o swift/Sources/BooksBridgeApp/Icons/AppIcon.ic
 `ReadingRangeTests` 覆盖当前章前缀、跨章页、重复锚点失败、三档权限、读取工具越界、历史预算和切书识别。
 `WebRenderingTests` 使用原生 WKWebView 验证 Markdown、危险链接清理、范围锁定、摘要确认取消、检测清空和 API 检测请求。
 真实书库集成测试需要进程自己的系统权限；普通 `swift test` 中跳过，不应将终端继承权限当作应用授权验证。
+
+`ReadingAssistantTests` 使用受控异步处理器验证：取消页面观察、切书、重复启动、跨书结果隔离和重启后的中断状态。
+分页容器坐标回归使用真实异常坐标；实机应通过签名应用里的「检查原文范围」验证，而非终端 AX 权限。

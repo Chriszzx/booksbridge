@@ -1001,3 +1001,5 @@ dialog { max-width: 440px; border: 1px solid var(--border); border-radius: 16px;
 dialog::backdrop { background: #0005; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
 @media (max-width: 800px) { :root { --side-w: 210px; } .composer-model { max-width: 100px; } .thread { padding: 18px; } }
+
+#preparation-jobs { white-space: pre-line; max-height: 160px; overflow-y: auto; }

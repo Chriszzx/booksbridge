@@ -1,5 +1,5 @@
 import XCTest
-import BooksBridgeCore
+@testable import BooksBridgeCore
 @testable import BooksBridgeLLM
 
 final class ReadingRangeTests: XCTestCase {
@@ -11,6 +11,14 @@ final class ReadingRangeTests: XCTestCase {
          .init(spineIndex: 2, href: "two", text: "本章前面已经读过的情节。\n" + page + "\n" + secret),
          .init(spineIndex: 3, href: "three", text: "最后一章结局。")]
     }
+    func testPaginatedWebAreaOutsideWindowStillUsesWindowViewport() {
+        let window = CGRect(x: 207, y: 118, width: 1024, height: 768)
+        let paginated = CGRect(x: -19537, y: 202, width: 906, height: 564)
+        XCTAssertEqual(AccessibilityReader.readingViewport(reader: paginated, window: window), window)
+        let ordinary = CGRect(x: 252, y: 190, width: 424, height: 564)
+        XCTAssertEqual(AccessibilityReader.readingViewport(reader: ordinary, window: window), ordinary)
+    }
+
     func testProgressIncludesCurrentChapterPrefixButNeverSuffix() throws {
         let reading = try ScopedReading.resolve(chapters: chapters(), current: 0, scope: .upToProgress, visible: [page])
         XCTAssertEqual(reading.currentChapter, 1, "实时页面优先于旧CFI")

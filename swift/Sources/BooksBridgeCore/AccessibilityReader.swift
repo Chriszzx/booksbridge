@@ -127,10 +127,9 @@ public struct AccessibilityReader: Sendable {
         if let windowFrame = frame(window) {
             for reader in readers {
                 guard let box = frame(reader) else { continue }
-                let viewport = box.intersection(windowFrame)
-                guard !viewport.isNull, viewport.width > 20, viewport.height > 20 else { continue }
+                let effectiveViewport = Self.readingViewport(reader: box, window: windowFrame)
                 walk(reader, depth: 0, titles: &titles, texts: &texts,
-                    selectionInfo: &selectionInfo, counter: counter, viewport: viewport)
+                    selectionInfo: &selectionInfo, counter: counter, viewport: effectiveViewport)
             }
         }
 
@@ -138,7 +137,7 @@ public struct AccessibilityReader: Sendable {
 
         return Snapshot(
             windowTitles: titles,
-            visibleText: counter.incomplete ? [] : texts,
+            visibleText: texts,
             selection: (selection?.isEmpty ?? true) ? nil : selection,
             selectionNodeText: selectionInfo?.nodeText,
             selectionRange: selectionInfo?.range,
@@ -192,7 +191,13 @@ public struct AccessibilityReader: Sendable {
                             visible.location >= 0, visible.length > 0,
                             visible.location + visible.length <= (value as NSString).length {
                         texts.append((value as NSString).substring(with: visible))
-                    } else { counter.incomplete = true }
+                    } else {
+                        // WebKit often exposes an entire paragraph across several pages.
+                        // Query range geometry rather than rejecting the complete snapshot.
+                        var budget = 512
+                        texts.append(contentsOf: visibleFragments(element, value: value,
+                            viewport: viewport, budget: &budget))
+                    }
                 }
             }
         default:
@@ -222,6 +227,46 @@ public struct AccessibilityReader: Sendable {
                 counter: counter, viewport: viewport
             )
         }
+    }
+
+    /// Books' paginated WebKit container may sit thousands of points offscreen,
+    /// while its descendant text uses correct screen coordinates. Never discard
+    /// those descendants based solely on the container frame.
+    static func readingViewport(reader: CGRect, window: CGRect) -> CGRect {
+        let intersection = reader.intersection(window)
+        return !intersection.isNull && intersection.width > 20 && intersection.height > 20 ? intersection : window
+    }
+
+    private func visibleFragments(_ element: AXUIElement, value: String,
+                                  viewport: CGRect, budget: inout Int) -> [String] {
+        let source = value as NSString
+        var ranges: [NSRange] = []
+        func visit(_ range: NSRange) {
+            guard range.length > 0, budget > 0 else { return }
+            budget -= 1
+            var cfRange = CFRange(location: range.location, length: range.length)
+            guard let parameter = AXValueCreate(.cfRange, &cfRange) else { return }
+            var result: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(element, "AXBoundsForRange" as CFString,
+                parameter, &result) == .success, let result,
+                CFGetTypeID(result) == AXValueGetTypeID() else { return }
+            var bounds = CGRect.zero
+            guard AXValueGetValue(result as! AXValue, .cgRect, &bounds) else { return }
+            let height = NSScreen.screens.first?.frame.height ?? 0
+            bounds.origin.y = height - bounds.maxY
+            guard !bounds.isEmpty, viewport.intersects(bounds) else { return }
+            if viewport.contains(bounds) {
+                if let last = ranges.last, NSMaxRange(last) == range.location {
+                    ranges[ranges.count - 1].length += range.length
+                } else { ranges.append(range) }
+            } else if range.length > 1 {
+                let half = range.length / 2
+                visit(NSRange(location: range.location, length: half))
+                visit(NSRange(location: range.location + half, length: range.length - half))
+            }
+        }
+        visit(NSRange(location: 0, length: source.length))
+        return ranges.map { source.substring(with: $0) }.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
     private func readerElements(_ element: AXUIElement, depth: Int = 0) -> [AXUIElement] {

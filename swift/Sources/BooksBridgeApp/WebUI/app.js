@@ -726,6 +726,7 @@
     if (key === renderedConversationKey) return;
     renderedConversationKey = key;
     chatState.streaming = false;
+    document.getElementById("reading-check-result").textContent = "";
     chatState.preparation = ""; chatState.preparationReady = false; chatState.preparationFailed = false;
     renderComposerState();
     renderScopePicker();
@@ -776,6 +777,10 @@
       // 问答事件（流式增量等）
       if (payload.chatEvent) handleChatEvent(payload.chatEvent);
 
+      if (payload.readingCheck) document.getElementById("reading-check-result").textContent = payload.readingCheck;
+      if (payload.preparationJobs) {
+        document.getElementById("preparation-jobs").textContent = payload.preparationJobs.map(job => `${job.title}：${job.status}`).join("\n");
+      }
       // 预处理状态
       if (payload.assistant) {
         chatState.preparation = payload.assistant.preparation ?? "";
@@ -944,6 +949,10 @@
     document.getElementById("prepare-confirm").close(); invoke("reprocessBook", { confirmed: true });
   });
   document.getElementById("prepare-no").addEventListener("click", () => document.getElementById("prepare-confirm").close());
+  document.getElementById("reading-check").addEventListener("click", () => {
+    document.getElementById("reading-check-result").textContent = "正在检查本地正文与当前页…";
+    invoke("checkReading", { scope: state.active?.scope || chatState.scope });
+  });
   document.getElementById("prep-cancel").addEventListener("click", () => invoke("cancelPreparation"));
   document.getElementById("prep-clear").addEventListener("click", () => invoke("clearKnowledge"));
   let apiRequestID = "";

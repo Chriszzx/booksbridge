@@ -92,7 +92,7 @@ public enum HTMLText {
         "nbsp": "\u{00A0}", "ensp": "\u{2002}", "emsp": "\u{2003}",
         "thinsp": "\u{2009}", "shy": "", "zwnj": "\u{200C}", "zwj": "\u{200D}",
         "hellip": "…", "mdash": "—", "ndash": "–", "minus": "−",
-        "lsquo": "'", "rsquo": "'", "ldquo": "\u{201C}", "rdquo": "\u{201D}",
+        "lsquo": "\u{2018}", "rsquo": "\u{2019}", "ldquo": "\u{201C}", "rdquo": "\u{201D}",
         "sbquo": "‚", "bdquo": "„", "laquo": "«", "raquo": "»",
         "dagger": "†", "Dagger": "‡", "bull": "•", "middot": "·",
         "times": "×", "divide": "÷", "plusmn": "±", "deg": "°",

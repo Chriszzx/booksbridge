@@ -5,6 +5,59 @@ import BooksBridgeLLM
 
 @MainActor
 final class ReadingAssistantTests: XCTestCase {
+    private actor SummaryGate {
+        var started = false
+        var resume: CheckedContinuation<Void, Never>?
+        func wait() async {
+            started = true
+            await withCheckedContinuation { resume = $0 }
+        }
+        func release() { resume?.resume(); resume = nil }
+    }
+
+    func testSummarySurvivesObserverCancellationAndOtherBookNavigation() async throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let directory = root.appendingPathComponent("cache")
+        let assistant = ReadingAssistant(settings: AppSettings(), apiKey: "test", knowledgeDirectory: directory)
+        let gate = SummaryGate()
+        assistant.processOverride = { book, epub, progress in
+            progress(.started(chunkCount: 4))
+            await gate.wait()
+            try Task.checkCancellation()
+            return BookKnowledge(readme: "完成的摘要", contentHash: BookPreprocessor.contentHash(of: BookPreprocessor.extractChapters(epub: epub)),
+                model: "test", characterCount: 800, chapterCount: 2, chunkCount: 4, promptTokens: 0, completionTokens: 0)
+        }
+        let stream = assistant.open(book: book(root), currentCFI: nil, forceReprocess: true)
+        let observer = Task { for await _ in stream {} }
+        for _ in 0..<200 {
+            if await gate.started { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let started = await gate.started
+        XCTAssertTrue(started)
+        observer.cancel()
+        assistant.cancelAnswer()
+        for await _ in assistant.open(book: book(root, id: "B"), currentCFI: nil) {}
+        if case .processing = assistant.preparationState(assetID: "A") {} else { XCTFail("切换页面不能取消摘要") }
+        let restarted = ReadingAssistant(settings: AppSettings(), apiKey: "", knowledgeDirectory: directory)
+        if case .failed(let reason) = restarted.preparationState(assetID: "A") {
+            XCTAssertTrue(reason.contains("中断"))
+        } else { XCTFail("重启必须报告未完成任务") }
+        // Repeated requests must attach to the existing job instead of paying twice.
+        for await _ in assistant.open(book: book(root), currentCFI: nil, forceReprocess: true) {}
+        await gate.release()
+        for _ in 0..<200 {
+            if case .ready = assistant.preparationState(assetID: "A") { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        if case .ready = assistant.preparationState(assetID: "A") {} else { XCTFail("脱离页面后仍应完成") }
+        XCTAssertEqual(assistant.currentBook?.assetID, "B")
+        XCTAssertNil(assistant.currentKnowledge, "A 的摘要不能写入 B")
+        for await _ in assistant.open(book: book(root), currentCFI: nil) {}
+        XCTAssertEqual(assistant.currentKnowledge?.readme, "完成的摘要")
+    }
+
     func testAppCanCancelAnswerBeforeFirstBookOrLaunchSettings() {
         let app = AppDelegate()
         app.cancelPendingAnswer()

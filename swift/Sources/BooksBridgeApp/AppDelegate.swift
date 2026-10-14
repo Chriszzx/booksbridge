@@ -463,14 +463,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 prepareBook(assetID: active.assetID, force: true)
             }
 
+        case "checkReading":
+            checkReading(invocation.payload)
         case "cancelPreparation":
-            assistant.cancelPreparation()
-            handleAssistantEvent(.preparationChanged(.idle))
+            assistant.cancelPreparation(assetID: store.state.lastActive?.assetID)
         case "clearKnowledge":
             if let active = store.state.lastActive {
                 Task { @MainActor in
                     await assistant.clearKnowledge(assetID: active.assetID)
-                    handleAssistantEvent(.preparationChanged(.idle))
+                    if store.state.lastActive?.assetID == active.assetID { handleAssistantEvent(.preparationChanged(.idle)) }
                 }
             }
         case "testAPI":
@@ -637,8 +638,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let cfi = (try? booksStore.readingPosition(assetID: assetID))?.cfi
 
-        answerStream?.cancel()
-        answerStream = Task { @MainActor [weak self] in
+        assistant.onPreparationChanged = { [weak self] id, state in
+            guard let self else { return }
+            self.bridge.push(["preparationJobs": self.assistant.preparationStatuses])
+            guard self.store.state.lastActive?.assetID == id else { return }
+            self.handleAssistantEvent(.preparationChanged(state))
+        }
+        Task { @MainActor [weak self] in
             guard let self else { return }
             let stream = self.assistant.open(book: book, currentCFI: cfi, forceReprocess: force)
             for await event in stream {
@@ -672,6 +678,37 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled, generation == self.apiTestGeneration else { return }
                 self.bridge.push(["apiTest": ["requestID": requestID, "text": "检测失败：\(error)"]])
             }
+        }
+    }
+
+    /// Local dry run uses the application's own permissions and never calls the API.
+    private func checkReading(_ payload: [String: Any]) {
+        guard let active = store.state.lastActive else { return }
+        let scope = active.conversationID.flatMap { store.conversation(assetID: active.assetID, conversationID: $0)?.scope }
+            ?? (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? .upToProgress
+        Task { @MainActor in
+            let result: String
+            do {
+                let assetID = active.assetID
+                result = try await Task.detached {
+                    let source = BooksStore()
+                    guard let book = try source.book(assetID: assetID), let path = book.path else { throw ReadingAssistant.AssistantError.noLocalFile }
+                    let epub = try EpubDocument(root: URL(fileURLWithPath: path))
+                    let chapters = BookPreprocessor.extractChapters(epub: epub)
+                    let cfi = try source.readingPosition(assetID: assetID)?.cfi
+                    let context = ReadingCoordinator().makeContext()
+                    let visible = context?.book.assetID == assetID ? context?.visibleText ?? [] : []
+                    let current = ReadingAssistant.locateChapter(cfi: cfi, epub: epub, chapters: chapters)
+                    do {
+                        let reading = try ScopedReading.resolve(chapters: chapters, current: current, scope: scope, visible: visible)
+                        return "原文可读取 · \(reading.chapters.count) 章 · \(reading.chapters.reduce(0) { $0 + $1.text.count }) 字 · 当前页 \(visible.reduce(0) { $0 + $1.count }) 字（本地检查，未调用 API）。范围末尾：\(reading.chapters.last.map { String($0.text.suffix(36)) } ?? "")"
+                    } catch {
+                        return "\(error)（本地正文 \(chapters.count) 章；可见片段 \(visible.count) 段 / \(visible.reduce(0) { $0 + $1.count }) 字）"
+                    }
+                }.value
+            } catch { result = "检查失败：\(error)" }
+            guard self.store.state.lastActive?.assetID == active.assetID else { return }
+            self.bridge.push(["readingCheck": result])
         }
     }
 
@@ -1014,7 +1051,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             "书库本数": String(store.state.books.count),
         ]
 
-        var body: [String: Any] = ["message": message, "facts": facts]
+        var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": assistant.preparationStatuses]
+        if let active = store.state.lastActive {
+            let preparation = assistant.preparationState(assetID: active.assetID)
+            body["assistant"] = ["preparation": preparation.label, "ready": isPreparationReady(preparation)]
+        }
 
         body["detected"] = NSNull()
         // --- detected：实时检测，不落盘 ---

@@ -5,7 +5,7 @@ import Foundation
 /// 阅读问答的编排层。
 ///
 /// 职责：
-/// 1. 打开一本书时后台做一次预处理（把整本书压缩成「书籍说明」），带缓存与去重
+/// 1. 打开书只读取本地正文；用户确认后，按书籍运行独立的后台摘要任务
 /// 2. 提问时按范围组装上下文、拼接提示词、流式取回答案
 ///
 /// 刻意不做的事：不碰 UI、不碰持久化以外的存储。
@@ -13,10 +13,11 @@ import Foundation
 @MainActor
 public final class ReadingAssistant {
     /// 预处理状态，用于在界面上显示进度。
-    public enum PreparationState: Sendable, Equatable {
+    public enum PreparationState: Sendable, Equatable, Codable {
         case idle
         /// 正在预处理，进度为「已完成块数 / 总块数」。
         case processing(done: Int, total: Int)
+        case reducing
         case ready(characterCount: Int, chapterCount: Int, generatedAt: Date)
         case failed(String)
 
@@ -24,6 +25,7 @@ public final class ReadingAssistant {
             switch self {
             case .idle: "直接读取本地原文 · 未生成有效摘要"
             case .processing(let done, let total): "正在理解全书 \(done)/\(total)"
+            case .reducing: "正在汇总全书摘要"
             case .ready(let characters, let chapters, _):
                 "已理解全书 · \(chapters) 章 / \(characters / 1000)k 字"
             case .failed(let why): "预处理失败：\(why)"
@@ -58,9 +60,39 @@ public final class ReadingAssistant {
     public private(set) var preparation: PreparationState = .idle
     /// 当前已加载的书与正文，供提问时使用。
     private var loaded: LoadedBook?
-    /// 正在进行的预处理任务，用于切换书目时取消。
-    private var preparationGeneration = UUID()
-    private var preparationTask: Task<Void, Never>?
+    /// 摘要由书籍拥有，只有显式取消才停止；页面观察者不拥有任务。
+    private var preparationGenerations: [String: UUID] = [:]
+    private var preparationTasks: [String: Task<Void, Never>] = [:]
+    private var preparationStates: [String: PreparationState] = [:]
+    private var preparationTitles: [String: String] = [:]
+    public var preparationStatuses: [[String: String]] {
+        preparationStates.keys.sorted().compactMap { id in
+            guard let state = preparationStates[id], state != .idle else { return nil }
+            return ["assetID": id, "title": preparationTitles[id] ?? "书籍摘要", "status": state.label]
+        }
+    }
+    private var openGeneration = UUID()
+    private let preparationFile: URL
+    private struct PreparationRecord: Codable {
+        let title: String
+        let state: PreparationState
+    }
+    typealias Processor = @Sendable (Book, EpubDocument, @escaping @Sendable (BookPreprocessor.Progress) -> Void) async throws -> BookKnowledge
+    var processOverride: Processor?
+    public var onPreparationChanged: ((String, PreparationState) -> Void)?
+    public func preparationState(assetID: String) -> PreparationState { preparationStates[assetID] ?? .idle }
+    private func setPreparation(_ state: PreparationState, assetID: String) {
+        preparationStates[assetID] = state
+        do {
+            try FileManager.default.createDirectory(at: preparationFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let named = preparationStates.map { id, state in
+                (id, PreparationRecord(title: preparationTitles[id] ?? "书籍摘要", state: state))
+            }
+            try JSONEncoder().encode(Dictionary(uniqueKeysWithValues: named)).write(to: preparationFile, options: .atomic)
+        } catch { NSLog("[BooksBridge] 摘要状态保存失败：%@", error.localizedDescription) }
+        if loaded?.book.assetID == assetID { preparation = state }
+        onPreparationChanged?(assetID, state)
+    }
     /// 正在进行的问答任务，用于用户中断。
     private var answerTask: Task<Void, Never>?
 
@@ -68,6 +100,18 @@ public final class ReadingAssistant {
         self.settings = settings
         self.apiKey = apiKey
         self.knowledgeStore = BookKnowledgeStore(directory: knowledgeDirectory)
+        self.preparationFile = (knowledgeDirectory ?? AppPaths.supportDirectory.appendingPathComponent("knowledge"))
+            .appendingPathComponent("preparation-status.json")
+        if let data = try? Data(contentsOf: preparationFile),
+           let saved = try? JSONDecoder().decode([String: PreparationRecord].self, from: data) {
+            preparationTitles = saved.mapValues(\.title)
+            preparationStates = saved.mapValues { record in
+                switch record.state {
+                case .processing, .reducing: return .failed("应用退出导致任务中断，请手动重新生成")
+                default: return record.state
+                }
+            }
+        }
     }
 
     /// 设置变更后刷新。已加载的书保持不动，只影响后续提问。
@@ -112,88 +156,112 @@ public final class ReadingAssistant {
         currentCFI: String?,
         forceReprocess: Bool = false
     ) -> AsyncStream<Event> {
-        preparationTask?.cancel()
-        preparationGeneration = UUID()
-        let generation = preparationGeneration
-        answerTask?.cancel()
+        preparationTitles[book.assetID] = book.title
+        openGeneration = UUID()
+        let opening = openGeneration
+        let generation = UUID()
+        if preparationTasks[book.assetID] != nil {
+            return AsyncStream { $0.yield(.preparationChanged(preparationState(assetID: book.assetID))); $0.finish() }
+        }
+        preparationGenerations[book.assetID] = generation
 
         return AsyncStream { continuation in
             let task = Task { @MainActor in
+                var state: PreparationState = self.preparationState(assetID: book.assetID)
+                defer {
+                    if self.preparationGenerations[book.assetID] == generation {
+                        self.preparationTasks[book.assetID] = nil
+                        self.preparationGenerations[book.assetID] = nil
+                    }
+                }
                 do {
                     let loaded = try await Task.detached { try Self.load(book: book, currentCFI: currentCFI) }.value
                     try Task.checkCancellation()
-                    self.loaded = loaded
-                    self.emit(.preparationChanged(.idle), to: continuation)
+                    if self.openGeneration == opening { self.loaded = loaded }
 
                     // 缓存命中且正文未变就不重做
                     if !forceReprocess,
                        let cached = await self.knowledgeStore.cached(assetID: book.assetID),
                        cached.contentHash == BookPreprocessor.contentHash(of: loaded.chapters) {
                         try Task.checkCancellation()
-                        self.loaded?.knowledge = cached
-                        self.preparation = .ready(
+                        if self.loaded?.book.assetID == book.assetID { self.loaded?.knowledge = cached }
+                        state = .ready(
                             characterCount: cached.characterCount,
                             chapterCount: cached.chapterCount,
                             generatedAt: cached.generatedAt
                         )
-                        self.emit(.preparationChanged(self.preparation), to: continuation)
+                        self.setPreparation(state, assetID: book.assetID)
+                        self.emit(.preparationChanged(state), to: continuation)
                         continuation.finish()
                         return
                     }
 
                     // 打开书只加载本地正文/缓存；付费预处理由明确操作触发。
                     guard forceReprocess else {
-                        self.preparation = .idle
-                        self.emit(.preparationChanged(self.preparation), to: continuation)
+                        if case .failed = state {} else { state = .idle }
+                        self.setPreparation(state, assetID: book.assetID)
+                        self.emit(.preparationChanged(state), to: continuation)
                         continuation.finish()
                         return
                     }
                     guard self.isConfigured else { throw ChatClient.ClientError.missingAPIKey }
                     try Task.checkCancellation()
-                    self.preparation = .processing(done: 0, total: 1)
-                    self.emit(.preparationChanged(self.preparation), to: continuation)
+                    state = .processing(done: 0, total: 1)
+                    self.setPreparation(state, assetID: book.assetID)
+                    self.emit(.preparationChanged(state), to: continuation)
 
                     let preprocessor = BookPreprocessor(client: self.client, model: self.settings.model)
-                    let knowledge = try await preprocessor.process(book: book, epub: loaded.epub) { progress in
+                    let progressHandler: @Sendable (BookPreprocessor.Progress) -> Void = { progress in
                         Task { @MainActor in
-                            guard self.preparationGeneration == generation else { return }
+                            guard self.preparationGenerations[book.assetID] == generation else { return }
+                            let state: PreparationState
                             switch progress {
                             case .started(let count):
-                                self.preparation = .processing(done: 0, total: count)
+                                state = .processing(done: 0, total: count)
                             case .chunkDone(let index, let total):
-                                self.preparation = .processing(done: index, total: total)
+                                state = .processing(done: index, total: total)
                             case .reducing:
-                                self.preparation = .processing(done: 1, total: 1)
+                                state = .reducing
                             case .finished:
-                                break
+                                return
                             }
-                            self.emit(.preparationChanged(self.preparation), to: continuation)
+                            self.setPreparation(state, assetID: book.assetID)
+                            self.emit(.preparationChanged(state), to: continuation)
                         }
                     }
 
+                    let knowledge: BookKnowledge
+                    if let process = self.processOverride {
+                        knowledge = try await process(book, loaded.epub, progressHandler)
+                    } else {
+                        knowledge = try await preprocessor.process(book: book, epub: loaded.epub, onProgress: progressHandler)
+                    }
                     try Task.checkCancellation()
                     await self.knowledgeStore.save(knowledge, assetID: book.assetID)
                     try Task.checkCancellation()
-                    self.loaded?.knowledge = knowledge
-                    self.preparation = .ready(
+                    if self.loaded?.book.assetID == book.assetID { self.loaded?.knowledge = knowledge }
+                    state = .ready(
                         characterCount: knowledge.characterCount,
                         chapterCount: knowledge.chapterCount,
                         generatedAt: knowledge.generatedAt
                     )
-                    self.emit(.preparationChanged(self.preparation), to: continuation)
+                    self.setPreparation(state, assetID: book.assetID)
+                    self.emit(.preparationChanged(state), to: continuation)
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
                 } catch {
+                    guard self.preparationGenerations[book.assetID] == generation, !Task.isCancelled else { continuation.finish(); return }
                     let message = (error as? ChatClient.ClientError)?.description
                         ?? error.localizedDescription
-                    self.preparation = .failed(message)
-                    self.emit(.preparationChanged(self.preparation), to: continuation)
+                    state = .failed(message)
+                    self.setPreparation(state, assetID: book.assetID)
+                    self.emit(.preparationChanged(state), to: continuation)
                     continuation.finish()
                 }
             }
-            self.preparationTask = task
-            continuation.onTermination = { _ in task.cancel() }
+            self.preparationTasks[book.assetID] = task
+            // The book owns this task; closing a view only detaches its observer.
         }
     }
 
@@ -373,15 +441,18 @@ public final class ReadingAssistant {
         }
     }
 
-    public func cancelPreparation() {
-        preparationGeneration = UUID()
-        preparationTask?.cancel(); preparationTask = nil; preparation = .idle
+    public func cancelPreparation(assetID: String? = nil) {
+        guard let id = assetID ?? loaded?.book.assetID else { return }
+        preparationGenerations[id] = UUID()
+        preparationTasks.removeValue(forKey: id)?.cancel()
+        setPreparation(.failed("已取消，可重新生成"), assetID: id)
     }
 
     public func clearKnowledge(assetID: String) async {
-        cancelPreparation()
+        cancelPreparation(assetID: assetID)
         await knowledgeStore.remove(assetID: assetID)
         if loaded?.book.assetID == assetID { loaded?.knowledge = nil }
+        setPreparation(.idle, assetID: assetID)
     }
 
     public func cancelAnswer() {

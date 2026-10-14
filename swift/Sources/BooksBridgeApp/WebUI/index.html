@@ -45,6 +45,7 @@
 
       <!-- 左下角：设置 -->
       <footer class="side-foot">
+        <div id="preparation-jobs" class="empty-hint" aria-live="polite"></div>
         <button id="settings-btn" class="side-action">
           <span class="sa-icon">⚙</span>
           <span class="sa-text">设置</span>
@@ -85,11 +86,13 @@
           <div id="prep-bar" class="prep-bar" hidden>
             <span class="prep-dot"></span>
             <span id="prep-text"></span>
+            <button id="reading-check" class="btn-plain btn-tiny">检查原文范围</button>
             <button id="prep-retry" class="btn-plain btn-tiny" hidden>生成阅读摘要</button>
             <button id="prep-cancel" class="btn-plain btn-tiny" hidden>取消</button>
             <button id="prep-clear" class="btn-plain btn-tiny" hidden>清除摘要</button>
           </div>
 
+          <div id="reading-check-result" class="empty-hint" aria-live="polite"></div>
           <textarea id="input" rows="1"
             placeholder="就正在读的内容提问…（Enter 发送，Shift+Enter 换行）"></textarea>
 
