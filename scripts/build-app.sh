@@ -39,6 +39,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$SWIFT_DIR/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$EXEC" "$APP/Contents/MacOS/BooksBridgeApp"
+cp "$SWIFT_DIR/Sources/BooksBridgeApp/Icons/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 # SwiftPM 把 target 资源放在独立的 .bundle 里，必须原样拷进 Contents/Resources，
 # 否则运行期 Bundle.module 会找不到 WebUI。

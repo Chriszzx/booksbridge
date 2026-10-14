@@ -2,7 +2,7 @@ import AppKit
 import BooksBridgeCore
 import Foundation
 
-/// 菜单栏上的 `BR` 图标。
+/// 菜单栏上的书本桥图标。
 ///
 /// 交互：
 /// - **左键**：下拉状态菜单（状态提示 + 操作），第一项是「打开界面」
@@ -67,14 +67,13 @@ public final class StatusItemController: NSObject {
         self.onReturnToReader = onReturnToReader
         self.onOpenDataDirectory = onOpenDataDirectory
 
-        // 文字图标需要可变宽度，squareLength 会把 "BR" 截断
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         super.init()
 
         if let button = statusItem.button {
-            button.title = "BR"
-            button.font = .systemFont(ofSize: 13, weight: .semibold)
+            button.image = AppIconFactory.menuBarImage()
+            button.setAccessibilityLabel("BooksBridge")
         }
 
         // 交给 AppKit 托管：位置与尺寸都由系统计算，不会出现位移与折叠

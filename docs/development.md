@@ -230,3 +230,16 @@ git log --oneline          # 基线提交：7281ba6
 ```
 
 `.gitignore` 已排除 `build/`、`swift/.build/`、`__pycache__/`。
+
+## 应用图标
+
+Dock 与菜单栏使用第 2 个书本桥设计。`swift/Sources/BooksBridgeApp/Icons/BookBridge.png`
+是透明底源素材；菜单栏通过 AppKit template 自动适配深浅色。`AppIcon.icns` 用于
+Dock、Finder 和 Cmd+Tab，并由打包脚本写入应用资源。修改源素材后，在仓库根目录重新生成：
+
+```bash
+ICONSET_DIR="$(mktemp -d)/BooksBridge.iconset"
+swift scripts/generate-icons.swift swift/Sources/BooksBridgeApp/Icons/BookBridge.png "$ICONSET_DIR"
+iconutil -c icns "$ICONSET_DIR" -o swift/Sources/BooksBridgeApp/Icons/AppIcon.icns
+./scripts/build-app.sh
+```

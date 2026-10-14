@@ -30,7 +30,7 @@ let package = Package(
         .executableTarget(
             name: "BooksBridgeApp",
             dependencies: ["BooksBridgeCore", "BooksBridgeLLM"],
-            resources: [.copy("WebUI")]
+            resources: [.copy("WebUI"), .copy("Icons")]
         ),
         // 设计阶段的小工具：读出任一运行中 App 的辅助功能树
         .executableTarget(
