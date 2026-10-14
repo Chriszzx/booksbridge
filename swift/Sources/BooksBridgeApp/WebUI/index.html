@@ -141,9 +141,13 @@
               </div>
 
               <div class="field">
+                <label><input id="set-auto-expand-reasoning" type="checkbox"> 自动展开思考摘要</label>
+                <p class="field-hint">控制回答中的思考内容是否默认展开，不影响模型的思考模式。</p>
+              </div>
+              <div class="field">
                 <label for="set-maxtokens">请求预算（字符，含历史与提示词）</label>
                 <input id="set-maxtokens" type="number" min="4000" max="200000" step="1000">
-                <p class="field-hint">超出部分会被截断，避免单次请求过大。</p>
+                <p class="field-hint">预算容得下时读取权限范围内的完整原文；超出时选取片段并标明省略。预算越大，API 用量可能越高。</p>
               </div>
             </section>
 

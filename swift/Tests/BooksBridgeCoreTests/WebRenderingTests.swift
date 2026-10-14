@@ -88,6 +88,31 @@ extension WebRenderingTests {
         try await Task.sleep(for: .milliseconds(100))
         let call = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "testAPI" })
         XCTAssertEqual((call["payload"] as? [String: Any])?["model"] as? String, "test-model")
+        let live = try await view.evaluateJavaScript("""
+        (() => {
+          const input = document.getElementById('input');
+          input.value = '开头到现在讲了什么'; input.dispatchEvent(new Event('input'));
+          document.getElementById('send-btn').click();
+          const immediate = document.querySelector('.msg.assistant:last-child .msg-body')?.textContent.includes('正在思考');
+          booksbridge.onState({chatEvent:{kind:'status',text:'正在思考 · 已读取完整原文 20000 字'}});
+          const status = document.querySelector('.msg.assistant:last-child').textContent.includes('20000');
+          booksbridge.onState({chatEvent:{kind:'reasoning',text:'检查材料'}});
+          const folded = !document.querySelector('.msg.assistant:last-child details').open;
+          document.getElementById('cancel-btn').click();
+          const stopped = document.querySelector('.msg.assistant:last-child .msg-body').textContent === '已停止';
+          booksbridge.onState({settings:{model:'test-model',baseURL:'https://example.test/v1',isConfigured:true,defaultScope:'upToProgress',temperature:0.3,maxContextCharacters:12000,autoExpandReasoning:true}});
+          input.value = '再试一次'; input.dispatchEvent(new Event('input'));
+          document.getElementById('send-btn').click();
+          booksbridge.onState({chatEvent:{kind:'reasoning',text:'展开的摘要'}});
+          const expanded = document.querySelector('.msg.assistant:last-child details').open;
+          booksbridge.onState({chatEvent:{kind:'finished',text:'回答完成'}});
+          const finished = document.querySelector('.msg.assistant:last-child .msg-body').textContent.trim() === '回答完成';
+          return {immediate,status,folded,stopped,expanded,finished};
+        })()
+        """) as! [String: Any]
+        for key in ["immediate", "status", "folded", "stopped", "expanded", "finished"] {
+            XCTAssertEqual(live[key] as? Bool, true, key)
+        }
         config.userContentController.removeScriptMessageHandler(forName: "booksbridge")
     }
 }

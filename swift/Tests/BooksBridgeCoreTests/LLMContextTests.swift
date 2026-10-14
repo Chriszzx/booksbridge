@@ -9,6 +9,29 @@ import XCTest
 final class ContextBuilderTests: XCTestCase {
     private let builder = ContextBuilder()
 
+    func testLargeBudgetIncludesEntireAllowedSourceBeyondTwelveSnippets() {
+        let source = chapters((0..<20).map { "区段\($0)开始" + String(repeating: "连续故事", count: 1000) + "区段\($0)结束" })
+        let result = ContextBuilder(maxCharacters: 200000).build(knowledge: "", chapters: source,
+            currentChapterIndex: 19, scope: .upToProgress, question: "开头到现在讲了什么", preScoped: true)
+        XCTAssertTrue(result.isComplete)
+        XCTAssertEqual(result.excerpts.map(\.text), source.map(\.text))
+        XCTAssertGreaterThan(result.characterCount, 70000)
+        XCTAssertLessThanOrEqual(result.render().count, 200000)
+        XCTAssertFalse(result.render().contains("第 4 章"))
+    }
+
+    func testSmallBudgetOverviewCoversBeginningMiddleEndAndLabelsGaps() {
+        let source = chapters((0..<5).map { "开始\($0)" + String(repeating: "内容", count: 3000) + "结束\($0)" })
+        let result = ContextBuilder(maxCharacters: 4000).build(knowledge: "", chapters: source,
+            currentChapterIndex: 4, scope: .upToProgress, question: "开头到现在讲了什么", preScoped: true)
+        XCTAssertFalse(result.isComplete)
+        XCTAssertEqual(result.excerpts.map(\.chapterIndex), [1,2,3,4,5])
+        XCTAssertTrue(result.render().contains("开始0"))
+        XCTAssertTrue(result.render().contains("结束4"))
+        XCTAssertTrue(result.render().contains("省略"))
+        XCTAssertLessThanOrEqual(result.render().count, 4000)
+    }
+
     // MARK: - 范围边界
 
     func testRestrictedScopesNeverIncludeWholeBookKnowledge() {
@@ -154,7 +177,7 @@ final class ContextBuilderTests: XCTestCase {
             "第一章的内容足够长以便通过长度过滤，这里继续补充一些文字凑够二十个字符以上。",
             "第二章出现了林振声这个名字以及他的主张，还有当时的舆论反应与后续演变过程。",
         ])
-        let visible = "这是用户此刻屏幕上看到的那一行文字。"
+        let visible = "第二章出现了林振声这个名字以及他的主张"
         let built = builder.build(
             knowledge: "",
             chapters: books,
@@ -163,7 +186,7 @@ final class ContextBuilderTests: XCTestCase {
             question: "这句什么意思",
             visibleText: [visible]
         )
-        XCTAssertEqual(built.excerpts.first?.text, visible, "屏幕可见正文应排在最前")
+        XCTAssertEqual(built.currentPageText, visible, "完整原文仍需单独标记当前页位置")
     }
 
     func testExcerptsStayWithinRangeForProgressScope() {

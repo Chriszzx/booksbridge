@@ -16,6 +16,8 @@ public struct ContextBuilder: Sendable {
         public let scopeDescription: String
         /// 组装后的字符数，用于成本可见。
         public let characterCount: Int
+        public let isComplete: Bool
+        public let currentPageText: String
 
         public struct Excerpt: Sendable {
             public let chapterIndex: Int
@@ -25,16 +27,19 @@ public struct ContextBuilder: Sendable {
 
         /// 拼成最终附在提问前的上下文块。
         public func render() -> String {
-            var parts: [String] = []
+            var parts: [String] = [isComplete
+                ? "以下是本轮允许范围内的完整原文，按原书顺序排列。文档区段编号不是书中的章节编号。"
+                : "以下是允许范围内的选段，不代表完整覆盖。选段之间可能有省略，不要把不相邻事件连成连续情节，也不要把区段编号当作书中章节编号。"]
             if !knowledge.isEmpty {
                 parts.append("## 全书说明\n\(knowledge)")
             }
             if !excerpts.isEmpty {
                 let body = excerpts.enumerated().map { index, excerpt in
-                    "### 原文片段 \(index + 1)（第 \(excerpt.chapterIndex) 章）\n\(excerpt.text)"
+                    "### 原文片段 \(index + 1)（文档区段 \(excerpt.chapterIndex)，来源 \(excerpt.href)）\n\(excerpt.text)"
                 }.joined(separator: "\n\n")
                 parts.append("## 相关原文\n\(body)")
             }
+            if !currentPageText.isEmpty { parts.append("## 当前页定位（与上方原文重复，仅标记读者位置）\n" + currentPageText) }
             return parts.joined(separator: "\n\n")
         }
     }
@@ -79,64 +84,82 @@ public struct ContextBuilder: Sendable {
             scope: scope
         )
 
+        let description = preScoped && scope == .upToProgress
+            ? "书首至当前页末尾（含当前章已读部分）"
+            : describe(scope: scope, usable: usable, total: chapters.count)
+        let page = visibleText.filter { fragment in
+            let anchor = ScopedReading.normalized(fragment)
+            return !anchor.isEmpty && usable.contains { ScopedReading.normalized(chapters[$0].text).contains(anchor) }
+        }.joined(separator: "\n")
+        let currentPage = String(page.suffix(min(1400, max(0, maxCharacters / 5))))
+        let all = usable.map { BuiltContext.Excerpt(chapterIndex: $0 + 1, href: chapters[$0].href, text: chapters[$0].text) }
+        let complete = BuiltContext(knowledge: "", excerpts: all, scope: scope, scopeDescription: description,
+            characterCount: all.reduce(0) { $0 + $1.text.count }, isComplete: true, currentPageText: currentPage)
+        // Respect the configured budget, including source labels. Do not cap full
+        // reading at an unrelated number of snippets when the source fits.
+        if !all.isEmpty, complete.render().count <= maxCharacters { return complete }
+
         // 2) 检索相关片段
         var excerpts: [BuiltContext.Excerpt] = []
         var used = 0
 
-        // 2a) 屏幕上可见的正文优先——它最贴近用户此刻的疑问
-        if scope != .wholeBook, let index = currentChapterIndex,
-           usable.contains(index), !visibleText.isEmpty {
-            let joined = visibleText.joined(separator: "\n")
-            let clipped = String(joined.prefix(max(0, min(excerptCharacters, maxCharacters - knowledge.count))))
-            if !clipped.isEmpty {
-                excerpts.append(.init(
-                    chapterIndex: index + 1,
-                    href: chapters[index].href,
-                    text: clipped
-                ))
-                used += clipped.count
+        let contentBudget = max(0, maxCharacters - knowledge.count - currentPage.count - 400 - usable.count * 90)
+        let broad = ["开头", "到现在", "到这里", "梳理", "概括", "总结", "讲了什么", "发生了什么", "主线"].contains { question.contains($0) }
+        if broad {
+            // Spread coverage over the entire allowed range instead of only the
+            // latest chapter tails. Explicit omissions prevent false continuity.
+            let total = max(1, usable.reduce(0) { $0 + chapters[$1].text.count })
+            for i in usable {
+                let text = chapters[i].text
+                let allowance = min(text.count, contentBudget * text.count / total)
+                guard allowance > 0 else { continue }
+                let selected: String
+                if allowance >= text.count { selected = text }
+                else {
+                    let part = max(1, (allowance - 50) / 3)
+                    let middle = max(0, text.count / 2 - part / 2)
+                    selected = String(text.prefix(part)) + "\n[中间原文省略]\n" + String(text.dropFirst(middle).prefix(part))
+                        + "\n[中间原文省略]\n" + String(text.suffix(part))
+                }
+                excerpts.append(.init(chapterIndex: i + 1, href: chapters[i].href, text: selected))
+                used += selected.count
             }
-        }
-
-        // 2b) 再按问题检索
-        let remaining = max(maxCharacters - knowledge.count - used, 0)
-        if remaining > 200 {
-            var picked = search(
-                question: question,
-                chapters: chapters,
-                within: usable,
-                limit: maxExcerpts - excerpts.count
-            )
+        } else {
+            let limit = max(maxExcerpts, contentBudget / max(1, excerptCharacters))
+            var picked = search(question: question, chapters: chapters, within: usable, limit: limit)
             if picked.isEmpty {
-                // A broad question still needs material; never silently become current-page-only.
-                for i in usable.reversed().prefix(maxExcerpts - excerpts.count) {
+                for i in usable.reversed() {
                     picked.append(Hit(chapterIndex: i + 1, href: chapters[i].href,
                         text: String(chapters[i].text.suffix(excerptCharacters)), score: 0))
                 }
             }
             for hit in picked {
-                let clipped = String(hit.text.prefix(excerptCharacters))
-                guard clipped.count <= maxCharacters - knowledge.count - used else { break }
-                excerpts.append(.init(
-                    chapterIndex: hit.chapterIndex,
-                    href: hit.href,
-                    text: clipped
-                ))
+                let remaining = contentBudget - used
+                guard remaining > 0 else { break }
+                let clipped = String(hit.text.prefix(remaining))
+                excerpts.append(.init(chapterIndex: hit.chapterIndex, href: hit.href, text: clipped))
                 used += clipped.count
+            }
+            excerpts.sort { a, b in
+                if a.chapterIndex != b.chapterIndex { return a.chapterIndex < b.chapterIndex }
+                let source = chapters[a.chapterIndex - 1].text
+                return (source.range(of: a.text)?.lowerBound ?? source.endIndex) < (source.range(of: b.text)?.lowerBound ?? source.endIndex)
             }
         }
 
-        let description = preScoped && scope == .upToProgress
-            ? "书首至当前页末尾（含当前章已读部分）"
-            : describe(scope: scope, usable: usable, total: chapters.count)
-        let context = BuiltContext(
+        func result() -> BuiltContext { BuiltContext(
             knowledge: knowledge,
             excerpts: excerpts,
             scope: scope,
             scopeDescription: description,
-            characterCount: knowledge.count + used
-        )
-        return context
+            characterCount: knowledge.count + excerpts.reduce(0) { $0 + $1.text.count }, isComplete: false, currentPageText: currentPage
+        ) }
+        while result().render().count > maxCharacters, let last = excerpts.popLast() {
+            let overflow = result().render().count + last.text.count + last.href.count + 90 - maxCharacters
+            let count = max(0, last.text.count - max(1, overflow))
+            if count > 0 { excerpts.append(.init(chapterIndex: last.chapterIndex, href: last.href, text: String(last.text.prefix(count)))) }
+        }
+        return result()
     }
 
     // MARK: - 范围
@@ -163,12 +186,12 @@ public struct ContextBuilder: Sendable {
     private func describe(scope: KnowledgeScope, usable: Range<Int>, total: Int) -> String {
         switch scope {
         case .wholeBook:
-            return "整本书（共 \(total) 章）"
+            return "整本书（共 \(total) 个文档区段）"
         case .currentChapter:
-            return "第 1–\(usable.upperBound) 章（含当前整章）"
+            return "书首至当前章末尾"
         case .upToProgress:
             let upTo = usable.upperBound
-            return upTo <= 0 ? "无已完成章节，仅使用当前可见正文" : "第 1–\(upTo) 章（已读范围）及当前可见正文"
+            return upTo <= 0 ? "无已完成章节，仅使用当前可见正文" : "此前已读区段及当前可见正文"
         }
     }
 

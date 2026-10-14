@@ -596,6 +596,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             if let value = payload["maxContextCharacters"] as? Int {
                 draft.maxContextCharacters = min(max(value, 4000), 200_000)
             }
+            if let value = payload["autoExpandReasoning"] as? Bool { draft.autoExpandReasoning = value }
             if let raw = payload["thinkingLevel"] as? String,
                let level = AppSettings.ThinkingLevel(rawValue: raw) {
                 draft.thinkingLevel = level
@@ -777,6 +778,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             ])
             statusItem.refreshTooltip()
 
+        case .contextPrepared(let text):
+            bridge.push(["chatEvent": ["kind": "status", "text": text]])
         case .reasoningDelta(let delta):
             bridge.push(["chatEvent": ["kind": "reasoning", "text": delta]])
 
@@ -1000,6 +1003,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 "defaultScope": settings.settings.defaultScope.rawValue,
                 "maxContextCharacters": settings.settings.maxContextCharacters,
                 "thinkingLevel": settings.settings.thinkingLevel.rawValue,
+                "autoExpandReasoning": settings.settings.autoExpandReasoning,
                 // 只暴露"是否已填"，不回传明文
                 "hasAPIKey": settings.hasAPIKey,
                 "isConfigured": settings.isConfigured,

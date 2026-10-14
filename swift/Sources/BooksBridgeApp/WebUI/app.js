@@ -340,8 +340,9 @@
     if (options.reasoning !== undefined) {
       const details = document.createElement("details");
       details.className = "msg-reasoning";
+      details.open = settingsState.settings?.autoExpandReasoning === true;
       const summary = document.createElement("summary");
-      summary.textContent = "思考过程";
+      summary.textContent = "思考摘要";
       const body = document.createElement("div");
       body.className = "reasoning-body";
       body.textContent = options.reasoning;
@@ -454,6 +455,10 @@
 
   function handleChatEvent(event) {
     switch (event.kind) {
+      case "status":
+        if (!chatState.streamNode) startAssistantMessage();
+        if (!chatState.streamText) chatState.streamNode.textContent = event.text;
+        break;
       case "reasoning":
         if (!chatState.streamNode) startAssistantMessage();
         if (chatState.streamReasoning) {
@@ -462,8 +467,9 @@
           // 首次出现思考内容时补一个折叠块
           const details = document.createElement("details");
           details.className = "msg-reasoning";
+          details.open = settingsState.settings?.autoExpandReasoning === true;
           const summary = document.createElement("summary");
-          summary.textContent = "思考过程";
+          summary.textContent = "思考摘要";
           const body = document.createElement("div");
           body.className = "reasoning-body";
           body.textContent = event.text;
@@ -510,8 +516,9 @@
   function startAssistantMessage() {
     chatState.streamText = "";
     chatState.streamReasoning = null;
-    chatState.streamNode = appendMessage("assistant", "");
-    showCursor(true);
+    chatState.streamNode = appendMessage("assistant", "正在思考…");
+    chatState.streamNode.setAttribute("aria-live", "polite");
+    scrollToBottom();
   }
 
   function showCursor(on) {
@@ -612,6 +619,7 @@
       els.setModel.value = s.model;
       els.setScope.value = s.defaultScope;
       els.setThinking.value = s.thinkingLevel;
+      document.getElementById("set-auto-expand-reasoning").checked = s.autoExpandReasoning === true;
       els.setMaxTokens.value = String(s.maxContextCharacters);
       els.setTemp.value = String(s.temperature);
       els.setTempValue.textContent = Number(s.temperature).toFixed(1);
@@ -930,12 +938,17 @@
     els.input.value = "";
     autoGrow();
     startStreaming();
+    startAssistantMessage();
 
     invoke("ask", { question, scope: chatState.scope });
   }
 
   els.sendBtn.addEventListener("click", send);
-  els.cancelBtn.addEventListener("click", () => invoke("cancelAnswer"));
+  els.cancelBtn.addEventListener("click", () => {
+    invoke("cancelAnswer"); showCursor(false);
+    if (chatState.streamNode && !chatState.streamText) chatState.streamNode.textContent = "已停止";
+    endStreaming();
+  });
   els.scopePicker.addEventListener("change", () => {
     if (!state.active?.scope) chatState.scope = els.scopePicker.value;
     renderScopePicker();
@@ -1027,7 +1040,7 @@
   // 任何设置控件的改动都标记为 dirty，防止推送覆盖
   for (const el of [
     els.setProvider, els.setBaseURL, els.setModel,
-    els.setScope, els.setMaxTokens, els.setApiKey, els.setThinking,
+    els.setScope, els.setMaxTokens, els.setApiKey, els.setThinking, document.getElementById("set-auto-expand-reasoning"),
   ]) {
     el.addEventListener("input", () => { settingsState.dirty = true; });
     el.addEventListener("change", () => { settingsState.dirty = true; });
@@ -1052,6 +1065,7 @@
       model: els.setModel.value.trim(),
       defaultScope: els.setScope.value,
       thinkingLevel: els.setThinking.value,
+      autoExpandReasoning: document.getElementById("set-auto-expand-reasoning").checked,
       maxContextCharacters: Number(els.setMaxTokens.value) || 12000,
       temperature: Number(els.setTemp.value) || 0,
     };

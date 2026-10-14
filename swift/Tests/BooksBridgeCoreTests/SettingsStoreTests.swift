@@ -33,6 +33,13 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(makeStore().settings.thinkingLevel, .off, "默认关闭思考模式：更快更省")
     }
 
+    func testAutomaticReasoningExpansionPersists() {
+        let store = makeStore()
+        XCTAssertFalse(store.settings.autoExpandReasoning)
+        store.update { $0.autoExpandReasoning = true }
+        XCTAssertTrue(makeStore().settings.autoExpandReasoning)
+    }
+
     func testThinkingLevelRoundTrip() {
         let store = makeStore()
         store.update { $0.thinkingLevel = .high }
@@ -51,6 +58,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(store.settings.model, "deepseek-chat")
         XCTAssertEqual(store.settings.thinkingLevel, .off, "缺字段应兜底为默认值")
         XCTAssertEqual(store.settings.defaultScope, .currentChapter)
+        XCTAssertFalse(store.settings.autoExpandReasoning)
     }
 
     func testSettingsRoundTrip() {

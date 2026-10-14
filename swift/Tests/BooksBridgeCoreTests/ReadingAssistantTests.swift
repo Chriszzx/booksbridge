@@ -58,6 +58,10 @@ final class ReadingAssistantTests: XCTestCase {
         XCTAssertEqual(assistant.currentKnowledge?.readme, "完成的摘要")
     }
 
+    func testRetryRetrievesOriginalQuestionInsteadOfOnlyRetryWords() {
+        XCTAssertTrue(ReadingAssistant.retrievalQuestion("不太对，重试", history: [.user("开头到现在讲了什么"), .assistant("错误回答")]).contains("开头到现在"))
+        XCTAssertFalse(ReadingAssistant.retrievalQuestion("重试", history: [.assistant("错误回答")]).contains("错误回答"))
+    }
     func testAppCanCancelAnswerBeforeFirstBookOrLaunchSettings() {
         let app = AppDelegate()
         app.cancelPendingAnswer()

@@ -94,6 +94,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var defaultScope: KnowledgeScope
     public var maxContextCharacters: Int
     public var thinkingLevel: ThinkingLevel
+    public var autoExpandReasoning: Bool
 
     public init(
         provider: Provider = .deepseek,
@@ -102,7 +103,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         temperature: Double = 0.3,
         defaultScope: KnowledgeScope = .upToProgress,
         maxContextCharacters: Int = 12_000,
-        thinkingLevel: ThinkingLevel = .off
+        thinkingLevel: ThinkingLevel = .off,
+        autoExpandReasoning: Bool = false
     ) {
         self.provider = provider
         self.baseURL = baseURL
@@ -111,6 +113,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.defaultScope = defaultScope
         self.maxContextCharacters = maxContextCharacters
         self.thinkingLevel = thinkingLevel
+        self.autoExpandReasoning = autoExpandReasoning
     }
 
     /// 解码旧版本配置文件时缺字段要能兜底，否则升级后会读不出设置。
@@ -123,6 +126,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         defaultScope = (try? c.decode(KnowledgeScope.self, forKey: .defaultScope)) ?? .upToProgress
         maxContextCharacters = (try? c.decode(Int.self, forKey: .maxContextCharacters)) ?? 12_000
         thinkingLevel = (try? c.decode(ThinkingLevel.self, forKey: .thinkingLevel)) ?? .off
+        autoExpandReasoning = (try? c.decode(Bool.self, forKey: .autoExpandReasoning)) ?? false
     }
 }
 

@@ -36,6 +36,7 @@ public final class ReadingAssistant {
     /// 问答过程中产生的事件。
     public enum Event: Sendable {
         case preparationChanged(PreparationState)
+        case contextPrepared(String)
         case reasoningDelta(String)
         case answerDelta(String)
         case finished(answer: String, scopeDescription: String, usage: TokenUsage?)
@@ -354,7 +355,8 @@ public final class ReadingAssistant {
                 }
                 self.lastBoundary = allowed.boundary
                 let safeHistory = history.enumerated().compactMap { i, message -> ChatMessage? in
-                    guard historyBoundaries.indices.contains(i), let boundary = historyBoundaries[i],
+                    guard !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          historyBoundaries.indices.contains(i), let boundary = historyBoundaries[i],
                           boundary <= allowed.boundary else { return nil }
                     return message
                 }
@@ -368,10 +370,11 @@ public final class ReadingAssistant {
                     chapters: allowed.chapters,
                     currentChapterIndex: allowed.currentChapter,
                     scope: scope,
-                    question: question,
+                    question: Self.retrievalQuestion(question, history: boundedHistory),
                     visibleText: visibleText, preScoped: true
                 )
 
+                self.emit(.contextPrepared("正在思考 · 已读取\(context.isComplete ? "完整原文" : "原文选段") \(context.characterCount) 字"), to: continuation)
                 var messages = self.promptBuilder.build(
                     book: loaded.book,
                     question: question,
@@ -383,18 +386,19 @@ public final class ReadingAssistant {
 
                 var answer = ""
                 var usage: TokenUsage?
+                var outputLimited = false
                 do {
                     // Bounded tool loop: the model can ask for extra local evidence.
                     // Only permitted chapters enter the tool object; no file access is exposed.
                     let tools = ReadingTools(reading: allowed)
                     var evidence = ""
                     let toolBudget = max(0, totalBudget - messages.reduce(0) { $0 + $1.content.count } - 500)
-                    if toolBudget >= 500 {
+                    if !context.isComplete && toolBudget >= 500 {
                         for _ in 0..<2 {
                             try Task.checkCancellation()
-                            let instruction = "你是阅读材料检索器，不回答问题。判断是否需要补充材料。只返回一个 JSON 对象，不用代码围栏：{\"tool\":\"search\",\"query\":\"关键词\"} 或 {\"tool\":\"read\",\"chapter\":0,\"offset\":0,\"length\":1200}；材料足够返回 {\"tool\":\"done\"}。章节编号从0开始，仅可读目录：" + String(tools.catalog.prefix(1200))
+                            let instruction = "你是阅读材料检索器，不回答问题。判断是否需要补充材料。只返回一个 JSON 对象，不用代码围栏：{\"tool\":\"search\",\"query\":\"关键词\"} 或 {\"tool\":\"read\",\"chapter\":0,\"offset\":0,\"length\":1200}；材料足够返回 {\"tool\":\"done\"}。文档区段ID从0开始，不是书中章号。仅可读目录：" + String(tools.catalog.prefix(1200))
                             let plan = try await self.client.complete(model: self.settings.model,
-                                messages: PromptBuilder.retrievalMessages(instruction: instruction, question: question, material: context.render() + evidence, budget: min(totalBudget, 5000)), maxTokens: 200)
+                                messages: PromptBuilder.retrievalMessages(instruction: instruction, question: Self.retrievalQuestion(question, history: boundedHistory), material: context.render() + evidence, budget: min(totalBudget, 5000)), maxTokens: 200)
                             guard let result = tools.execute(plan.text) else { break }
                             let remaining = toolBudget - evidence.count
                             guard remaining > 0 else { break }
@@ -402,11 +406,15 @@ public final class ReadingAssistant {
                         }
                     }
                     if !evidence.isEmpty { messages.append(.user("本轮读取工具返回的补充原文（仍在权限内）：\n" + evidence)) }
+                    guard messages.reduce(0, { $0 + $1.content.count }) <= totalBudget else {
+                        self.emit(.failed("组装后的请求超过字符预算，本次未发送；请增大请求预算。"), to: continuation)
+                        continuation.finish(); return
+                    }
                     let stream = self.client.stream(
                         model: self.settings.model,
                         messages: messages,
                         thinking: self.settings.thinkingLevel.thinkingMode,
-                        temperature: self.settings.temperature, maxTokens: 2048
+                        temperature: self.settings.temperature, maxTokens: 8192
                     )
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -416,14 +424,20 @@ public final class ReadingAssistant {
                             self.emit(.answerDelta(delta), to: continuation)
                         case .reasoning(let delta):
                             self.emit(.reasoningDelta(delta), to: continuation)
-                        case .finished(let reported, _):
+                        case .finished(let reported, let reason):
                             usage = reported
+                            outputLimited = reason == "length"
                         }
                     }
                     try Task.checkCancellation()
+                    if answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.emit(.failed(outputLimited ? "模型在输出上限内未生成正文，思考可能已占满预算；请降低思考档位后重试。" : "模型未返回回答正文，请重试。"), to: continuation)
+                        continuation.finish(); return
+                    }
+                    if outputLimited { answer += "\n\n> 本次回答达到输出上限，内容尚未完成。" }
                     self.emit(.finished(
                         answer: answer,
-                        scopeDescription: context.scopeDescription,
+                        scopeDescription: context.scopeDescription + " · " + (context.isComplete ? "完整原文" : "选段，存在省略") + " \(context.characterCount) 字",
                         usage: usage
                     ), to: continuation)
                     continuation.finish()
@@ -439,6 +453,11 @@ public final class ReadingAssistant {
             self.answerTask = task
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    static func retrievalQuestion(_ question: String, history: [ChatMessage]) -> String {
+        let previous = history.filter { $0.role == .user }.suffix(2).map(\.content)
+        return (previous + [question]).joined(separator: "\n")
     }
 
     public func cancelPreparation(assetID: String? = nil) {
