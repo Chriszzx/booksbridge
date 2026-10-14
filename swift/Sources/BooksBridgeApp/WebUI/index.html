@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BooksBridge</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- ══════════ 侧栏 ══════════ -->
+    <aside id="sidebar">
+      <div class="side-head">
+        <span class="brand">BooksBridge</span>
+        <button id="hide-btn" class="icon-btn" title="隐藏窗口（⌘W）">✕</button>
+      </div>
+
+      <div class="side-scroll">
+        <!-- 现在在读：检测结果的落点，点击才进入 -->
+        <section class="block">
+          <div class="block-label">
+            <span>现在在读</span>
+            <span class="dot" id="live-dot"></span>
+          </div>
+          <button class="reading-card" id="reading-card" disabled>
+            <span class="rc-title" id="rc-title">等待检测…</span>
+            <span class="rc-meta">
+              <span class="rc-author" id="rc-author"></span>
+              <span class="rc-kind" id="rc-kind"></span>
+            </span>
+            <span class="rc-track"><i id="rc-bar"></i></span>
+            <span class="rc-hint" id="rc-hint"></span>
+          </button>
+        </section>
+
+        <!-- 书库：书名 → 对话 -->
+        <section class="block block-grow">
+          <div class="block-label"><span>书库</span></div>
+          <div id="library-list" class="library-list"></div>
+          <p id="library-empty" class="empty-hint">
+            点上面「现在在读」把书加入书库。
+          </p>
+        </section>
+      </div>
+
+      <!-- 左下角：设置 -->
+      <footer class="side-foot">
+        <button id="settings-btn" class="side-action">
+          <span class="sa-icon">⚙</span>
+          <span class="sa-text">设置</span>
+          <span class="sa-badge" id="settings-badge" hidden></span>
+        </button>
+      </footer>
+    </aside>
+
+    <!-- ══════════ 主区 ══════════ -->
+    <main id="main">
+      <!-- 对话视图 -->
+      <section id="view-chat" class="view">
+        <header class="topbar">
+          <div class="crumb">
+            <span id="crumb-book"></span>
+            <span id="crumb-conv"></span>
+          </div>
+          <div class="topbar-right">
+            <span id="ctx-chip" class="chip" hidden></span>
+            <button id="return-btn" class="btn-primary" title="返回图书 App">← 返回图书</button>
+          </div>
+        </header>
+
+        <!-- 会话流 -->
+        <div id="thread" class="thread">
+          <div id="thread-empty" class="thread-empty">
+            <div class="te-mark">BR</div>
+            <div class="te-title" id="te-title">选择一本书开始</div>
+            <p class="te-body" id="te-body">
+              左侧「现在在读」是实时检测结果。<br>点它把书加入书库并进入对话。
+            </p>
+          </div>
+          <div id="messages" class="messages"></div>
+        </div>
+
+        <!-- Composer -->
+        <div class="composer">
+          <div id="prep-bar" class="prep-bar" hidden>
+            <span class="prep-dot"></span>
+            <span id="prep-text"></span>
+            <button id="prep-retry" class="btn-plain btn-tiny" hidden>重做</button>
+          </div>
+
+          <textarea id="input" rows="1"
+            placeholder="就正在读的内容提问…（Enter 发送，Shift+Enter 换行）"></textarea>
+
+          <div class="composer-row">
+            <!-- 知识范围：三档剧透边界 -->
+            <div class="scope-picker" id="scope-picker" role="group" aria-label="知识范围"></div>
+            <span class="spacer"></span>
+            <span id="usage-chip" class="chip chip-tiny" hidden></span>
+            <button id="cancel-btn" class="btn-plain" hidden>停止</button>
+            <button id="send-btn" class="btn-send">发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════ 设置视图（两栏，不重叠）══════════ -->
+      <section id="view-settings" class="view" hidden>
+        <header class="topbar">
+          <div class="crumb"><span class="crumb-strong">设置</span></div>
+          <div class="topbar-right">
+            <button id="settings-close" class="btn-plain">完成</button>
+          </div>
+        </header>
+
+        <div class="settings-body">
+          <!-- 设置导航 -->
+          <nav class="settings-nav" id="settings-nav">
+            <button class="nav-item active" data-section="general">通用</button>
+            <button class="nav-item" data-section="model">模型与 API</button>
+            <button class="nav-item" data-section="permissions">权限</button>
+          </nav>
+
+          <!-- 设置内容 -->
+          <div class="settings-pane" id="settings-pane">
+            <!-- 通用 -->
+            <section class="pane" data-pane="general">
+              <h2>通用</h2>
+
+              <div class="field">
+                <label for="set-scope">默认知识范围</label>
+                <select id="set-scope"></select>
+                <p class="field-hint" id="set-scope-hint">
+                  三档的区别是剧透边界：只用到你读过的内容，还是包含全书。
+                </p>
+              </div>
+
+              <div class="field">
+                <label for="set-maxtokens">上下文上限（字符）</label>
+                <input id="set-maxtokens" type="number" min="1000" max="200000" step="1000">
+                <p class="field-hint">超出部分会被截断，避免单次请求过大。</p>
+              </div>
+            </section>
+
+            <!-- 模型与 API -->
+            <section class="pane" data-pane="model" hidden>
+              <h2>模型与 API</h2>
+
+              <div class="field">
+                <label for="set-provider">服务商</label>
+                <select id="set-provider"></select>
+              </div>
+
+              <div class="field">
+                <label for="set-apikey">API Key</label>
+                <div class="input-row">
+                  <input id="set-apikey" type="password" placeholder="未配置" autocomplete="off">
+                  <button id="set-apikey-toggle" class="btn-plain" type="button">显示</button>
+                </div>
+                <p class="field-hint" id="apikey-hint">以 0600 权限保存在本机，不会上传。</p>
+              </div>
+
+              <div class="field">
+                <label for="set-baseurl">接口地址</label>
+                <input id="set-baseurl" type="text" spellcheck="false">
+              </div>
+
+              <div class="field">
+                <label for="set-model">模型</label>
+                <input id="set-model" type="text" list="model-suggestions" spellcheck="false">
+                <datalist id="model-suggestions"></datalist>
+              </div>
+
+              <div class="field">
+                <label for="set-thinking">思考模式</label>
+                <select id="set-thinking"></select>
+                <p class="field-hint" id="set-thinking-hint"></p>
+              </div>
+
+              <div class="field">
+                <label for="set-temp">温度 <span class="value" id="set-temp-value">0.3</span></label>
+                <input id="set-temp" type="range" min="0" max="2" step="0.1">
+              </div>
+
+              <div class="pane-note">
+                <strong>关于联网</strong>
+                <p>
+                  提问时会把书籍说明与相关原文片段发送到上面配置的接口。
+                  若在意隐私，可把接口地址指向本机的 Ollama。
+                </p>
+              </div>
+            </section>
+
+            <!-- 权限 -->
+            <section class="pane" data-pane="permissions" hidden>
+              <div class="pane-head">
+                <h2>权限</h2>
+                <button id="perm-connect" class="btn-plain">连接 Apple Books</button>
+                <button id="perm-recheck" class="btn-plain">重新检测</button>
+              </div>
+
+              <div class="perm-row">
+                <div class="perm-info">
+                  <span class="perm-name">图书数据访问</span>
+                  <span class="perm-why">读取图书 App 的书库与阅读位置；受阻时可前往系统设置授予完全磁盘访问</span>
+                </div>
+                <span class="perm-state" id="perm-fda">检查中…</span>
+                <button class="btn-plain" data-open-settings="fullDiskAccess">打开设置</button>
+              </div>
+
+              <div class="perm-row">
+                <div class="perm-info">
+                  <span class="perm-name">辅助功能权限</span>
+                  <span class="perm-why">读取屏幕可见正文与划选文本</span>
+                </div>
+                <span class="perm-state" id="perm-ax">检查中…</span>
+                <button class="btn-plain" data-open-settings="accessibility">打开设置</button>
+              </div>
+
+              <!-- 实际读取探测：这才是最终依据 -->
+              <div class="probe-block">
+                <div class="probe-title">实际读取探测</div>
+                <p class="field-hint" id="probe-hint">
+                  系统设置里的开关不代表本应用已获授权，以实际能否读取为准。
+                </p>
+                <ul class="probe-list" id="probe-list"></ul>
+                <p class="probe-path" id="probe-bundle"></p>
+              </div>
+
+              <div class="pane-note pane-note-warn">
+                <strong>授权后仍提示未授权？</strong>
+                <p>
+                  请确认系统设置中添加的是当前 BooksBridge 应用，然后点击「重新检测」。
+                  若系统要求重启，请退出应用后重新打开，再点击「连接 Apple Books」。
+                  数据尚未创建时，请先在图书 App 中打开一本书。
+                </p>
+              </div>
+
+              <div class="pane-note">
+                <strong>为什么需要这些权限</strong>
+                <p>
+                  图书 App 没有插件机制，只能从外部旁路读取它的数据文件。
+                  macOS 会拦截跨应用容器访问，因此需要手动授权。
+                </p>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

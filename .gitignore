@@ -1,0 +1,14 @@
+# 构建产物
+build/
+swift/.build/
+*.app
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# 本地临时文件
+*.log
