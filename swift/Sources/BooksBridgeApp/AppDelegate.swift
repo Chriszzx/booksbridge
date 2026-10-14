@@ -26,7 +26,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 应用设置（服务商、模型、上下文范围）与 API Key。
     private var settings: SettingsStore!
     /// 阅读问答编排：预处理与流式问答。
-    private var assistant: ReadingAssistant!
+    private let assistant = ReadingAssistant(settings: AppSettings(), apiKey: "")
     /// 当前问答的流式事件流，用于取消。
     private var answerStream: Task<Void, Never>?
 
@@ -113,6 +113,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         AppPaths.ensureSupportDirectory()
         store = ConversationStore()
         settings = SettingsStore()
+        assistant.update(settings: settings.settings, apiKey: settings.apiKey)
         writeReport()
 
 
@@ -410,6 +411,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case "selectConversation":
             guard let assetID = invocation.payload["assetID"] as? String else { return }
             let conversationID = invocation.payload["conversationID"] as? String
+            cancelPendingAnswer()
             store.setActive(assetID: assetID, conversationID: conversationID)
             pushState(message: "已切换对话")
 
@@ -441,12 +443,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             ask(invocation.payload)
 
         case "cancelAnswer":
-            answerStream?.cancel()
-            assistant.cancelAnswer()
+            cancelPendingAnswer()
             pushState(message: "已中断")
 
         case "reprocessBook":
-            if let active = store.state.lastActive {
+            if connectionRequested, dataAccess.isGranted,
+               let active = store.state.lastActive, let id = active.conversationID,
+               invocation.payload["scope"] as? String == KnowledgeScope.wholeBook.rawValue,
+               store.lockScope(assetID: active.assetID, conversationID: id, requested: .wholeBook) == .wholeBook {
+                pushState(message: "本对话范围固定为整本书")
                 prepareBook(assetID: active.assetID, force: true)
             }
 
@@ -586,6 +591,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.refreshTooltip()
     }
 
+    /// 助手在 AppDelegate 创建时就有效；取消操作不依赖是否已进入一本书。
+    func cancelPendingAnswer() {
+        answerStream?.cancel()
+        assistant.cancelAnswer()
+    }
+
     // MARK: - 阅读问答
 
     /// 预处理当前书：把整本书压缩成「书籍说明」，供后续提问使用。
@@ -604,13 +615,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("[BooksBridge] 预处理跳过：找不到书目 \(assetID)")
             return
         }
-        let cfi = latestContext?.position?.cfi
+        let cfi = (try? booksStore.readingPosition(assetID: assetID))?.cfi
 
         answerStream?.cancel()
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
             let stream = self.assistant.open(book: book, currentCFI: cfi, forceReprocess: force)
             for await event in stream {
+                guard !Task.isCancelled,
+                      self.store.state.lastActive?.assetID == assetID else { break }
                 self.handleAssistantEvent(event)
             }
         }
@@ -618,37 +631,55 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 发起提问。
     private func ask(_ payload: [String: Any]) {
-        guard let question = (payload["question"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !question.isEmpty else { return }
-
-        let scope = (payload["scope"] as? String)
-            .flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
-
-        // 把用户消息先落到会话里，界面立即能看到
-        if let active = store.state.lastActive,
-           let conversationID = active.conversationID {
-            store.appendMessage(
-                assetID: active.assetID,
-                conversationID: conversationID,
-                message: Conversation.Message(role: .user, text: question)
-            )
+        guard let question = (payload["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !question.isEmpty,
+              let active = store.state.lastActive, let conversationID = active.conversationID else { return }
+        guard connectionRequested, dataAccess.isGranted else {
+            bridge.push(["chatEvent": ["kind": "error", "text": "请先连接 Apple Books，以读取本书最新进度"]])
+            return
         }
-        pushState(message: "已提问")
-
-        let history = conversationHistory()
-        let visible = latestContext?.visibleText ?? []
-
-        answerStream?.cancel()
+        let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
+        guard let scope = store.lockScope(assetID: active.assetID, conversationID: conversationID, requested: requested) else { return }
+        // 历史在追加本轮问题之前取，避免重复发送；旧格式的未标注范围历史不参与。
+        let conversation = store.conversation(assetID: active.assetID, conversationID: conversationID)!
+        let history: [ChatMessage] = conversation.messages.dropFirst(conversation.scopeHistoryStartIndex ?? 0).map {
+            $0.role == .user ? .user($0.text) : .assistant($0.text)
+        }
+        store.appendMessage(assetID: active.assetID, conversationID: conversationID,
+                            message: Conversation.Message(role: .user, text: question))
+        pushState(message: "正在读取本书最新进度")
+        cancelPendingAnswer()
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
-            let stream = self.assistant.ask(
-                question: question,
-                scope: scope,
-                visibleText: visible,
-                history: history
-            )
-            for await event in stream {
-                self.handleAssistantEvent(event)
+            do {
+                // 每次提问走数据库工具读取，不能借用其他书的 latestContext。
+                let assetID = active.assetID
+                let fresh = try await Task.detached {
+                    let source = BooksStore()
+                    guard let book = try source.book(assetID: assetID) else { throw ReadingAssistant.AssistantError.notLoaded }
+                    let position = try source.readingPosition(assetID: assetID)
+                    return (book, position?.cfi)
+                }.value
+                try Task.checkCancellation()
+                let visible: [String]
+                if self.booksStore.currentAssetID() == assetID,
+                   Permissions().accessibilityStatus().isGranted,
+                   let snapshot = try? AccessibilityReader().snapshot() {
+                    visible = [String(snapshot.visibleText.joined(separator: "\n").prefix(1200))]
+                } else { visible = [] }
+                let stream = self.assistant.ask(book: fresh.0, currentCFI: fresh.1,
+                    question: question, scope: scope, visibleText: visible, history: history)
+                for await event in stream {
+                    guard !Task.isCancelled else { break }
+                    guard self.store.state.lastActive?.assetID == assetID,
+                          self.store.state.lastActive?.conversationID == conversationID else { break }
+                    self.handleAssistantEvent(event)
+                }
+            } catch is CancellationError { return }
+            catch {
+                guard self.store.state.lastActive?.assetID == active.assetID,
+                      self.store.state.lastActive?.conversationID == conversationID else { return }
+                self.handleAssistantEvent(.failed("最新阅读进度读取失败：\(error)"))
             }
         }
     }
@@ -704,23 +735,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
-    /// 取当前会话的历史消息，用于多轮上下文。
-    private func conversationHistory() -> [ChatMessage] {
-        guard let active = store.state.lastActive,
-              let conversationID = active.conversationID,
-              let conversation = store.conversation(assetID: active.assetID, conversationID: conversationID) else {
-            return []
-        }
-        return conversation.messages.map { message in
-            switch message.role {
-            case .user: .user(message.text)
-            case .assistant: .assistant(message.text)
-            }
-        }
-    }
-
     /// 在指定书下新建对话并切过去。
     private func newConversation(assetID: String) {
+        cancelPendingAnswer()
         guard let conversation = store.createConversation(assetID: assetID) else {
             NSLog("[BooksBridge] 新建对话失败：书 \(assetID) 不在书库中")
             return
@@ -1010,6 +1027,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // 消息随 active 一起推，是为了让前端在切换会话时能整段重绘历史。
         // 前端会比对会话标识，只有真的换了会话才重建 DOM，
         // 因此不会与流式渲染互相打架。
+        body["active"] = NSNull()
         if let active = store.state.lastActive {
             var payload: [String: Any] = ["assetID": active.assetID]
             if let conversationID = active.conversationID {
@@ -1017,6 +1035,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let conversation = store.conversation(
                     assetID: active.assetID, conversationID: conversationID
                 ) {
+                    payload["scope"] = conversation.scope?.rawValue ?? NSNull() as Any
                     payload["messages"] = conversation.messages.map { message in
                         [
                             "role": message.role.rawValue,

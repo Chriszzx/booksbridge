@@ -288,7 +288,7 @@
       els.teTitle.textContent = "还没有对话";
       els.teBody.innerHTML =
         "在下面输入问题开始。默认范围是「读到这为止」，不会剧透后面的情节。<br>" +
-        "第一次提问前会先把整本书理解一遍，这需要一点时间。";
+        "首次提问后范围固定；每次提问会读取本书最新进度。";
       renderThreadShell();
       if (hasHistory) els.threadEmpty.hidden = true;
 
@@ -386,7 +386,7 @@
   // ---------- 渲染：预处理状态 ----------
 
   function renderPreparation() {
-    const text = chatState.preparation;
+    const text = chatState.preparation || (chatState.scope === "wholeBook" ? "按需检索全书原文，也可选择预处理" : "");
     if (!text) {
       els.prepBar.hidden = true;
       return;
@@ -395,7 +395,9 @@
     els.prepText.textContent = text;
     els.prepBar.classList.toggle("ready", chatState.preparationReady);
     els.prepBar.classList.toggle("failed", chatState.preparationFailed);
-    els.prepRetry.hidden = !chatState.preparationFailed;
+    els.prepRetry.hidden = chatState.scope !== "wholeBook";
+    els.prepRetry.disabled = chatState.streaming || !(settingsState.settings?.isConfigured ?? false);
+    els.prepRetry.textContent = "预处理全书（消耗 API 用量）";
   }
 
   // ---------- 渲染：知识范围选择器 ----------
@@ -420,6 +422,7 @@
         button.textContent = scope.label;
         button.title = scope.explanation ?? "";
         button.addEventListener("click", () => {
+          if (state.active?.scope) return;
           chatState.scope = scope.id;
           renderScopePicker();
         });
@@ -430,7 +433,10 @@
 
     for (const button of els.scopePicker.querySelectorAll(".scope-option")) {
       button.classList.toggle("active", button.dataset.scope === chatState.scope);
+      button.disabled = !!state.active?.scope || chatState.streaming;
+      button.title = state.active?.scope ? "本对话范围已固定，切换范围请新建对话" : (scopes.find(s => s.id === button.dataset.scope)?.explanation ?? "");
     }
+    renderPreparation();
   }
 
   // ---------- 渲染：发送状态 ----------
@@ -555,11 +561,13 @@
     chatState.streamNode = null;
     chatState.streamReasoning = null;
     renderComposerState();
+    renderScopePicker();
   }
 
   function startStreaming() {
     chatState.streaming = true;
     renderComposerState();
+    renderScopePicker();
   }
 
   // ---------- 渲染：设置 ----------
@@ -715,9 +723,15 @@
     const key = state.active
       ? `${state.active.assetID}/${state.active.conversationID ?? ""}`
       : "";
+    chatState.scope = state.active?.scope ?? (key !== renderedConversationKey
+      ? settingsState.settings?.defaultScope ?? "upToProgress" : chatState.scope);
+    renderScopePicker();
     // 会话没变就不动 DOM——流式渲染正在进行时更不能重绘
     if (key === renderedConversationKey) return;
     renderedConversationKey = key;
+    chatState.streaming = false;
+    renderComposerState();
+    renderScopePicker();
 
     els.messages.textContent = "";
     chatState.streamNode = null;
@@ -917,7 +931,7 @@
 
   els.sendBtn.addEventListener("click", send);
   els.cancelBtn.addEventListener("click", () => invoke("cancelAnswer"));
-  els.prepRetry.addEventListener("click", () => invoke("reprocessBook"));
+  els.prepRetry.addEventListener("click", () => invoke("reprocessBook", { scope: chatState.scope }));
 
   els.input.addEventListener("input", () => {
     autoGrow();

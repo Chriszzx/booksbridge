@@ -1,5 +1,6 @@
 import BooksBridgeCore
 import Foundation
+import CryptoKit
 
 /// 把整本书交给 LLM 做一次预处理，产出后续提问用的「书籍说明」。
 ///
@@ -204,36 +205,13 @@ public struct BookPreprocessor: Sendable {
 
     /// 正文内容指纹。
     ///
-    /// 用长度 + 多点采样而非完整哈希：目的只是判断"书有没有变"，
-    /// 采样足以发现替换与截断，且对超大书是常数开销。
-    ///
-    /// 采样点固定取**首、中、尾**再在中段均匀铺开，而不是简单按步长遍历——
-    /// 早期实现用 `stride(from: 0, by: max(count/64, 1))`，当文本不足 64 字时
-    /// 只会取到下标 0，于是"甲"与"乙"算出同一个指纹（已由测试捕获）。
+    /// SHA-256 基于完整 UTF-8 正文，跨进程稳定且覆盖内部改动。
     public static func contentHash(of text: String) -> String {
-        var hasher = Hasher()
-        hasher.combine(text.count)
+        "sha256-v1:" + SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
 
-        let scalars = Array(text.unicodeScalars)
-        guard !scalars.isEmpty else {
-            return String(format: "%016llx", UInt64(bitPattern: Int64(hasher.finalize())))
-        }
-
-        // 首尾必取，保证任何长度下都有区分度
-        hasher.combine(scalars[0].value)
-        hasher.combine(scalars[scalars.count - 1].value)
-
-        if scalars.count > 2 {
-            let samples = min(64, scalars.count)
-            for i in 0..<samples {
-                // 均匀铺开并保证落在边界内
-                let index = scalars.count == samples
-                    ? i
-                    : Int(Double(i) * Double(scalars.count - 1) / Double(samples - 1))
-                hasher.combine(scalars[index].value)
-            }
-        }
-        return String(format: "%016llx", UInt64(bitPattern: Int64(hasher.finalize())))
+    public static func contentHash(of chapters: [Chapter]) -> String {
+        contentHash(of: chapters.map(\.text).joined(separator: "\n\n"))
     }
 
     // MARK: - 提示词

@@ -86,6 +86,7 @@ public final class ReadingAssistant {
             && !settings.model.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
+    var currentChapterIndex: Int? { loaded?.currentChapterIndex }
     public var currentBook: Book? { loaded?.book }
     public var currentChapters: [BookPreprocessor.Chapter] { loaded?.chapters ?? [] }
     public var currentKnowledge: BookKnowledge? { loaded?.knowledge }
@@ -93,7 +94,7 @@ public final class ReadingAssistant {
     // MARK: - 已加载的书
 
     struct LoadedBook {
-        let book: Book
+        var book: Book
         let epub: EpubDocument
         let chapters: [BookPreprocessor.Chapter]
         var knowledge: BookKnowledge?
@@ -129,7 +130,8 @@ public final class ReadingAssistant {
                     // 缓存命中且正文未变就不重做
                     if !forceReprocess,
                        let cached = await self.knowledgeStore.cached(assetID: book.assetID),
-                       cached.contentHash == loaded.epub.contentHash {
+                       cached.contentHash == BookPreprocessor.contentHash(of: loaded.chapters) {
+                        try Task.checkCancellation()
                         self.loaded?.knowledge = cached
                         self.preparation = .ready(
                             characterCount: cached.characterCount,
@@ -141,6 +143,14 @@ public final class ReadingAssistant {
                         return
                     }
 
+                    // 打开书只加载本地正文/缓存；付费预处理由明确操作触发。
+                    guard forceReprocess else {
+                        self.preparation = .idle
+                        self.emit(.preparationChanged(self.preparation), to: continuation)
+                        continuation.finish()
+                        return
+                    }
+                    try Task.checkCancellation()
                     self.preparation = .processing(done: 0, total: 1)
                     self.emit(.preparationChanged(self.preparation), to: continuation)
 
@@ -161,7 +171,9 @@ public final class ReadingAssistant {
                         }
                     }
 
+                    try Task.checkCancellation()
                     await self.knowledgeStore.save(knowledge, assetID: book.assetID)
+                    try Task.checkCancellation()
                     self.loaded?.knowledge = knowledge
                     self.preparation = .ready(
                         characterCount: knowledge.characterCount,
@@ -216,10 +228,26 @@ public final class ReadingAssistant {
         return chapters.firstIndex { $0.href == href }
     }
 
+    /// 提问前更新本书快照；受限范围无法定位时停止，避免使用旧位置。
+    func refreshReading(book: Book, currentCFI: String?, scope: KnowledgeScope) throws {
+        if loaded?.book.assetID != book.assetID || loaded?.book.path != book.path {
+            loaded = try load(book: book, currentCFI: currentCFI)
+        }
+        guard var snapshot = loaded else { throw AssistantError.notLoaded }
+        snapshot.book = book
+        snapshot.currentChapterIndex = Self.locateChapter(cfi: currentCFI, epub: snapshot.epub, chapters: snapshot.chapters)
+        loaded = snapshot
+        if scope != .wholeBook, snapshot.currentChapterIndex == nil {
+            throw AssistantError.unknownPosition
+        }
+    }
+
     // MARK: - 问答
 
     /// 提问并流式取回答案。
     public func ask(
+        book: Book,
+        currentCFI: String?,
         question: String,
         scope: KnowledgeScope,
         visibleText: [String] = [],
@@ -229,11 +257,14 @@ public final class ReadingAssistant {
 
         return AsyncStream { continuation in
             let task = Task { @MainActor in
-                guard let loaded = self.loaded else {
-                    self.emit(.failed("尚未打开任何书籍"), to: continuation)
+                do {
+                    try self.refreshReading(book: book, currentCFI: currentCFI, scope: scope)
+                } catch {
+                    self.emit(.failed(String(describing: error)), to: continuation)
                     continuation.finish()
                     return
                 }
+                guard let loaded = self.loaded else { continuation.finish(); return }
                 guard self.isConfigured else {
                     self.emit(.failed("未配置 API Key，请先在设置里填写"), to: continuation)
                     continuation.finish()
@@ -313,26 +344,14 @@ public final class ReadingAssistant {
     public enum AssistantError: Error, CustomStringConvertible {
         case noLocalFile
         case notLoaded
+        case unknownPosition
 
         public var description: String {
             switch self {
             case .noLocalFile: "这本书的正文文件不在本地，无法读取内容"
+            case .unknownPosition: "无法定位本书最新阅读进度，本次未发送请求；请在图书 App 中打开本书并翻页后重试"
             case .notLoaded: "尚未打开任何书籍"
             }
         }
-    }
-}
-
-private extension EpubDocument {
-    /// 正文指纹，用于判断缓存是否失效。
-    var contentHash: String {
-        var hasher = Hasher()
-        hasher.combine(manifest.count)
-        hasher.combine(spine.count)
-        for id in spine {
-            guard let href = manifest[id] else { continue }
-            hasher.combine(href)
-        }
-        return String(format: "%016llx", UInt64(bitPattern: Int64(hasher.finalize())))
     }
 }

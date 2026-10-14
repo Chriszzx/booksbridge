@@ -11,20 +11,38 @@ final class ContextBuilderTests: XCTestCase {
 
     // MARK: - 范围边界
 
+    func testRestrictedScopesNeverIncludeWholeBookKnowledge() {
+        for scope in [KnowledgeScope.upToProgress, .currentChapter] {
+            let context = builder.build(knowledge: "结局秘密", chapters: chapters([String(repeating: "故事正文", count: 20)]),
+                currentChapterIndex: 0, scope: scope, question: "故事")
+            XCTAssertFalse(context.render().contains("结局秘密"))
+        }
+    }
+
+    func testFirstChapterAndUnknownPositionDoNotRetrieveUnreadText() {
+        let books = chapters([String(repeating: "结局秘密", count: 20)])
+        for position: Int? in [0, nil] {
+            let context = builder.build(knowledge: "结局秘密", chapters: books,
+                currentChapterIndex: position, scope: .upToProgress, question: "结局")
+            XCTAssertTrue(context.excerpts.isEmpty)
+            XCTAssertTrue(context.knowledge.isEmpty)
+        }
+    }
+
     func testRangeExcludesCurrentChapterForProgressScope() {
         // 第 5 章在读（下标 4）→ 已读范围不含当前章
         let range = builder.usableChapterRange(count: 10, currentChapterIndex: 4, scope: .upToProgress)
-        XCTAssertEqual(range, 0...3, "读到这为止不应包含正在读的这一章")
+        XCTAssertEqual(range, 0..<4, "读到这为止不应包含正在读的这一章")
     }
 
     func testRangeIncludesCurrentChapterForChapterScope() {
         let range = builder.usableChapterRange(count: 10, currentChapterIndex: 4, scope: .currentChapter)
-        XCTAssertEqual(range, 0...4, "整章档应包含当前章")
+        XCTAssertEqual(range, 0..<5, "整章档应包含当前章")
     }
 
     func testRangeIsWholeBookForWholeBookScope() {
         let range = builder.usableChapterRange(count: 10, currentChapterIndex: 4, scope: .wholeBook)
-        XCTAssertEqual(range, 0...9)
+        XCTAssertEqual(range, 0..<10)
     }
 
     func testProgressScopeAtFirstChapterStaysInBounds() {
@@ -48,11 +66,11 @@ final class ContextBuilderTests: XCTestCase {
         // 定位不到位置时，前两档必须保守，不能退化成"给全书"
         XCTAssertEqual(builder.usableChapterRange(count: 10, currentChapterIndex: nil, scope: .upToProgress).upperBound, 0)
         XCTAssertEqual(builder.usableChapterRange(count: 10, currentChapterIndex: nil, scope: .currentChapter).upperBound, 0)
-        XCTAssertEqual(builder.usableChapterRange(count: 10, currentChapterIndex: nil, scope: .wholeBook).upperBound, 9)
+        XCTAssertEqual(builder.usableChapterRange(count: 10, currentChapterIndex: nil, scope: .wholeBook).upperBound, 10)
     }
 
     func testEmptyChapterListDoesNotCrash() {
-        XCTAssertEqual(builder.usableChapterRange(count: 0, currentChapterIndex: nil, scope: .upToProgress), 0...0)
+        XCTAssertEqual(builder.usableChapterRange(count: 0, currentChapterIndex: nil, scope: .upToProgress), 0..<0)
     }
 
     // MARK: - 检索
@@ -69,7 +87,7 @@ final class ContextBuilderTests: XCTestCase {
             "第二章里提到了一个关键人物叫做林振声，他是整件事的核心推动者与决策人。",
             "第三章继续发展，讨论了许多别的话题比如气象观测与地质勘探的方法论。",
         ])
-        let hits = builder.search(question: "林振声是谁", chapters: books, within: 0...2, limit: 3)
+        let hits = builder.search(question: "林振声是谁", chapters: books, within: 0..<3, limit: 3)
         XCTAssertFalse(hits.isEmpty, "应检索到含关键词的段落")
         XCTAssertEqual(hits.first?.chapterIndex, 2, "命中的应是第二章")
     }
@@ -80,13 +98,13 @@ final class ContextBuilderTests: XCTestCase {
             "第二章出现了关键术语「熵增困境」，并在后续反复使用这个说法。",
         ])
         // 把范围限制在第一章，就不该检索到第二章的内容
-        let hits = builder.search(question: "熵增困境", chapters: books, within: 0...0, limit: 3)
+        let hits = builder.search(question: "熵增困境", chapters: books, within: 0..<1, limit: 3)
         XCTAssertTrue(hits.isEmpty, "范围之外的内容不得被检索到，否则会剧透")
     }
 
     func testSearchReturnsEmptyForUnrelatedQuestion() {
         let books = chapters(["这一章讨论灌溉渠道的坡度设计与材料选择等工程问题。"])
-        XCTAssertTrue(builder.search(question: "量子纠缠", chapters: books, within: 0...0, limit: 3).isEmpty)
+        XCTAssertTrue(builder.search(question: "量子纠缠", chapters: books, within: 0..<1, limit: 3).isEmpty)
     }
 
     func testQueryTermsExtractChineseBigrams() {
@@ -125,9 +143,9 @@ final class ContextBuilderTests: XCTestCase {
             scope: .currentChapter,
             question: "林振声做了什么"
         )
-        XCTAssertTrue(built.knowledge.contains("改革"))
+        XCTAssertTrue(built.knowledge.isEmpty, "受限范围不能混入全书说明")
         XCTAssertFalse(built.excerpts.isEmpty, "应带回原文片段")
-        XCTAssertTrue(built.render().contains("全书说明"))
+        XCTAssertFalse(built.render().contains("全书说明"))
         XCTAssertTrue(built.render().contains("相关原文"))
     }
 
@@ -247,6 +265,17 @@ final class BookPreprocessorTests: XCTestCase {
         }
     }
 
+    func testContentHashMatchesKnownSHA256AcrossProcesses() {
+        XCTAssertEqual(BookPreprocessor.contentHash(of: "abc"),
+            "sha256-v1:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    }
+
+    func testWriterAndReaderUseSameChapterFingerprint() {
+        let parts = [chapter("第一章正文"), chapter("第二章正文", spine: 2)]
+        XCTAssertEqual(BookPreprocessor.contentHash(of: parts),
+                       BookPreprocessor.contentHash(of: parts.map(\.text).joined(separator: "\n\n")))
+    }
+
     func testContentHashIsStable() {
         let text = "一段用于指纹测试的正文内容。"
         XCTAssertEqual(BookPreprocessor.contentHash(of: text), BookPreprocessor.contentHash(of: text))
@@ -285,20 +314,17 @@ final class BookPreprocessorTests: XCTestCase {
         )
     }
 
-    /// 明确记录这个已知局限：单个内部字符的改动**可能**不被发现。
-    ///
-    /// 这不是 bug 而是取舍——采样把指纹成本压成常数，代价是放弃逐字精度。
+    /// 完整 SHA-256 也必须覆盖正文内部的单个字符变化。
     /// 缓存失效要的是"这本书还是不是原来那本"，首尾与长度已足够覆盖换书与截断。
     /// 测试写成断言"允许漏判"，以免将来有人误以为它是校验和。
-    func testContentHashToleratesSingleInteriorChange() {
+    func testContentHashDetectsInteriorChange() {
         let base = String(repeating: "甲乙丙丁戊己庚辛", count: 5_000)
         var changed = Array(base)
         // 挑一个确定不在采样点上的位置
         changed[11] = "改"
         let before = BookPreprocessor.contentHash(of: base)
         let after = BookPreprocessor.contentHash(of: String(changed))
-        // 这一条不断言"相等"，只记录行为：允许相同，也允许不同
-        XCTAssertTrue(before == after || before != after)
+        XCTAssertNotEqual(before, after, "完整指纹应发现内部字符改动")
     }
 
     func testContentHashHandlesEmptyAndTinyInput() {

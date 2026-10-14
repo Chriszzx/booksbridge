@@ -46,7 +46,7 @@ public struct BookKnowledge: Codable, Sendable, Equatable {
 /// - 读者可能只想问"我读到这里为止的内容"，怕被剧透后面
 /// - 也可能想直接问整本书，不在意剧透
 public enum KnowledgeScope: String, Codable, Sendable, CaseIterable {
-    /// 读到哪算哪：只给读者已读到的部分（当前章之前 + 当前章已读部分）。
+    /// 读到哪算哪：只给已完成章节与当前可见正文，不估算当前章内偏移。
     case upToProgress
     /// 整个当前章，包含读者还没读到的部分。仍不含后面的章节。
     case currentChapter
@@ -63,7 +63,7 @@ public enum KnowledgeScope: String, Codable, Sendable, CaseIterable {
 
     public var explanation: String {
         switch self {
-        case .upToProgress: "只使用你已经读过的内容，不会剧透"
+        case .upToProgress: "读取已完成章节与当前可见正文，不读取当前章的其他部分"
         case .currentChapter: "包含当前章未读部分，但不涉及后面的章节"
         case .wholeBook: "使用全书内容，可能剧透后续情节"
         }

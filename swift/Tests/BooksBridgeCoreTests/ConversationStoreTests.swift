@@ -1,6 +1,7 @@
 import XCTest
 
 @testable import BooksBridgeApp
+import BooksBridgeLLM
 
 /// `ConversationStore` 的持久化行为。
 ///
@@ -22,6 +23,43 @@ final class ConversationStoreTests: XCTestCase {
 
     private func makeStore() -> ConversationStore {
         ConversationStore(fileURL: fileURL)
+    }
+
+    func testScopeCannotBeChangedAndPersists() {
+        let store = makeStore()
+        store.addBook(assetID: "A", title: "书", author: "")
+        let conversation = store.createConversation(assetID: "A")!
+        XCTAssertEqual(store.lockScope(assetID: "A", conversationID: conversation.id, requested: .upToProgress), .upToProgress)
+        XCTAssertEqual(store.lockScope(assetID: "A", conversationID: conversation.id, requested: .wholeBook), .upToProgress)
+        XCTAssertEqual(makeStore().conversation(assetID: "A", conversationID: conversation.id)?.scope, .upToProgress)
+    }
+
+    func testNewConversationCanUseDifferentScope() {
+        let store = makeStore()
+        store.addBook(assetID: "A", title: "书", author: "")
+        let first = store.createConversation(assetID: "A")!
+        let second = store.createConversation(assetID: "A")!
+        _ = store.lockScope(assetID: "A", conversationID: first.id, requested: .upToProgress)
+        XCTAssertEqual(store.lockScope(assetID: "A", conversationID: second.id, requested: .wholeBook), .wholeBook)
+    }
+
+    func testLegacyHistoryIsExcludedWhenScopeFirstLocks() throws {
+        let old = Conversation(title: "旧对话", messages: [.init(role: .assistant, text: "曾经透露的结局")])
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var json = try JSONSerialization.jsonObject(with: encoder.encode(old)) as! [String: Any]
+        json.removeValue(forKey: "scope")
+        json.removeValue(forKey: "scopeHistoryStartIndex")
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let legacy = try decoder.decode(Conversation.self, from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertNil(legacy.scope)
+        let store = makeStore()
+        store.addBook(assetID: "A", title: "书", author: "")
+        let conversation = store.createConversation(assetID: "A")!
+        store.appendMessage(assetID: "A", conversationID: conversation.id, message: legacy.messages[0])
+        _ = store.lockScope(assetID: "A", conversationID: conversation.id, requested: .upToProgress)
+        XCTAssertEqual(makeStore().conversation(assetID: "A", conversationID: conversation.id)?.scopeHistoryStartIndex, 1)
     }
 
     // MARK: - 基础读写

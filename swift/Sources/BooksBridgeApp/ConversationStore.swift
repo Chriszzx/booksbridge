@@ -1,4 +1,5 @@
 import BooksBridgeCore
+import BooksBridgeLLM
 import Foundation
 
 /// 一本书在侧栏里的记录。
@@ -34,19 +35,26 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var createdAt: Date
     public var updatedAt: Date
     public var messages: [Message]
+    /// 首次提问后固定；nil 为尚未提问或旧格式。
+    public var scope: KnowledgeScope?
+    /// 旧对话没有范围记录，其旧历史保留展示但不送入新的 agent。
+    public var scopeHistoryStartIndex: Int?
 
     public init(
         id: String = UUID().uuidString,
         title: String,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
-        messages: [Message] = []
+        messages: [Message] = [],
+        scope: KnowledgeScope? = nil
     ) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.messages = messages
+        self.scope = scope
+        self.scopeHistoryStartIndex = nil
     }
 
     /// 骨架期只有这两个角色，接入 LLM 后直接复用。
@@ -275,6 +283,18 @@ public final class ConversationStore {
             state.lastActive = nil
         }
         persist()
+    }
+
+    /// 只允许首次绑定范围；即使前端发来其他范围也不能切换。
+    @discardableResult
+    public func lockScope(assetID: String, conversationID: String, requested: KnowledgeScope) -> KnowledgeScope? {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }) else { return nil }
+        if let scope = state.books[bi].conversations[ci].scope { return scope }
+        state.books[bi].conversations[ci].scope = requested
+        state.books[bi].conversations[ci].scopeHistoryStartIndex = state.books[bi].conversations[ci].messages.count
+        persist()
+        return requested
     }
 
     /// 追加一条消息（骨架期不会被调用，接入 LLM 后使用）。

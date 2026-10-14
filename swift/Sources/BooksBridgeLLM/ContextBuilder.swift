@@ -89,6 +89,8 @@ public struct ContextBuilder: Sendable {
         question: String,
         visibleText: [String] = []
     ) -> BuiltContext {
+        // 全书摘要只供全书范围使用，受限范围只检索允许的原文。
+        let knowledge = scope == .wholeBook ? String(knowledge.prefix(max(0, maxCharacters))) : ""
         // 1) 按范围确定可用章节
         let usable = usableChapterRange(
             count: chapters.count,
@@ -104,7 +106,7 @@ public struct ContextBuilder: Sendable {
         if scope != .wholeBook, let index = currentChapterIndex,
            usable.contains(index), !visibleText.isEmpty {
             let joined = visibleText.joined(separator: "\n")
-            let clipped = String(joined.prefix(excerptCharacters))
+            let clipped = String(joined.prefix(max(0, min(excerptCharacters, maxCharacters - knowledge.count))))
             if !clipped.isEmpty {
                 excerpts.append(.init(
                     chapterIndex: index + 1,
@@ -126,7 +128,7 @@ public struct ContextBuilder: Sendable {
             )
             for hit in picked {
                 let clipped = String(hit.text.prefix(excerptCharacters))
-                guard used + clipped.count <= remaining else { break }
+                guard clipped.count <= maxCharacters - knowledge.count - used else { break }
                 excerpts.append(.init(
                     chapterIndex: hit.chapterIndex,
                     href: hit.href,
@@ -149,34 +151,34 @@ public struct ContextBuilder: Sendable {
 
     // MARK: - 范围
 
-    /// 返回可用章节的下标范围（闭区间）。
-    func usableChapterRange(count: Int, currentChapterIndex: Int?, scope: KnowledgeScope) -> ClosedRange<Int> {
-        guard count > 0 else { return 0...0 }
+    /// 返回可用章节下标的半开区间，可表达空范围。
+    func usableChapterRange(count: Int, currentChapterIndex: Int?, scope: KnowledgeScope) -> Range<Int> {
+        guard count > 0 else { return 0..<0 }
         let last = count - 1
         guard let current = currentChapterIndex, (0...last).contains(current) else {
-            // 没定位到位置时：整本书就是全书；其余两档保守地退化为"只给书籍说明"
-            return scope == .wholeBook ? 0...last : 0...0
+            // 定位未知时受限范围不返回任何章节，更不能使用全书说明。
+            return scope == .wholeBook ? 0..<count : 0..<0
         }
         switch scope {
         case .upToProgress:
             // 不含当前章正文，避免读到一半的章节里后半部分剧透
-            return 0...max(current - 1, 0)
+            return 0..<current
         case .currentChapter:
-            return 0...current
+            return 0..<(current + 1)
         case .wholeBook:
-            return 0...last
+            return 0..<count
         }
     }
 
-    private func describe(scope: KnowledgeScope, usable: ClosedRange<Int>, total: Int) -> String {
+    private func describe(scope: KnowledgeScope, usable: Range<Int>, total: Int) -> String {
         switch scope {
         case .wholeBook:
             return "整本书（共 \(total) 章）"
         case .currentChapter:
-            return "第 1–\(usable.upperBound + 1) 章（含当前整章）"
+            return "第 1–\(usable.upperBound) 章（含当前整章）"
         case .upToProgress:
-            let upTo = usable.upperBound + 1
-            return upTo <= 0 ? "尚未进入正文" : "第 1–\(upTo) 章（已读范围）"
+            let upTo = usable.upperBound
+            return upTo <= 0 ? "无已完成章节，仅使用当前可见正文" : "第 1–\(upTo) 章（已读范围）及当前可见正文"
         }
     }
 
@@ -202,7 +204,7 @@ public struct ContextBuilder: Sendable {
     func search(
         question: String,
         chapters: [BookPreprocessor.Chapter],
-        within range: ClosedRange<Int>,
+        within range: Range<Int>,
         limit: Int
     ) -> [Hit] {
         guard limit > 0, !question.isEmpty, !chapters.isEmpty else { return [] }
@@ -239,7 +241,7 @@ public struct ContextBuilder: Sendable {
             }
         }
         // 中文 2-gram：汉字连续段上滑窗
-        let chinese = question.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }
+        let chinese = question.unicodeScalars.filter { (0x4E00..<0x9FFF).contains($0.value) }
         if chinese.count >= 2 {
             let scalars = Array(chinese)
             for i in 0..<(scalars.count - 1) {

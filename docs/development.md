@@ -28,7 +28,7 @@
 cd swift
 swift build                    # 全部 target
 swift build --product booksbridged
-swift test                     # 144 个测试
+swift test                     # 155 个测试
 ```
 
 ---
@@ -54,16 +54,17 @@ swift/
 
 ## 测试
 
-144 个用例，按关注点分文件：
+155 个用例，按关注点分文件：
 
 | 文件 | 用例 | 覆盖 |
 |---|---|---|
 | `CFITests` | 21 | CFI 解析（含真实样本与边界） |
-| `LLMContextTests` | 34 | 范围边界、检索、分块、知识缓存 |
+| `LLMContextTests` | 38 | 范围边界、检索、分块、知识缓存 |
 | `LLMClientTests` | 19 | SSE 解析、请求构造、URL 规范化 |
 | `PermissionAndMenuTests` | 18 | 权限判定语义、状态栏菜单结构 |
 | `SettingsStoreTests` | 16 | 设置往返、0600 权限、向后兼容 |
-| `ConversationStoreTests` | 15 | 持久化、原子写、编号递增、损坏恢复 |
+| `ConversationStoreTests` | 18 | 持久化、原子写、编号递增、损坏恢复 |
+| `ReadingAssistantTests` | 4 | 重启缓存复用、进度刷新、跨书隔离、旧缓存不触发付费调用 |
 | `IntegrationTests` | 9 | **跑在真实书库上** |
 | `BooksPathsTests` | 7 | 路径发现、作者字段清洗 |
 | `FileWatcherTests` | 5 | 触发、合并、文件后创建、停止 |
@@ -77,7 +78,7 @@ swift/
 
 有些测试**不是断言"正确"而是记录取舍**，避免将来有人误以为是 bug：
 
-- `testContentHashToleratesSingleInteriorChange` —— 采样式指纹允许漏判单个内部字符改动
+- `testContentHashDetectsInteriorChange` —— 完整 SHA-256 指纹覆盖正文内部改动
 - `testMissingBooksDataWithoutBooksInstalledIsUnknown` —— 缺数据不等于没权限
 
 ---
