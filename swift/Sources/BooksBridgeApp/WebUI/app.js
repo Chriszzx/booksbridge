@@ -334,7 +334,7 @@
 
     const roleLabel = document.createElement("div");
     roleLabel.className = "msg-role";
-    roleLabel.textContent = options.roleLabel ?? (role === "user" ? "我" : "助手");
+    roleLabel.textContent = options.roleLabel ?? (role === "user" ? "我" : settingsState.settings?.model ?? "助手");
     wrap.append(roleLabel);
 
     if (options.reasoning !== undefined) {
@@ -351,7 +351,8 @@
 
     const body = document.createElement("div");
     body.className = "msg-body";
-    body.textContent = text ?? "";
+    if (role === "assistant") renderMarkdown(body, text ?? "");
+    else body.textContent = text ?? "";
     wrap.append(body);
 
     if (options.meta) {
@@ -386,7 +387,7 @@
   // ---------- 渲染：预处理状态 ----------
 
   function renderPreparation() {
-    const text = chatState.preparation || (chatState.scope === "wholeBook" ? "按需检索全书原文，也可选择预处理" : "");
+    const text = hasConversation() ? (chatState.preparation || "直接读取本地原文 · 未生成摘要") : "";
     if (!text) {
       els.prepBar.hidden = true;
       return;
@@ -395,9 +396,13 @@
     els.prepText.textContent = text;
     els.prepBar.classList.toggle("ready", chatState.preparationReady);
     els.prepBar.classList.toggle("failed", chatState.preparationFailed);
-    els.prepRetry.hidden = chatState.scope !== "wholeBook";
+    els.prepRetry.hidden = !hasConversation();
+    const processing = /正在/.test(text);
+    document.getElementById("prep-cancel").hidden = !processing;
+    document.getElementById("prep-clear").hidden = !chatState.preparationReady;
+    els.prepRetry.hidden = processing || !hasConversation();
     els.prepRetry.disabled = chatState.streaming || !(settingsState.settings?.isConfigured ?? false);
-    els.prepRetry.textContent = "预处理全书（消耗 API 用量）";
+    els.prepRetry.textContent = chatState.preparationReady ? "重新生成摘要" : "生成阅读摘要（可选）";
   }
 
   // ---------- 渲染：知识范围选择器 ----------
@@ -411,31 +416,16 @@
       chatState.scope = settingsState.settings?.defaultScope ?? scopes[0].id;
     }
 
-    // 选项数量或内容变化时才重建，避免每次推送都闪一下
-    const wanted = scopes.map((s) => s.id).join(",");
-    if (els.scopePicker.dataset.built !== wanted) {
-      els.scopePicker.textContent = "";
-      for (const scope of scopes) {
-        const button = document.createElement("button");
-        button.className = "scope-option";
-        button.dataset.scope = scope.id;
-        button.textContent = scope.label;
-        button.title = scope.explanation ?? "";
-        button.addEventListener("click", () => {
-          if (state.active?.scope) return;
-          chatState.scope = scope.id;
-          renderScopePicker();
-        });
-        els.scopePicker.append(button);
-      }
-      els.scopePicker.dataset.built = wanted;
+    if (els.scopePicker.options.length !== scopes.length) {
+      els.scopePicker.replaceChildren(...scopes.map(scope => {
+        const option = document.createElement("option");
+        option.value = scope.id; option.textContent = scope.label; return option;
+      }));
     }
-
-    for (const button of els.scopePicker.querySelectorAll(".scope-option")) {
-      button.classList.toggle("active", button.dataset.scope === chatState.scope);
-      button.disabled = !!state.active?.scope || chatState.streaming;
-      button.title = state.active?.scope ? "本对话范围已固定，切换范围请新建对话" : (scopes.find(s => s.id === button.dataset.scope)?.explanation ?? "");
-    }
+    els.scopePicker.value = chatState.scope;
+    els.scopePicker.disabled = !!state.active?.scope || chatState.streaming;
+    els.scopePicker.title = state.active?.scope ? "本对话权限已固定；更换权限请新建对话" : "选择本对话的读取权限";
+    document.getElementById("composer-model").textContent = settingsState.settings?.model ?? "未配置模型";
     renderPreparation();
   }
 
@@ -487,7 +477,13 @@
       case "delta":
         if (!chatState.streamNode) startAssistantMessage();
         chatState.streamText += event.text;
-        chatState.streamNode.textContent = chatState.streamText;
+        if (!chatState.renderPending) {
+          chatState.renderPending = true;
+          requestAnimationFrame(() => {
+            chatState.renderPending = false;
+            if (chatState.streaming && chatState.streamNode) { renderMarkdown(chatState.streamNode, chatState.streamText); showCursor(true); }
+          });
+        }
         showCursor(true);
         scrollToBottom();
         break;
@@ -533,7 +529,7 @@
   function finishAssistantMessage(event) {
     showCursor(false);
     if (chatState.streamNode) {
-      chatState.streamNode.textContent = event.text ?? chatState.streamText;
+      renderMarkdown(chatState.streamNode, event.text ?? chatState.streamText);
       // 在气泡下方补一行出处与用量
       const bits = [];
       if (event.scope) bits.push(`范围：${event.scope}`);
@@ -730,6 +726,7 @@
     if (key === renderedConversationKey) return;
     renderedConversationKey = key;
     chatState.streaming = false;
+    chatState.preparation = ""; chatState.preparationReady = false; chatState.preparationFailed = false;
     renderComposerState();
     renderScopePicker();
 
@@ -741,7 +738,7 @@
     // 历史消息随 active 一起推送（library 里只有计数，不带正文）
     for (const message of state.active?.messages ?? []) {
       appendMessage(message.role, message.text, {
-        roleLabel: message.role === "user" ? "我" : "助手",
+        roleLabel: message.role === "user" ? "我" : settingsState.settings?.model ?? "助手",
       });
     }
     renderThreadShell();
@@ -768,6 +765,9 @@
       if (Array.isArray(payload.thinkingLevels)) settingsState.thinkingLevels = payload.thinkingLevels;
       if (payload.permissionProbe) settingsState.permissionProbe = payload.permissionProbe;
 
+      if (payload.apiTest && payload.apiTest.requestID === apiRequestID) {
+        apiResult.textContent = payload.apiTest.text; apiTestButton.disabled = false;
+      }
       if (payload.openSettings) showView("settings");
 
       // 会话历史：仅在切换会话时整段重绘，避免与流式渲染互相打架
@@ -931,7 +931,35 @@
 
   els.sendBtn.addEventListener("click", send);
   els.cancelBtn.addEventListener("click", () => invoke("cancelAnswer"));
-  els.prepRetry.addEventListener("click", () => invoke("reprocessBook", { scope: chatState.scope }));
+  els.scopePicker.addEventListener("change", () => {
+    if (!state.active?.scope) chatState.scope = els.scopePicker.value;
+    renderScopePicker();
+  });
+  els.prepRetry.addEventListener("click", () => {
+    const dialog = document.getElementById("prepare-confirm");
+    document.getElementById("prepare-destination").textContent = `将整本书正文发送至 ${settingsState.settings?.baseURL ?? "当前接口"}，使用 ${settingsState.settings?.model ?? "当前模型"} 生成摘要，会产生 API 用量。摘要保存在本机，可随时清除。不会更改本对话的读取权限。`;
+    dialog.showModal();
+  });
+  document.getElementById("prepare-yes").addEventListener("click", () => {
+    document.getElementById("prepare-confirm").close(); invoke("reprocessBook", { confirmed: true });
+  });
+  document.getElementById("prepare-no").addEventListener("click", () => document.getElementById("prepare-confirm").close());
+  document.getElementById("prep-cancel").addEventListener("click", () => invoke("cancelPreparation"));
+  document.getElementById("prep-clear").addEventListener("click", () => invoke("clearKnowledge"));
+  let apiRequestID = "";
+  const apiResult = document.getElementById("api-test-result");
+  const apiTestButton = document.getElementById("api-test");
+  for (const field of [els.setBaseURL, els.setModel, els.setApiKey, els.setProvider].filter(Boolean)) {
+    field.addEventListener("input", () => {
+      apiRequestID = ""; apiTestButton.disabled = false; apiResult.textContent = "配置已改变，请重新检测";
+    });
+  }
+  apiTestButton.addEventListener("click", () => {
+    apiRequestID = String(Date.now()); apiTestButton.disabled = true; apiResult.textContent = "正在检测…";
+    const key = els.setApiKey.value.trim();
+    invoke("testAPI", { requestID: apiRequestID, baseURL: els.setBaseURL.value.trim(), model: els.setModel.value.trim(),
+      ...((key && !/^•+$/.test(key)) ? { apiKey: key } : {}) });
+  });
 
   els.input.addEventListener("input", () => {
     autoGrow();
@@ -1031,6 +1059,7 @@
   window.addEventListener("keydown", (event) => {
     const isSettings = !els.viewSettings.hidden;
 
+    if (event.key === "Escape" && document.querySelector("dialog[open]")) return;
     if (event.key === "Escape") {
       event.preventDefault();
       if (isSettings) {

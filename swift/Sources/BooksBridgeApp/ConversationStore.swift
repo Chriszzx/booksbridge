@@ -68,10 +68,12 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         public var role: Role
         public var text: String
         public var createdAt: Date
+        public var boundary: ReadingBoundary?
 
-        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date()) {
+        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil) {
             self.id = id
             self.role = role
+            self.boundary = boundary
             self.text = text
             self.createdAt = createdAt
         }
@@ -295,6 +297,14 @@ public final class ConversationStore {
         state.books[bi].conversations[ci].scopeHistoryStartIndex = state.books[bi].conversations[ci].messages.count
         persist()
         return requested
+    }
+
+    public func markLastQuestion(assetID: String, conversationID: String, boundary: ReadingBoundary?) {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }),
+              let mi = state.books[bi].conversations[ci].messages.lastIndex(where: { $0.role == .user }) else { return }
+        state.books[bi].conversations[ci].messages[mi].boundary = boundary
+        persist()
     }
 
     /// 追加一条消息（骨架期不会被调用，接入 LLM 后使用）。

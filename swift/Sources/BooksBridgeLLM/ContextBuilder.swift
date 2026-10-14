@@ -3,27 +3,7 @@ import Foundation
 
 /// 按知识范围组装送给 LLM 的上下文。
 ///
-/// ## 关于"读到哪为止"的实现依据
-///
-/// 判断读者位置最直接的想法是用 CFI 尾部的字符偏移换算成章节内百分比。
-/// **实测证明这不可行**：本机 53 条真实位置记录里，偏移与章节长度的比值
-/// 均值 0.0059 而标准差 0.0237（标准差是均值的 4 倍），典型样本如
-/// 「偏移 239 / 章节 39442」= 0.6%。原因是该偏移是相对 XPath 指向的
-/// **那个文本节点**的，不是相对章节开头。
-///
-/// 因此这里采用与三档范围语义一致的边界：
-/// - `upToProgress`  → 当前章**之前**的章节（不含当前章正文）
-/// - `currentChapter`→ 当前章**及其之前**的章节
-/// - `wholeBook`     → 全部章节
-///
-/// 这样三档之间的实际差别就是"是否包含当前章 → 是否包含后续章节"，
-/// 与用户在界面上看到的说明一致，也不会因为不可靠的偏移估算给出错误的剧透边界。
-///
-/// ## 为什么除了范围还要做检索
-///
-/// 全书正文动辄十几万字，全塞进去既慢又贵。预处理产出的书籍说明已经压缩了
-/// 全局理解，这里再按读者的问题检索出最相关的片段补上原文细节，
-/// 兼顾"知道整本"与"引得到原文"。
+/// 原文先由 ScopedReading 裁到权限边界，再检索；磁盘不保存正文副本。
 public struct ContextBuilder: Sendable {
     public struct BuiltContext: Sendable {
         /// 送进 system 的书籍知识（预处理说明）。
@@ -87,12 +67,13 @@ public struct ContextBuilder: Sendable {
         currentChapterIndex: Int?,
         scope: KnowledgeScope,
         question: String,
-        visibleText: [String] = []
+        visibleText: [String] = [],
+        preScoped: Bool = false
     ) -> BuiltContext {
         // 全书摘要只供全书范围使用，受限范围只检索允许的原文。
-        let knowledge = scope == .wholeBook ? String(knowledge.prefix(max(0, maxCharacters))) : ""
+        let knowledge = scope == .wholeBook ? String(knowledge.prefix(max(0, maxCharacters / 3))) : ""
         // 1) 按范围确定可用章节
-        let usable = usableChapterRange(
+        let usable = preScoped ? 0..<chapters.count : usableChapterRange(
             count: chapters.count,
             currentChapterIndex: currentChapterIndex,
             scope: scope
@@ -120,12 +101,19 @@ public struct ContextBuilder: Sendable {
         // 2b) 再按问题检索
         let remaining = max(maxCharacters - knowledge.count - used, 0)
         if remaining > 200 {
-            let picked = search(
+            var picked = search(
                 question: question,
                 chapters: chapters,
                 within: usable,
                 limit: maxExcerpts - excerpts.count
             )
+            if picked.isEmpty {
+                // A broad question still needs material; never silently become current-page-only.
+                for i in usable.reversed().prefix(maxExcerpts - excerpts.count) {
+                    picked.append(Hit(chapterIndex: i + 1, href: chapters[i].href,
+                        text: String(chapters[i].text.suffix(excerptCharacters)), score: 0))
+                }
+            }
             for hit in picked {
                 let clipped = String(hit.text.prefix(excerptCharacters))
                 guard clipped.count <= maxCharacters - knowledge.count - used else { break }
@@ -138,7 +126,9 @@ public struct ContextBuilder: Sendable {
             }
         }
 
-        let description = describe(scope: scope, usable: usable, total: chapters.count)
+        let description = preScoped && scope == .upToProgress
+            ? "书首至当前页末尾（含当前章已读部分）"
+            : describe(scope: scope, usable: usable, total: chapters.count)
         let context = BuiltContext(
             knowledge: knowledge,
             excerpts: excerpts,
@@ -214,10 +204,10 @@ public struct ContextBuilder: Sendable {
         var hits: [Hit] = []
         for index in range where index < chapters.count {
             let chapter = chapters[index]
-            for paragraph in chapter.text.components(separatedBy: "\n") {
+            for paragraph in Self.chunks(chapter.text, size: max(200, excerptCharacters)) {
                 let trimmed = paragraph.trimmingCharacters(in: .whitespaces)
                 // 过短的段落（标题、页码）区分度低
-                guard trimmed.count >= 20 else { continue }
+                guard !trimmed.isEmpty else { continue }
                 let score = Self.score(paragraph: trimmed, terms: terms)
                 guard score > 0 else { continue }
                 hits.append(Hit(chapterIndex: index + 1, href: chapter.href, text: trimmed, score: score))
@@ -229,6 +219,18 @@ public struct ContextBuilder: Sendable {
             $0.score == $1.score ? $0.chapterIndex > $1.chapterIndex : $0.score > $1.score
         }
         return Array(hits.prefix(limit))
+    }
+
+    static func chunks(_ text: String, size: Int) -> [String] {
+        var result: [String] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            let end = text.index(start, offsetBy: size, limitedBy: text.endIndex) ?? text.endIndex
+            result.append(String(text[start..<end]))
+            if end == text.endIndex { break }
+            start = text.index(start, offsetBy: max(1, size - 100), limitedBy: text.endIndex) ?? text.endIndex
+        }
+        return result
     }
 
     /// 从问题里抽出查询词：中文用 2-gram，英文/数字用整词。

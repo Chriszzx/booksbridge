@@ -50,6 +50,8 @@ public final class StatusItemController: NSObject {
     /// 由外部提供当前状态，避免这里持有业务对象。
     public var stateProvider: () -> MenuState = { MenuState() }
 
+    private var menuIsOpen = false
+    public var onRefresh: (() -> Void)?
     private let statusItem: NSStatusItem
     private let onOpenPage: () -> Void
     private let onOpenSettings: () -> Void
@@ -108,6 +110,7 @@ public final class StatusItemController: NSObject {
             parts.append("图书 App 未在阅读")
         }
         statusItem.button?.toolTip = parts.joined(separator: " · ")
+        if menuIsOpen, let menu = statusItem.menu { rebuild(menu) }
     }
 
     // MARK: - 菜单构造
@@ -247,6 +250,14 @@ extension StatusItemController: NSMenuDelegate {
     /// 返回 false 表示"不复用旧菜单"：AppKit 会直接用我们在 `menuNeedsUpdate` 里
     /// 换上的新菜单，不再做自己的启用状态推断（启用状态由我们显式设置）。
     public func menuNeedsUpdate(_ menu: NSMenu) {
+        onRefresh?()
+        rebuild(menu)
+    }
+
+    public func menuWillOpen(_ menu: NSMenu) { menuIsOpen = true }
+    public func menuDidClose(_ menu: NSMenu) { menuIsOpen = false }
+
+    private func rebuild(_ menu: NSMenu) {
         menu.removeAllItems()
         let fresh = buildMenu()
         for item in fresh.items {

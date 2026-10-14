@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// 把各层拼装成"用户此刻在读什么"的单一事实来源。
 ///
@@ -26,6 +27,9 @@ public final class ReadingCoordinator: @unchecked Sendable {
     private let options: Options
 
     private let queue = DispatchQueue(label: "booksbridge.coordinator")
+    private var activationObserver: NSObjectProtocol?
+    private var timer: DispatchSourceTimer?
+    private var stopped = false
     private var watcher: FileWatcher?
     private var isCollecting = false
     private var needsRecollect = false
@@ -47,19 +51,31 @@ public final class ReadingCoordinator: @unchecked Sendable {
         self.options = options
     }
 
+    deinit { if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }; timer?.cancel() }
+
     // MARK: - 生命周期
 
     /// 开始监听：先采集一次，然后监听数据文件变化。
     public func start() {
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil) { [weak self] _ in self?.refresh() }
         queue.async { [weak self] in
             guard let self else { return }
+            self.stopped = false
             self.collect()
             self.startWatching()
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + 1, repeating: 1)
+            timer.setEventHandler { [weak self] in self?.scheduleCollect() }
+            self.timer = timer; timer.resume()
         }
     }
 
     public func stop() {
+        if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
+        activationObserver = nil
         queue.sync { [weak self] in
+            self?.stopped = true
+            self?.timer?.cancel(); self?.timer = nil
             self?.watcher?.stop()
             self?.watcher = nil
         }
@@ -74,7 +90,10 @@ public final class ReadingCoordinator: @unchecked Sendable {
     }
 
     /// 合并并发触发：采集进行中时只记一个"待重采"标记。
+    public func refresh() { queue.async { [weak self] in self?.scheduleCollect() } }
+
     private func scheduleCollect() {
+        guard !stopped else { return }
         if isCollecting {
             needsRecollect = true
             return
@@ -94,7 +113,7 @@ public final class ReadingCoordinator: @unchecked Sendable {
             }
         }
 
-        guard let context = makeContext() else { return }
+        guard let context = makeContext() else { lastSignature = nil; return }
 
         // 用签名去重：只有真正变化才回调，避免 AX 噪声导致刷屏
         let signature = Self.signature(of: context)
@@ -104,36 +123,30 @@ public final class ReadingCoordinator: @unchecked Sendable {
     }
 
     /// 采集一次完整快照。返回 nil 表示当前没有可用的阅读上下文。
+    public func activeBookID() -> String? {
+        guard let snapshot = try? axReader.snapshot(), let title = snapshot.windowTitles.first else { return nil }
+        let books = (try? store.books(titled: title)) ?? []
+        return Self.matchActiveBook(title: title, books: books)?.assetID
+    }
+
+    public static func matchActiveBook(title: String, books: [Book]) -> Book? {
+        let matches = books.filter { $0.title.trimmingCharacters(in: .whitespacesAndNewlines) == title.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return matches.count == 1 ? matches.first : nil
+    }
+
     public func makeContext() -> ReadingContext? {
         guard permissions.fullDiskAccessStatus().isGranted else {
             onIssue?("缺少完全磁盘访问权限，无法读取图书数据")
             return nil
         }
-        guard let assetID = store.currentAssetID() else {
-            onIssue?("偏好设置里没有 kLastCurrentBookKey（图书 App 可能还没打开过任何书）")
+        guard let snapshot = try? axReader.snapshot(), let title = snapshot.windowTitles.first,
+              let book = Self.matchActiveBook(title: title, books: (try? store.books(titled: title)) ?? []) else {
+            onIssue?("当前阅读窗口无法唯一匹配书籍，请在 Apple Books 中打开一本书")
             return nil
         }
-        guard let book = try? store.book(assetID: assetID) else {
-            onIssue?("书库里找不到 assetID=\(assetID)")
-            return nil
-        }
-        let position = try? store.readingPosition(assetID: assetID)
-
-        var visible: [String] = []
-        var selection: String?
-        if options.includeVisibleText {
-            switch permissions.accessibilityStatus() {
-            case .granted:
-                if let snapshot = try? axReader.snapshot() {
-                    visible = snapshot.visibleText
-                    selection = snapshot.selection
-                }
-            case .denied:
-                onIssue?("缺少辅助功能权限，无法读取屏幕可见正文")
-            case .unknown(let why):
-                onIssue?("辅助功能权限状态未知：\(why)")
-            }
-        }
+        let position = try? store.readingPosition(assetID: book.assetID)
+        let visible = options.includeVisibleText ? snapshot.visibleText : []
+        let selection = snapshot.selection
 
         return ReadingContext(
             book: book,
@@ -150,7 +163,7 @@ public final class ReadingCoordinator: @unchecked Sendable {
     private static func signature(of context: ReadingContext) -> String {
         let cfi = context.position?.cfi ?? context.position?.raw ?? "-"
         let sel = context.selection ?? "-"
-        return "\(context.book.assetID)|\(cfi)|\(context.visibleText.count)|\(sel.count)"
+        return "\(context.book.assetID)|\(context.book.progress)|\(cfi)|\(context.visibleText.joined())|\(sel)"
     }
 
     // MARK: - 派生：可喂给 LLM 的章节正文

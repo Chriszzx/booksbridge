@@ -126,6 +126,9 @@ public struct BookPreprocessor: Sendable {
         public let spineIndex: Int
         public let href: String
         public let text: String
+        public init(spineIndex: Int, href: String, text: String) {
+            self.spineIndex = spineIndex; self.href = href; self.text = text
+        }
     }
 
     /// 按 spine 顺序抽出各章正文。
@@ -138,7 +141,7 @@ public struct BookPreprocessor: Sendable {
                   let text = try? epub.text(forHref: href) else { continue }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             // 少于 200 字的多半是扉页/版权页/目录，对理解全书帮助很小
-            guard trimmed.count >= 200 else { continue }
+            guard !trimmed.isEmpty else { continue }
             result.append(Chapter(spineIndex: index + 1, href: href, text: trimmed))
         }
         return result

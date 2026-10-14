@@ -22,7 +22,7 @@ public final class ReadingAssistant {
 
         public var label: String {
             switch self {
-            case .idle: "未预处理"
+            case .idle: "直接读取本地原文 · 未生成有效摘要"
             case .processing(let done, let total): "正在理解全书 \(done)/\(total)"
             case .ready(let characters, let chapters, _):
                 "已理解全书 · \(chapters) 章 / \(characters / 1000)k 字"
@@ -54,10 +54,12 @@ public final class ReadingAssistant {
 
     // MARK: - 运行时状态
 
+    public private(set) var lastBoundary: ReadingBoundary?
     public private(set) var preparation: PreparationState = .idle
     /// 当前已加载的书与正文，供提问时使用。
     private var loaded: LoadedBook?
     /// 正在进行的预处理任务，用于切换书目时取消。
+    private var preparationGeneration = UUID()
     private var preparationTask: Task<Void, Never>?
     /// 正在进行的问答任务，用于用户中断。
     private var answerTask: Task<Void, Never>?
@@ -93,7 +95,7 @@ public final class ReadingAssistant {
 
     // MARK: - 已加载的书
 
-    struct LoadedBook {
+    struct LoadedBook: Sendable {
         var book: Book
         let epub: EpubDocument
         let chapters: [BookPreprocessor.Chapter]
@@ -111,21 +113,17 @@ public final class ReadingAssistant {
         forceReprocess: Bool = false
     ) -> AsyncStream<Event> {
         preparationTask?.cancel()
+        preparationGeneration = UUID()
+        let generation = preparationGeneration
         answerTask?.cancel()
 
         return AsyncStream { continuation in
             let task = Task { @MainActor in
                 do {
-                    let loaded = try self.load(book: book, currentCFI: currentCFI)
+                    let loaded = try await Task.detached { try Self.load(book: book, currentCFI: currentCFI) }.value
+                    try Task.checkCancellation()
                     self.loaded = loaded
                     self.emit(.preparationChanged(.idle), to: continuation)
-
-                    guard self.isConfigured else {
-                        self.preparation = .failed("未配置 API Key")
-                        self.emit(.preparationChanged(self.preparation), to: continuation)
-                        continuation.finish()
-                        return
-                    }
 
                     // 缓存命中且正文未变就不重做
                     if !forceReprocess,
@@ -150,6 +148,7 @@ public final class ReadingAssistant {
                         continuation.finish()
                         return
                     }
+                    guard self.isConfigured else { throw ChatClient.ClientError.missingAPIKey }
                     try Task.checkCancellation()
                     self.preparation = .processing(done: 0, total: 1)
                     self.emit(.preparationChanged(self.preparation), to: continuation)
@@ -157,6 +156,7 @@ public final class ReadingAssistant {
                     let preprocessor = BookPreprocessor(client: self.client, model: self.settings.model)
                     let knowledge = try await preprocessor.process(book: book, epub: loaded.epub) { progress in
                         Task { @MainActor in
+                            guard self.preparationGeneration == generation else { return }
                             switch progress {
                             case .started(let count):
                                 self.preparation = .processing(done: 0, total: count)
@@ -197,7 +197,7 @@ public final class ReadingAssistant {
         }
     }
 
-    private func load(book: Book, currentCFI: String?) throws -> LoadedBook {
+    nonisolated private static func load(book: Book, currentCFI: String?) throws -> LoadedBook {
         guard let path = book.path else {
             throw AssistantError.noLocalFile
         }
@@ -216,7 +216,7 @@ public final class ReadingAssistant {
     ///
     /// 注意 `chapters` 已过滤掉过短的页面（扉页、目录），
     /// 所以不能直接用 spine 序号当下标，必须按 spineIndex 反查。
-    static func locateChapter(
+    nonisolated static func locateChapter(
         cfi: String?,
         epub: EpubDocument,
         chapters: [BookPreprocessor.Chapter]
@@ -231,7 +231,7 @@ public final class ReadingAssistant {
     /// 提问前更新本书快照；受限范围无法定位时停止，避免使用旧位置。
     func refreshReading(book: Book, currentCFI: String?, scope: KnowledgeScope) throws {
         if loaded?.book.assetID != book.assetID || loaded?.book.path != book.path {
-            loaded = try load(book: book, currentCFI: currentCFI)
+            loaded = try Self.load(book: book, currentCFI: currentCFI)
         }
         guard var snapshot = loaded else { throw AssistantError.notLoaded }
         snapshot.book = book
@@ -251,14 +251,19 @@ public final class ReadingAssistant {
         question: String,
         scope: KnowledgeScope,
         visibleText: [String] = [],
-        history: [ChatMessage] = []
+        history: [ChatMessage] = [],
+        historyBoundaries: [ReadingBoundary?] = []
     ) -> AsyncStream<Event> {
         answerTask?.cancel()
 
         return AsyncStream { continuation in
             let task = Task { @MainActor in
                 do {
-                    try self.refreshReading(book: book, currentCFI: currentCFI, scope: scope)
+                    if self.loaded?.book.assetID != book.assetID || self.loaded?.book.path != book.path {
+                        self.loaded = try await Task.detached { try Self.load(book: book, currentCFI: currentCFI) }.value
+                        try Task.checkCancellation()
+                    }
+                    try self.refreshReading(book: book, currentCFI: currentCFI, scope: .wholeBook)
                 } catch {
                     self.emit(.failed(String(describing: error)), to: continuation)
                     continuation.finish()
@@ -271,32 +276,69 @@ public final class ReadingAssistant {
                     return
                 }
 
-                let context = self.contextBuilder.build(
+                let allowed: ScopedReading
+                do {
+                    allowed = try ScopedReading.resolve(chapters: loaded.chapters,
+                        current: loaded.currentChapterIndex, scope: scope, visible: visibleText)
+                } catch {
+                    self.emit(.failed(String(describing: error)), to: continuation)
+                    continuation.finish(); return
+                }
+                self.lastBoundary = allowed.boundary
+                let safeHistory = history.enumerated().compactMap { i, message -> ChatMessage? in
+                    guard historyBoundaries.indices.contains(i), let boundary = historyBoundaries[i],
+                          boundary <= allowed.boundary else { return nil }
+                    return message
+                }
+                // Reserve room for system instructions, history, question and the response.
+                let totalBudget = max(4000, min(self.settings.maxContextCharacters, 200000))
+                let historyBudget = min(6000, totalBudget / 4)
+                let boundedHistory = PromptBuilder.trimHistory(safeHistory, characters: historyBudget)
+                let materialBudget = max(500, totalBudget - 2200 - question.count - boundedHistory.reduce(0) { $0 + $1.content.count })
+                let context = ContextBuilder(maxCharacters: materialBudget, maxExcerpts: 12, excerptCharacters: 1400).build(
                     knowledge: loaded.knowledge?.readme ?? "",
-                    chapters: loaded.chapters,
-                    currentChapterIndex: loaded.currentChapterIndex,
+                    chapters: allowed.chapters,
+                    currentChapterIndex: allowed.currentChapter,
                     scope: scope,
                     question: question,
-                    visibleText: visibleText
+                    visibleText: visibleText, preScoped: true
                 )
 
-                let messages = self.promptBuilder.build(
+                var messages = self.promptBuilder.build(
                     book: loaded.book,
                     question: question,
                     context: context,
-                    visibleText: visibleText,
+                    visibleText: [],
                     progress: loaded.book.progress,
-                    history: history
+                    history: boundedHistory
                 )
 
                 var answer = ""
                 var usage: TokenUsage?
                 do {
+                    // Bounded tool loop: the model can ask for extra local evidence.
+                    // Only permitted chapters enter the tool object; no file access is exposed.
+                    let tools = ReadingTools(reading: allowed)
+                    var evidence = ""
+                    let toolBudget = max(0, totalBudget - messages.reduce(0) { $0 + $1.content.count } - 500)
+                    if toolBudget >= 500 {
+                        for _ in 0..<2 {
+                            try Task.checkCancellation()
+                            let instruction = "你是阅读材料检索器，不回答问题。判断是否需要补充材料。只返回一个 JSON 对象，不用代码围栏：{\"tool\":\"search\",\"query\":\"关键词\"} 或 {\"tool\":\"read\",\"chapter\":0,\"offset\":0,\"length\":1200}；材料足够返回 {\"tool\":\"done\"}。章节编号从0开始，仅可读目录：" + String(tools.catalog.prefix(1200))
+                            let plan = try await self.client.complete(model: self.settings.model,
+                                messages: PromptBuilder.retrievalMessages(instruction: instruction, question: question, material: context.render() + evidence, budget: min(totalBudget, 5000)), maxTokens: 200)
+                            guard let result = tools.execute(plan.text) else { break }
+                            let remaining = toolBudget - evidence.count
+                            guard remaining > 0 else { break }
+                            evidence += String(result.prefix(remaining))
+                        }
+                    }
+                    if !evidence.isEmpty { messages.append(.user("本轮读取工具返回的补充原文（仍在权限内）：\n" + evidence)) }
                     let stream = self.client.stream(
                         model: self.settings.model,
                         messages: messages,
                         thinking: self.settings.thinkingLevel.thinkingMode,
-                        temperature: self.settings.temperature
+                        temperature: self.settings.temperature, maxTokens: 2048
                     )
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -310,6 +352,7 @@ public final class ReadingAssistant {
                             usage = reported
                         }
                     }
+                    try Task.checkCancellation()
                     self.emit(.finished(
                         answer: answer,
                         scopeDescription: context.scopeDescription,
@@ -328,6 +371,17 @@ public final class ReadingAssistant {
             self.answerTask = task
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    public func cancelPreparation() {
+        preparationGeneration = UUID()
+        preparationTask?.cancel(); preparationTask = nil; preparation = .idle
+    }
+
+    public func clearKnowledge(assetID: String) async {
+        cancelPreparation()
+        await knowledgeStore.remove(assetID: assetID)
+        if loaded?.book.assetID == assetID { loaded?.knowledge = nil }
     }
 
     public func cancelAnswer() {

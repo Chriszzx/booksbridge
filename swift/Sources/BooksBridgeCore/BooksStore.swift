@@ -82,6 +82,15 @@ public struct BooksStore: Sendable {
         return rows.first.flatMap(Self.makeBook)
     }
 
+    /// Match a live window without depending on the delayed last-opened timestamp.
+    public func books(titled title: String) throws -> [Book] {
+        guard let db = paths.libraryDatabase() else { return [] }
+        return try SQLite.query(path: db.path, """
+            SELECT ZASSETID, ZTITLE, ZAUTHOR, ZREADINGPROGRESS, ZCONTENTTYPE, ZPATH, ZLASTOPENDATE
+            FROM ZBKLIBRARYASSET WHERE ZTITLE = ?
+            """, [title]).compactMap(Self.makeBook)
+    }
+
     /// 最近打开过的书，按最后打开时间倒序。
     public func recentBooks(limit: Int = 15) throws -> [Book] {
         guard let db = paths.libraryDatabase() else { return [] }

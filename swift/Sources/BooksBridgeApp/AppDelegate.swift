@@ -28,6 +28,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 阅读问答编排：预处理与流式问答。
     private let assistant = ReadingAssistant(settings: AppSettings(), apiKey: "")
     /// 当前问答的流式事件流，用于取消。
+    private var apiTestTask: Task<Void, Never>?
+    private var apiTestGeneration = 0
     private var answerStream: Task<Void, Never>?
 
     /// 最近一次采集到的阅读上下文；未检测到时为 nil。
@@ -141,6 +143,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSWorkspace.shared.open(url)
             }
         )
+        statusItem.onRefresh = { [weak self] in self?.coordinator?.refresh() }
         statusItem.stateProvider = { [weak self] in
             guard let self else { return StatusItemController.MenuState() }
             let permissions = Permissions()
@@ -269,7 +272,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationDidBecomeActive(_ notification: Notification) {
-        guard frontendReady, returningFromPermissionSettings else { return }
+        guard frontendReady else { return }
+        if !returningFromPermissionSettings { coordinator?.refresh(); return }
         returningFromPermissionSettings = false
         reconnectBooks(requestAccessibility: false)
     }
@@ -355,6 +359,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 打开界面（菜单里的「打开界面」）。
     private func openPage() {
+        coordinator?.refresh()
         page.show()
         pushState(message: "页面已打开")
         pushSettings()
@@ -397,6 +402,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             pushState(message: "前端已就绪")
             // 立刻把设置也推一次：下拉选项要在用户打开设置面板之前就绪
             pushSettings()
+            if Permissions().accessibilityStatus().isGranted, Permissions().fullDiskAccessStatus().isGranted {
+                reconnectBooks(requestAccessibility: false)
+                if let active = store.state.lastActive { prepareBook(assetID: active.assetID, force: false) }
+            }
 
         // MARK: 侧栏交互
 
@@ -414,6 +423,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             cancelPendingAnswer()
             store.setActive(assetID: assetID, conversationID: conversationID)
             pushState(message: "已切换对话")
+            prepareBook(assetID: assetID, force: false)
 
         case "deleteConversation":
             guard let assetID = invocation.payload["assetID"] as? String,
@@ -448,13 +458,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case "reprocessBook":
             if connectionRequested, dataAccess.isGranted,
-               let active = store.state.lastActive, let id = active.conversationID,
-               invocation.payload["scope"] as? String == KnowledgeScope.wholeBook.rawValue,
-               store.lockScope(assetID: active.assetID, conversationID: id, requested: .wholeBook) == .wholeBook {
-                pushState(message: "本对话范围固定为整本书")
+               let active = store.state.lastActive,
+               invocation.payload["confirmed"] as? Bool == true {
                 prepareBook(assetID: active.assetID, force: true)
             }
 
+        case "cancelPreparation":
+            assistant.cancelPreparation()
+            handleAssistantEvent(.preparationChanged(.idle))
+        case "clearKnowledge":
+            if let active = store.state.lastActive {
+                Task { @MainActor in
+                    await assistant.clearKnowledge(assetID: active.assetID)
+                    handleAssistantEvent(.preparationChanged(.idle))
+                }
+            }
+        case "testAPI":
+            testAPI(invocation.payload)
         case "showPermissions":
             openSettings()
 
@@ -573,7 +593,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 draft.defaultScope = scope
             }
             if let value = payload["maxContextCharacters"] as? Int {
-                draft.maxContextCharacters = min(max(value, 1000), 200_000)
+                draft.maxContextCharacters = min(max(value, 4000), 200_000)
             }
             if let raw = payload["thinkingLevel"] as? String,
                let level = AppSettings.ThinkingLevel(rawValue: raw) {
@@ -630,6 +650,31 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 发起提问。
+    private func testAPI(_ payload: [String: Any]) {
+        apiTestTask?.cancel()
+        apiTestGeneration += 1
+        let generation = apiTestGeneration
+        let requestID = payload["requestID"] as? String ?? ""
+        let base = payload["baseURL"] as? String ?? settings.settings.baseURL
+        let model = payload["model"] as? String ?? settings.settings.model
+        let key = (payload["apiKey"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? settings.apiKey
+        apiTestTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let start = Date()
+            do {
+                let result = try await ChatClient(baseURL: base, apiKey: key, timeout: 15).complete(
+                    model: model, messages: [.user("Reply OK.")], maxTokens: 8)
+                try Task.checkCancellation()
+                guard generation == self.apiTestGeneration else { return }
+                guard !result.text.isEmpty else { throw ChatClient.ClientError.decoding("模型没有返回内容") }
+                self.bridge.push(["apiTest": ["requestID": requestID, "text": String(format: "可用 · %@ · %.0f ms · %@", model, Date().timeIntervalSince(start) * 1000, Date().formatted(date: .omitted, time: .standard))]])
+            } catch {
+                guard !Task.isCancelled, generation == self.apiTestGeneration else { return }
+                self.bridge.push(["apiTest": ["requestID": requestID, "text": "检测失败：\(error)"]])
+            }
+        }
+    }
+
     private func ask(_ payload: [String: Any]) {
         guard let question = (payload["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !question.isEmpty,
@@ -638,11 +683,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             bridge.push(["chatEvent": ["kind": "error", "text": "请先连接 Apple Books，以读取本书最新进度"]])
             return
         }
+        guard question.count <= max(500, settings.settings.maxContextCharacters / 4) else {
+            bridge.push(["chatEvent": ["kind": "error", "text": "问题超过请求预算，请缩短后发送"]]); return
+        }
         let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
         guard let scope = store.lockScope(assetID: active.assetID, conversationID: conversationID, requested: requested) else { return }
         // 历史在追加本轮问题之前取，避免重复发送；旧格式的未标注范围历史不参与。
         let conversation = store.conversation(assetID: active.assetID, conversationID: conversationID)!
-        let history: [ChatMessage] = conversation.messages.dropFirst(conversation.scopeHistoryStartIndex ?? 0).map {
+        let previous = Array(conversation.messages.dropFirst(conversation.scopeHistoryStartIndex ?? 0))
+        let history: [ChatMessage] = previous.map {
             $0.role == .user ? .user($0.text) : .assistant($0.text)
         }
         store.appendMessage(assetID: active.assetID, conversationID: conversationID,
@@ -658,17 +707,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     let source = BooksStore()
                     guard let book = try source.book(assetID: assetID) else { throw ReadingAssistant.AssistantError.notLoaded }
                     let position = try source.readingPosition(assetID: assetID)
-                    return (book, position?.cfi)
+                    return (book, position?.cfi, ReadingCoordinator().makeContext())
                 }.value
                 try Task.checkCancellation()
                 let visible: [String]
-                if self.booksStore.currentAssetID() == assetID,
-                   Permissions().accessibilityStatus().isGranted,
-                   let snapshot = try? AccessibilityReader().snapshot() {
-                    visible = [String(snapshot.visibleText.joined(separator: "\n").prefix(1200))]
-                } else { visible = [] }
+                let live = fresh.2
+                if let live, live.book.assetID == assetID { visible = live.visibleText }
+                else { visible = [] }
                 let stream = self.assistant.ask(book: fresh.0, currentCFI: fresh.1,
-                    question: question, scope: scope, visibleText: visible, history: history)
+                    question: question, scope: scope, visibleText: visible, history: history, historyBoundaries: previous.map(\.boundary))
                 for await event in stream {
                     guard !Task.isCancelled else { break }
                     guard self.store.state.lastActive?.assetID == assetID,
@@ -703,10 +750,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // 落盘助手回答
             if let active = store.state.lastActive,
                let conversationID = active.conversationID {
+                store.markLastQuestion(assetID: active.assetID, conversationID: conversationID, boundary: assistant.lastBoundary)
                 store.appendMessage(
                     assetID: active.assetID,
                     conversationID: conversationID,
-                    message: Conversation.Message(role: .assistant, text: answer)
+                    message: Conversation.Message(role: .assistant, text: answer, boundary: assistant.lastBoundary)
                 )
             }
             var payload: [String: Any] = [
@@ -744,6 +792,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         store.setActive(assetID: assetID, conversationID: conversation.id)
         pushState(message: "已新建 \(conversation.title)")
+        prepareBook(assetID: assetID, force: false)
     }
 
     /// 把"检测不到"归类，让前端能给出准确的提示而不是笼统的"未在阅读"。
@@ -883,6 +932,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self, self.connectionGeneration == generation else { return }
                 self.latestContext = nil
                 self.detectionIssue = message
+                self.statusItem.refreshTooltip()
                 self.pushState(message: "采集受阻")
             }
         }
@@ -966,6 +1016,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         var body: [String: Any] = ["message": message, "facts": facts]
 
+        body["detected"] = NSNull()
         // --- detected：实时检测，不落盘 ---
         if let context = latestContext {
             let book = context.book

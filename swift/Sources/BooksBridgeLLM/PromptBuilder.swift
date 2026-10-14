@@ -8,6 +8,25 @@ import Foundation
 public struct PromptBuilder: Sendable {
     public init() {}
 
+    public static func retrievalMessages(instruction: String, question: String, material: String, budget: Int) -> [ChatMessage] {
+        let question = String(question.prefix(max(0, min(1000, budget / 4))))
+        let label = "\n已检索材料：\n"
+        let remaining = max(0, budget - instruction.count - question.count - label.count)
+        return [.system(instruction), .user(question + label + String(material.prefix(remaining)))]
+    }
+
+    public static func trimHistory(_ messages: [ChatMessage], characters: Int) -> [ChatMessage] {
+        var kept: [ChatMessage] = []
+        var remaining = max(0, characters)
+        for message in messages.suffix(8).reversed() {
+            guard message.content.count <= remaining else { break }
+            kept.insert(message, at: 0); remaining -= message.content.count
+        }
+        // Avoid an orphaned assistant answer after trimming.
+        while kept.first?.role == .assistant { kept.removeFirst() }
+        return kept
+    }
+
     /// 系统提示词。
     ///
     /// 三件事必须说清：
@@ -63,7 +82,7 @@ public struct PromptBuilder: Sendable {
         if !material.isEmpty {
             sections.append("# 可用材料\n\n\(material)")
         } else {
-            sections.append("# 可用材料\n\n（暂无预处理说明，只能依据读者当前所见的原文回答）")
+            sections.append("# 可用材料\n\n（本轮没有检索到足够原文，请说明材料不足；读取权限仍覆盖上述范围，不等于只允许当前页）")
         }
 
         // 屏幕可见正文单独列出：这是读者提问时眼前的东西，往往就是问题的指向

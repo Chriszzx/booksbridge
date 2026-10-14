@@ -4,7 +4,7 @@
 
 - macOS 14+（开发机为 macOS 27.0.1）
 - Xcode 命令行工具（Swift 6.4 / SDK 27.0）
-- 无需任何第三方依赖，构建不联网拉包
+- Swift 无外部包依赖，Markdown 前端库已随源码固定打包，构建不联网拉包
 
 ---
 
@@ -28,7 +28,7 @@
 cd swift
 swift build                    # 全部 target
 swift build --product booksbridged
-swift test                     # 155 个测试
+swift test                     # 165 个测试
 ```
 
 ---
@@ -54,7 +54,7 @@ swift/
 
 ## 测试
 
-155 个用例，按关注点分文件：
+165 个用例，按关注点分文件：
 
 | 文件 | 用例 | 覆盖 |
 |---|---|---|
@@ -243,3 +243,9 @@ swift scripts/generate-icons.swift swift/Sources/BooksBridgeApp/Icons/BookBridge
 iconutil -c icns "$ICONSET_DIR" -o swift/Sources/BooksBridgeApp/Icons/AppIcon.icns
 ./scripts/build-app.sh
 ```
+
+## 阅读范围与界面回归
+
+`ReadingRangeTests` 覆盖当前章前缀、跨章页、重复锚点失败、三档权限、读取工具越界、历史预算和切书识别。
+`WebRenderingTests` 使用原生 WKWebView 验证 Markdown、危险链接清理、范围锁定、摘要确认取消、检测清空和 API 检测请求。
+真实书库集成测试需要进程自己的系统权限；普通 `swift test` 中跳过，不应将终端继承权限当作应用授权验证。

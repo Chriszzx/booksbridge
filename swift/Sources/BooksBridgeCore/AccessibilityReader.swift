@@ -111,24 +111,34 @@ public struct AccessibilityReader: Sendable {
             throw ReaderError.noAccessibilityPermission
         }
         let element = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(element, 0.4)
         var titles: [String] = []
         var texts: [String] = []
         var selectionInfo: SelectionInfo?
 
-        walk(
-            element,
-            depth: 0,
-            titles: &titles,
-            texts: &texts,
-            selectionInfo: &selectionInfo,
-            counter: Counter()
-        )
+        var windowRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXFocusedWindowAttribute as CFString, &windowRef)
+        if windowRef == nil { AXUIElementCopyAttributeValue(element, kAXMainWindowAttribute as CFString, &windowRef) }
+        guard let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID() else { throw ReaderError.noApplicationElement }
+        let window = windowRef as! AXUIElement
+        let readers = readerElements(window)
+        if let title = string(window, kAXTitleAttribute as String) { titles.append(title) }
+        let counter = Counter()
+        if let windowFrame = frame(window) {
+            for reader in readers {
+                guard let box = frame(reader) else { continue }
+                let viewport = box.intersection(windowFrame)
+                guard !viewport.isNull, viewport.width > 20, viewport.height > 20 else { continue }
+                walk(reader, depth: 0, titles: &titles, texts: &texts,
+                    selectionInfo: &selectionInfo, counter: counter, viewport: viewport)
+            }
+        }
 
         let selection = selectionInfo?.text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         return Snapshot(
             windowTitles: titles,
-            visibleText: texts,
+            visibleText: counter.incomplete ? [] : texts,
             selection: (selection?.isEmpty ?? true) ? nil : selection,
             selectionNodeText: selectionInfo?.nodeText,
             selectionRange: selectionInfo?.range,
@@ -147,6 +157,7 @@ public struct AccessibilityReader: Sendable {
     // MARK: - 遍历
 
     private final class Counter {
+        var incomplete = false
         var value = 0
         var seen = Set<CFHashCode>()
     }
@@ -157,9 +168,9 @@ public struct AccessibilityReader: Sendable {
         titles: inout [String],
         texts: inout [String],
         selectionInfo: inout SelectionInfo?,
-        counter: Counter
+        counter: Counter, viewport: CGRect?
     ) {
-        guard depth <= maxDepth, counter.value < maxNodes else { return }
+        guard depth <= maxDepth, counter.value < maxNodes else { counter.incomplete = true; return }
         counter.value += 1
 
         // 用 CFHash 去重，避免同一元素被多条路径重复访问
@@ -175,7 +186,14 @@ public struct AccessibilityReader: Sendable {
             }
         case kAXStaticTextRole as String, kAXTextAreaRole as String:
             if let value = string(element, kAXValueAttribute as String), value.count > 8 {
-                texts.append(value)
+                if let box = frame(element), let viewport, viewport.intersects(box) {
+                    if viewport.contains(box) { texts.append(value) }
+                    else if let visible = range(element, "AXVisibleCharacterRange"),
+                            visible.location >= 0, visible.length > 0,
+                            visible.location + visible.length <= (value as NSString).length {
+                        texts.append((value as NSString).substring(with: visible))
+                    } else { counter.incomplete = true }
+                }
             }
         default:
             break
@@ -201,9 +219,15 @@ public struct AccessibilityReader: Sendable {
                 titles: &titles,
                 texts: &texts,
                 selectionInfo: &selectionInfo,
-                counter: counter
+                counter: counter, viewport: viewport
             )
         }
+    }
+
+    private func readerElements(_ element: AXUIElement, depth: Int = 0) -> [AXUIElement] {
+        guard depth < 16 else { return [] }
+        if string(element, kAXRoleAttribute as String) == "AXWebArea" { return [element] }
+        return (children(of: element) ?? []).prefix(100).flatMap { readerElements($0, depth: depth + 1) }
     }
 
     // MARK: - AX 取值

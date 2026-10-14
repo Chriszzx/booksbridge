@@ -71,7 +71,7 @@
         <!-- 会话流 -->
         <div id="thread" class="thread">
           <div id="thread-empty" class="thread-empty">
-            <div class="te-mark">BR</div>
+            <div class="te-mark">⌒</div>
             <div class="te-title" id="te-title">选择一本书开始</div>
             <p class="te-body" id="te-body">
               左侧「现在在读」是实时检测结果。<br>点它把书加入书库并进入对话。
@@ -85,7 +85,9 @@
           <div id="prep-bar" class="prep-bar" hidden>
             <span class="prep-dot"></span>
             <span id="prep-text"></span>
-            <button id="prep-retry" class="btn-plain btn-tiny" hidden>重做</button>
+            <button id="prep-retry" class="btn-plain btn-tiny" hidden>生成阅读摘要</button>
+            <button id="prep-cancel" class="btn-plain btn-tiny" hidden>取消</button>
+            <button id="prep-clear" class="btn-plain btn-tiny" hidden>清除摘要</button>
           </div>
 
           <textarea id="input" rows="1"
@@ -93,7 +95,9 @@
 
           <div class="composer-row">
             <!-- 知识范围：三档剧透边界 -->
-            <div class="scope-picker" id="scope-picker" role="group" aria-label="知识范围"></div>
+            <button class="icon-btn composer-plus" aria-label="更多" title="更多" type="button">＋</button>
+            <select class="scope-picker" id="scope-picker" aria-label="读取权限"></select>
+            <span id="composer-model" class="composer-model"></span>
             <span class="spacer"></span>
             <span id="usage-chip" class="chip chip-tiny" hidden></span>
             <button id="cancel-btn" class="btn-plain" hidden>停止</button>
@@ -134,8 +138,8 @@
               </div>
 
               <div class="field">
-                <label for="set-maxtokens">上下文上限（字符）</label>
-                <input id="set-maxtokens" type="number" min="1000" max="200000" step="1000">
+                <label for="set-maxtokens">请求预算（字符，含历史与提示词）</label>
+                <input id="set-maxtokens" type="number" min="4000" max="200000" step="1000">
                 <p class="field-hint">超出部分会被截断，避免单次请求过大。</p>
               </div>
             </section>
@@ -143,6 +147,8 @@
             <!-- 模型与 API -->
             <section class="pane" data-pane="model" hidden>
               <h2>模型与 API</h2>
+              <div class="field"><button id="api-test" class="btn-plain">测试连接</button>
+              <p id="api-test-result" class="field-hint" role="status">未检测 · 测试会产生少量 API 用量</p></div>
 
               <div class="field">
                 <label for="set-provider">服务商</label>
@@ -248,6 +254,10 @@
     </main>
   </div>
 
-  <script src="app.js"></script>
+  <dialog id="prepare-confirm"><h3>生成整书阅读摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
+<script src="vendor/marked.js"></script>
+<script src="vendor/purify.js"></script>
+<script src="markdown.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

@@ -106,7 +106,12 @@ public final class FileWatcher: @unchecked Sendable {
         source.setEventHandler { [weak self] in
             guard let self else { return }
             if FileManager.default.fileExists(atPath: url.path) {
+                self.sources.removeAll { source in
+                    if source.handle == fd { source.cancel(); return true }
+                    return false
+                }
                 self.attach(url)
+                self.scheduleCallback()
             }
         }
         source.setCancelHandler { close(fd) }
