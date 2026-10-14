@@ -42,6 +42,23 @@ public struct ScopedReading: Sendable {
         return end.map { source.unicodeScalars.distance(from: source.unicodeScalars.startIndex, to: $0) }
     }
 
+    public static func prefix(chapters: [BookPreprocessor.Chapter], through boundary: ReadingBoundary, current: Int?) throws -> Self {
+        guard chapters.indices.contains(boundary.chapter), boundary.end >= 0 else { throw Failure.cannotLocatePage }
+        let original = chapters[boundary.chapter]
+        let source = original.text.precomposedStringWithCanonicalMapping
+        guard boundary.end == Int.max || boundary.end <= normalized(source).unicodeScalars.count else { throw Failure.cannotLocatePage }
+        var count = 0
+        var text = ""
+        for scalar in source.unicodeScalars {
+            let counted = !CharacterSet.whitespacesAndNewlines.contains(scalar) && scalar.value != 0xad && scalar.value != 0x200b
+            if counted { if count == boundary.end { break }; count += 1 }
+            text.unicodeScalars.append(scalar)
+        }
+        var result = Array(chapters.prefix(boundary.chapter))
+        if !text.isEmpty { result.append(.init(spineIndex: original.spineIndex, href: original.href, text: text)) }
+        return Self(chapters: result, boundary: boundary, currentChapter: current)
+    }
+
     public static func resolve(chapters: [BookPreprocessor.Chapter], current: Int?, scope: KnowledgeScope,
                                visible: [String]) throws -> Self {
         guard !chapters.isEmpty else { throw Failure.cannotLocatePage }
@@ -70,19 +87,6 @@ public struct ScopedReading: Sendable {
             return Self(chapters: Array(chapters.prefix(index + 1)), boundary: .init(chapter: index, end: Int.max), currentChapter: index)
         }
         guard let live else { throw Failure.cannotLocatePage }
-        let original = chapters[index]
-        // Preserve whitespace for retrieval while counting normalized scalars for the boundary.
-        var count = 0
-        var prefix = ""
-        for scalar in original.text.precomposedStringWithCanonicalMapping.unicodeScalars {
-            if !CharacterSet.whitespacesAndNewlines.contains(scalar) && scalar.value != 0xad && scalar.value != 0x200b {
-                if count == live.1 { break }
-                count += 1
-            }
-            prefix.unicodeScalars.append(scalar)
-        }
-        var allowed = Array(chapters.prefix(index))
-        allowed.append(.init(spineIndex: original.spineIndex, href: original.href, text: prefix))
-        return Self(chapters: allowed, boundary: .init(chapter: index, end: live.1), currentChapter: index)
+        return try prefix(chapters: chapters, through: .init(chapter: index, end: live.1), current: index)
     }
 }

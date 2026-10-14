@@ -146,13 +146,14 @@ public final class ReadingCoordinator: @unchecked Sendable {
         }
         let position = try? store.readingPosition(assetID: book.assetID)
         let visible = options.includeVisibleText ? snapshot.visibleText : []
-        let selection = snapshot.selection
+        let selection = snapshot.preciseSelection
 
         return ReadingContext(
             book: book,
             position: position,
             visibleText: visible,
-            selection: selection
+            selection: selection,
+            selectionIsExact: snapshot.selectionIsExact
         )
     }
 

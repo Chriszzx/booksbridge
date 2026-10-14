@@ -146,13 +146,77 @@ public struct EpubDocument: Sendable {
         return base.standardizedFileURL
     }
 
-    /// 章节的纯文本。
-    public func text(forHref href: String) throws -> String {
-        let url = fileURL(forHref: href)
-        let raw = (try? String(contentsOf: url, encoding: .utf8))
-            ?? (try? String(contentsOf: url, encoding: .isoLatin1))
-            ?? ""
-        return HTMLText.plainText(from: raw)
+    public func html(forHref href: String) throws -> String {
+        let url = fileURL(forHref: href.components(separatedBy: "#")[0])
+        let data = try Data(contentsOf: url)
+        guard let raw = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+            throw EpubError.malformedOPF("正文编码无法识别：\(href)")
+        }
+        return raw
+    }
+
+    public func text(forHref href: String) throws -> String { HTMLText.plainText(from: try html(forHref: href)) }
+
+    public struct NavigationEntry: Sendable {
+        public let title: String
+        public let href: String
+        public let fragment: String?
+        public let level: Int
+    }
+
+    public func navigationTitles() throws -> [String: String] {
+        var result: [String: String] = [:]
+        for entry in try navigationEntries() where result[entry.href] == nil { result[entry.href] = entry.title }
+        return result
+    }
+
+    /// EPUB 3 toc and EPUB 2 NCX. Page-list/landmarks are not chapter maps.
+    public func navigationEntries() throws -> [NavigationEntry] {
+        var result: [NavigationEntry] = []
+        let opfText = try String(contentsOf: opf, encoding: .utf8)
+        let navigation = Self.tags(named: "item", in: opfText).filter {
+            (Self.attribute("properties", in: $0) ?? "").split(separator: " ").contains("nav")
+                || (Self.attribute("media-type", in: $0) ?? "").contains("ncx")
+        }
+        for item in navigation {
+            guard let href = Self.attribute("href", in: item) else { continue }
+            var html = try self.html(forHref: href)
+            let isNCX = href.lowercased().hasSuffix(".ncx")
+            if !isNCX {
+                let nav = try NSRegularExpression(pattern: "(?is)<nav\\b([^>]*)>(.*?)</nav>")
+                let nodes = nav.matches(in: html, range: NSRange(html.startIndex..., in: html))
+                if let node = nodes.first(where: { match in
+                    guard let range = Range(match.range(at: 1), in: html) else { return false }
+                    let attributes = String(html[range])
+                    return (Self.attribute("epub:type", in: attributes) ?? "").split(separator: " ").contains("toc")
+                        || Self.attribute("role", in: attributes) == "doc-toc"
+                }) ?? nodes.first(where: { match in
+                    guard let range = Range(match.range(at: 1), in: html) else { return false }
+                    let attributes = String(html[range])
+                    return Self.attribute("epub:type", in: attributes) == nil && Self.attribute("role", in: attributes) == nil
+                }), let range = Range(node.range(at: 2), in: html) { html = String(html[range]) }
+                else if !nodes.isEmpty { continue }
+            }
+            let regex = try NSRegularExpression(pattern: "(?is)<a\\b[^>]*href\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>|<navLabel[^>]*>.*?<text[^>]*>(.*?)</text>.*?</navLabel>\\s*<content[^>]*src\\s*=\\s*[\"']([^\"']+)")
+            for match in regex.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+                let linkIndex = match.range(at: 1).location != NSNotFound ? 1 : 4
+                let textIndex = linkIndex == 1 ? 2 : 3
+                guard let linkRange = Range(match.range(at: linkIndex), in: html), let titleRange = Range(match.range(at: textIndex), in: html), let fullRange = Range(match.range, in: html) else { continue }
+                let parts = String(html[linkRange]).components(separatedBy: "#")
+                let target = parts[0].isEmpty ? fileURL(forHref: href) : fileURL(forHref: href).deletingLastPathComponent().appendingPathComponent(parts[0].removingPercentEncoding ?? parts[0]).standardizedFileURL
+                guard let source = manifest.values.first(where: { fileURL(forHref: $0) == target }) else { continue }
+                let title = HTMLText.plainText(from: String(html[titleRange])).trimmingCharacters(in: .whitespacesAndNewlines)
+                let prefix = String(html[..<fullRange.lowerBound])
+                let openTag = isNCX ? "<navPoint\\b" : "<(?:ol|ul)\\b"
+                let closeTag = isNCX ? "</navPoint\\s*>" : "</(?:ol|ul)\\s*>"
+                func count(_ pattern: String) throws -> Int {
+                    try NSRegularExpression(pattern: pattern, options: .caseInsensitive).numberOfMatches(in: prefix, range: NSRange(prefix.startIndex..., in: prefix))
+                }
+                let level = max(1, try count(openTag) - count(closeTag))
+                if !title.isEmpty { result.append(.init(title: title, href: source, fragment: parts.count > 1 ? parts[1].removingPercentEncoding : nil, level: level)) }
+            }
+        }
+        return result
     }
 
     /// 解析 CFI 并取出对应章节的正文。

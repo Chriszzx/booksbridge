@@ -31,6 +31,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var apiTestTask: Task<Void, Never>?
     private var apiTestGeneration = 0
     private var answerStream: Task<Void, Never>?
+    private var positionTask: Task<Void, Never>?
+    private let summaryJobs = SummaryJobs()
+    private var selectionCandidate: ConfirmedReference?
 
     /// 最近一次采集到的阅读上下文；未检测到时为 nil。
     private var latestContext: ReadingContext?
@@ -115,6 +118,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         AppPaths.ensureSupportDirectory()
         store = ConversationStore()
         settings = SettingsStore()
+        summaryJobs.onUpdate = { [weak self] assetID, conversationID, status, summary in
+            guard let self else { return }
+            self.store.updateConversation(assetID: assetID, conversationID: conversationID) {
+                $0.summaryStatus = status
+                if let summary { $0.summary = summary }
+            }
+            self.pushState(message: status)
+        }
         assistant.update(settings: settings.settings, apiKey: settings.apiKey)
         writeReport()
 
@@ -404,7 +415,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             pushSettings()
             if Permissions().accessibilityStatus().isGranted, Permissions().fullDiskAccessStatus().isGranted {
                 reconnectBooks(requestAccessibility: false)
-                if let active = store.state.lastActive { prepareBook(assetID: active.assetID, force: false) }
+                if let active = store.state.lastActive { prepareBook(assetID: active.assetID) }
             }
 
         // MARK: 侧栏交互
@@ -423,16 +434,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             cancelPendingAnswer()
             store.setActive(assetID: assetID, conversationID: conversationID)
             pushState(message: "已切换对话")
-            prepareBook(assetID: assetID, force: false)
+            prepareBook(assetID: assetID)
 
         case "deleteConversation":
             guard let assetID = invocation.payload["assetID"] as? String,
                   let conversationID = invocation.payload["conversationID"] as? String else { return }
+            summaryJobs.cancel(assetID: assetID, conversationID: conversationID)
             store.deleteConversation(assetID: assetID, conversationID: conversationID)
             pushState(message: "已删除对话")
 
         case "removeBook":
             guard let assetID = invocation.payload["assetID"] as? String else { return }
+            for conversation in store.book(assetID: assetID)?.conversations ?? [] {
+                summaryJobs.cancel(assetID: assetID, conversationID: conversation.id)
+            }
             store.removeBook(assetID: assetID)
             pushState(message: "已移出书库")
 
@@ -458,21 +473,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case "reprocessBook":
             if connectionRequested, dataAccess.isGranted,
-               let active = store.state.lastActive,
+               store.state.lastActive != nil,
                invocation.payload["confirmed"] as? Bool == true {
-                prepareBook(assetID: active.assetID, force: true)
+                generateSummary(invocation.payload)
             }
 
         case "checkReading":
             checkReading(invocation.payload)
+        case "captureSelection":
+            captureSelection()
         case "cancelPreparation":
-            assistant.cancelPreparation(assetID: store.state.lastActive?.assetID)
+            if let active = store.state.lastActive, let id = active.conversationID {
+                summaryJobs.cancel(assetID: active.assetID, conversationID: id)
+            }
         case "clearKnowledge":
-            if let active = store.state.lastActive {
-                Task { @MainActor in
-                    await assistant.clearKnowledge(assetID: active.assetID)
-                    if store.state.lastActive?.assetID == active.assetID { handleAssistantEvent(.preparationChanged(.idle)) }
-                }
+            if let active = store.state.lastActive, let id = active.conversationID {
+                summaryJobs.cancel(assetID: active.assetID, conversationID: id)
+                store.updateConversation(assetID: active.assetID, conversationID: id) { $0.summary = nil; $0.summaryStatus = nil }
+                pushState(message: "已清除本对话摘要")
             }
         case "testAPI":
             testAPI(invocation.payload)
@@ -571,7 +589,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         store.setActive(assetID: assetID, conversationID: book?.conversations.first?.id)
         NSLog("[BooksBridge] 进入《\(resolvedTitle)》的 workspace，对话数=\(book?.conversations.count ?? 0)")
         pushState(message: "已进入《\(resolvedTitle)》")
-        prepareBook(assetID: assetID, force: false)
+        prepareBook(assetID: assetID)
     }
 
     /// 保存前端提交的设置。
@@ -616,42 +634,83 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 助手在 AppDelegate 创建时就有效；取消操作不依赖是否已进入一本书。
     func cancelPendingAnswer() {
         answerStream?.cancel()
+        positionTask?.cancel()
         assistant.cancelAnswer()
     }
 
     // MARK: - 阅读问答
 
-    /// 预处理当前书：把整本书压缩成「书籍说明」，供后续提问使用。
-    ///
-    /// 耗时且要花 token，因此放在进入 workspace 之后、后台进行；
-    /// 未完成时提问会退化为"只用原文片段"，不会阻塞用户。
-    private func prepareBook(assetID: String, force: Bool) {
-        // 优先用实时上下文里的书目：路径与进度以图书 App 的数据为准
-        let resolved: BooksBridgeCore.Book?
-        if let context = latestContext, context.book.assetID == assetID {
-            resolved = context.book
-        } else {
-            resolved = (try? booksStore.book(assetID: assetID)) ?? nil
-        }
-        guard let book = resolved else {
-            NSLog("[BooksBridge] 预处理跳过：找不到书目 \(assetID)")
-            return
-        }
-        let cfi = (try? booksStore.readingPosition(assetID: assetID))?.cfi
+    /// A single refresh path for opening, /now, questions and summaries.
+    private func refreshConversation(assetID: String, conversationID: String) async throws -> (BooksBridgeCore.Book, ReadingSnapshot, ReadingContext?) {
+        let previous = store.conversation(assetID: assetID, conversationID: conversationID)?.readingSnapshot
+        let fresh = try await Task.detached {
+            guard let book = try BooksStore().book(assetID: assetID) else { throw ReadingAssistant.AssistantError.notLoaded }
+            return (book, ReadingCoordinator().makeContext())
+        }.value
+        try Task.checkCancellation()
+        let snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: previous)
+        try Task.checkCancellation()
+        store.updateReading(assetID: assetID, conversationID: conversationID, snapshot: snapshot)
+        pushState(message: snapshot.label)
+        return (fresh.0, snapshot, fresh.1)
+    }
 
-        assistant.onPreparationChanged = { [weak self] id, state in
-            guard let self else { return }
-            self.bridge.push(["preparationJobs": self.assistant.preparationStatuses])
-            guard self.store.state.lastActive?.assetID == id else { return }
-            self.handleAssistantEvent(.preparationChanged(state))
+    private func prepareBook(assetID: String) {
+        guard let id = store.state.lastActive?.conversationID else { return }
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
+            do {
+                let (_, snapshot, _) = try await refreshConversation(assetID: assetID, conversationID: id)
+                if store.conversation(assetID: assetID, conversationID: id)?.messages.isEmpty == true {
+                    store.appendMessage(assetID: assetID, conversationID: id, message: .init(role: .assistant, text: snapshot.label, isPositionCard: true))
+                    if store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == id {
+                        bridge.push(["positionCard": snapshot.label])
+                    }
+                }
+            } catch is CancellationError {} catch {
+                if store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == id {
+                    bridge.push(["readingCheck": "本地书籍读取失败：\(error)"])
+                }
+            }
         }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let stream = self.assistant.open(book: book, currentCFI: cfi, forceReprocess: force)
-            for await event in stream {
-                guard !Task.isCancelled,
-                      self.store.state.lastActive?.assetID == assetID else { break }
-                self.handleAssistantEvent(event)
+    }
+
+    private func generateSummary(_ payload: [String: Any]) {
+        guard let active = store.state.lastActive, let id = active.conversationID else { return }
+        let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
+        guard let scope = store.lockScope(assetID: active.assetID, conversationID: id, requested: requested) else { return }
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
+            do {
+                let (book, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
+                let reading = try assistant.reading(snapshot: snapshot, scope: scope)
+                summaryJobs.start(book: book, conversationID: id, snapshot: snapshot, reading: reading,
+                    scope: scope, settings: settings.settings, apiKey: settings.apiKey)
+            } catch is CancellationError {} catch {
+                store.updateConversation(assetID: active.assetID, conversationID: id) { $0.summaryStatus = "摘要失败：\(error)" }
+                pushState(message: "摘要未发送")
+            }
+        }
+    }
+
+    private func captureSelection() {
+        guard let active = store.state.lastActive, let id = active.conversationID else { return }
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
+            do {
+                let (_, snapshot, live) = try await refreshConversation(assetID: active.assetID, conversationID: id)
+                guard let live, live.book.assetID == active.assetID,
+                      let text = live.selection, !text.isEmpty, text.count <= 10000 else {
+                    bridge.push(["selectionCandidate": ["error": "没有检测到本书的选中文字；请先在 Books 中划选。"]]); return
+                }
+                guard store.state.lastActive?.assetID == active.assetID, store.state.lastActive?.conversationID == id else { return }
+                let token = UUID().uuidString
+                selectionCandidate = ConfirmedReference(token: token, assetID: active.assetID, conversationID: id, sourceHash: snapshot.sourceHash, text: text)
+                bridge.push(["selectionCandidate": ["token": token, "text": text, "exact": live.selectionIsExact]])
+            } catch is CancellationError {} catch {
+                guard !Task.isCancelled, store.state.lastActive?.assetID == active.assetID,
+                      store.state.lastActive?.conversationID == id else { return }
+                bridge.push(["selectionCandidate": ["error": String(describing: error)]])
             }
         }
     }
@@ -682,34 +741,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Local dry run uses the application's own permissions and never calls the API.
     private func checkReading(_ payload: [String: Any]) {
-        guard let active = store.state.lastActive else { return }
-        let scope = active.conversationID.flatMap { store.conversation(assetID: active.assetID, conversationID: $0)?.scope }
-            ?? (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? .upToProgress
-        Task { @MainActor in
-            let result: String
+        guard let active = store.state.lastActive, let id = active.conversationID else { return }
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
             do {
-                let assetID = active.assetID
-                result = try await Task.detached {
-                    let source = BooksStore()
-                    guard let book = try source.book(assetID: assetID), let path = book.path else { throw ReadingAssistant.AssistantError.noLocalFile }
-                    let epub = try EpubDocument(root: URL(fileURLWithPath: path))
-                    let chapters = BookPreprocessor.extractChapters(epub: epub)
-                    let cfi = try source.readingPosition(assetID: assetID)?.cfi
-                    let context = ReadingCoordinator().makeContext()
-                    let visible = context?.book.assetID == assetID ? context?.visibleText ?? [] : []
-                    let current = ReadingAssistant.locateChapter(cfi: cfi, epub: epub, chapters: chapters)
-                    do {
-                        let reading = try ScopedReading.resolve(chapters: chapters, current: current, scope: scope, visible: visible)
-                        return "原文可读取 · \(reading.chapters.count) 章 · \(reading.chapters.reduce(0) { $0 + $1.text.count }) 字 · 当前页 \(visible.reduce(0) { $0 + $1.count }) 字（本地检查，未调用 API）。范围末尾：\(reading.chapters.last.map { String($0.text.suffix(36)) } ?? "")"
-                    } catch {
-                        return "\(error)（本地正文 \(chapters.count) 章；可见片段 \(visible.count) 段 / \(visible.reduce(0) { $0 + $1.count }) 字）"
-                    }
-                }.value
-            } catch { result = "检查失败：\(error)" }
-            guard self.store.state.lastActive?.assetID == active.assetID else { return }
-            self.bridge.push(["readingCheck": result])
+                let (_, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
+                let scope = store.conversation(assetID: active.assetID, conversationID: id)?.scope
+                    ?? (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
+                let reading = try assistant.reading(snapshot: snapshot, scope: scope)
+                guard store.state.lastActive?.assetID == active.assetID, store.state.lastActive?.conversationID == id else { return }
+                bridge.push(["readingCheck": "\(snapshot.label) · 可读取 \(reading.chapters.reduce(0) { $0 + $1.text.count }) 字 · 本地检查，未调用 API"])
+            } catch is CancellationError {} catch {
+                guard !Task.isCancelled, store.state.lastActive?.assetID == active.assetID,
+                      store.state.lastActive?.conversationID == id else { return }
+                bridge.push(["readingCheck": "检查失败：\(error)"])
+            }
         }
     }
 
@@ -724,60 +771,70 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         guard question.count <= max(500, settings.settings.maxContextCharacters / 4) else {
             bridge.push(["chatEvent": ["kind": "error", "text": "问题超过请求预算，请缩短后发送"]]); return
         }
+        let command = ReadingCommand(question)
+        let isNow = command.refreshOnlyOrFirst
+        let request = command.question
         let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
-        guard let scope = store.lockScope(assetID: active.assetID, conversationID: conversationID, requested: requested) else { return }
-        // 历史在追加本轮问题之前取，避免重复发送；旧格式的未标注范围历史不参与。
+        let scope = request.isEmpty ? requested : store.lockScope(assetID: active.assetID, conversationID: conversationID, requested: requested) ?? requested
         let conversation = store.conversation(assetID: active.assetID, conversationID: conversationID)!
-        let previous = Array(conversation.messages.dropFirst(conversation.scopeHistoryStartIndex ?? 0))
-        let history: [ChatMessage] = previous.map {
-            $0.role == .user ? .user($0.text) : .assistant($0.text)
-        }
-        store.appendMessage(assetID: active.assetID, conversationID: conversationID,
-                            message: Conversation.Message(role: .user, text: question))
-        pushState(message: "正在读取本书最新进度")
+        let previous = Array(conversation.messages.dropFirst(conversation.scopeHistoryStartIndex ?? 0)).filter { $0.isPositionCard != true }
+        let history: [ChatMessage] = previous.map { $0.role == .user ? .user($0.text) : .assistant($0.text) }
+        store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: .init(role: .user, text: question, isPositionCard: request.isEmpty))
         cancelPendingAnswer()
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                // 每次提问走数据库工具读取，不能借用其他书的 latestContext。
                 let assetID = active.assetID
-                let fresh = try await Task.detached {
-                    let source = BooksStore()
-                    guard let book = try source.book(assetID: assetID) else { throw ReadingAssistant.AssistantError.notLoaded }
-                    let position = try source.readingPosition(assetID: assetID)
-                    return (book, position?.cfi, ReadingCoordinator().makeContext())
-                }.value
-                try Task.checkCancellation()
-                let visible: [String]
-                let live = fresh.2
-                if let live, live.book.assetID == assetID { visible = live.visibleText }
-                else { visible = [] }
-                let stream = self.assistant.ask(book: fresh.0, currentCFI: fresh.1,
-                    question: question, scope: scope, visibleText: visible, history: history, historyBoundaries: previous.map(\.boundary))
-                for await event in stream {
-                    guard !Task.isCancelled else { break }
-                    guard self.store.state.lastActive?.assetID == assetID,
-                          self.store.state.lastActive?.conversationID == conversationID else { break }
-                    self.handleAssistantEvent(event)
+                let (book, snapshot, live) = try await refreshConversation(assetID: assetID, conversationID: conversationID)
+                guard store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == conversationID else { return }
+                if isNow {
+                    store.appendMessage(assetID: assetID, conversationID: conversationID, message: .init(role: .assistant, text: snapshot.label, isPositionCard: true))
+                    if request.isEmpty {
+                        bridge.push(["chatEvent": ["kind": "finished", "text": snapshot.label, "roleLabel": "阅读位置（本地）"]])
+                        pushState(message: "位置已刷新，未调用模型"); return
+                    }
+                    bridge.push(["positionCard": snapshot.label])
                 }
-            } catch is CancellationError { return }
-            catch {
-                guard self.store.state.lastActive?.assetID == active.assetID,
-                      self.store.state.lastActive?.conversationID == conversationID else { return }
-                self.handleAssistantEvent(.failed("最新阅读进度读取失败：\(error)"))
+                let allowed = try assistant.reading(snapshot: snapshot, scope: scope)
+                var prompt = request
+                if let token = payload["selectionToken"] as? String {
+                    guard let selection = selectionCandidate,
+                          selection.validated(token: token, confirmed: payload["selectionConfirmed"] as? Bool == true,
+                            snapshot: snapshot, conversationID: conversationID, reading: allowed) != nil else {
+                        throw SelectionError.invalid
+                    }
+                    prompt += "\n\n用户确认引用的文字：\n" + selection.text
+                    store.updateConversation(assetID: assetID, conversationID: conversationID) {
+                        if let index = $0.messages.lastIndex(where: { $0.role == .user }) { $0.messages[index].text = question + "\n\n引用：\n" + selection.text }
+                    }
+                    selectionCandidate = nil
+                }
+                let visible = live?.book.assetID == assetID ? live?.visibleText ?? [] : []
+                let stream = assistant.ask(book: book, currentCFI: live?.book.assetID == assetID ? live?.position?.cfi : nil,
+                    question: prompt, scope: scope, visibleText: visible, history: history,
+                    historyBoundaries: previous.map(\.boundary), historySourceHashes: previous.map(\.sourceHash),
+                    snapshot: snapshot, summary: conversation.summary)
+                for await event in stream {
+                    guard !Task.isCancelled, store.state.lastActive?.assetID == assetID,
+                          store.state.lastActive?.conversationID == conversationID else { break }
+                    handleAssistantEvent(event)
+                }
+            } catch is CancellationError {} catch {
+                guard !Task.isCancelled, store.state.lastActive?.assetID == active.assetID,
+                      store.state.lastActive?.conversationID == conversationID else { return }
+                handleAssistantEvent(.failed(String(describing: error)))
             }
         }
+    }
+
+    private enum SelectionError: Error, CustomStringConvertible {
+        case invalid
+        var description: String { "引用尚未确认、已失效或超出当前读取范围；请重新划选并确认。" }
     }
 
     /// 把助手事件转成前端可消费的推送。
     private func handleAssistantEvent(_ event: ReadingAssistant.Event) {
         switch event {
-        case .preparationChanged(let state):
-            bridge.push([
-                "assistant": ["preparation": state.label, "ready": isPreparationReady(state)],
-            ])
-            statusItem.refreshTooltip()
-
         case .contextPrepared(let text):
             bridge.push(["chatEvent": ["kind": "status", "text": text]])
         case .reasoningDelta(let delta):
@@ -790,11 +847,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // 落盘助手回答
             if let active = store.state.lastActive,
                let conversationID = active.conversationID {
-                store.markLastQuestion(assetID: active.assetID, conversationID: conversationID, boundary: assistant.lastBoundary)
+                store.markLastQuestion(assetID: active.assetID, conversationID: conversationID, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash)
                 store.appendMessage(
                     assetID: active.assetID,
                     conversationID: conversationID,
-                    message: Conversation.Message(role: .assistant, text: answer, boundary: assistant.lastBoundary)
+                    message: Conversation.Message(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash)
                 )
             }
             var payload: [String: Any] = [
@@ -818,11 +875,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func isPreparationReady(_ state: ReadingAssistant.PreparationState) -> Bool {
-        if case .ready = state { return true }
-        return false
-    }
-
     /// 在指定书下新建对话并切过去。
     private func newConversation(assetID: String) {
         cancelPendingAnswer()
@@ -832,7 +884,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         store.setActive(assetID: assetID, conversationID: conversation.id)
         pushState(message: "已新建 \(conversation.title)")
-        prepareBook(assetID: assetID, force: false)
+        prepareBook(assetID: assetID)
     }
 
     /// 把"检测不到"归类，让前端能给出准确的提示而不是笼统的"未在阅读"。
@@ -1055,10 +1107,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             "书库本数": String(store.state.books.count),
         ]
 
-        var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": assistant.preparationStatuses]
-        if let active = store.state.lastActive {
-            let preparation = assistant.preparationState(assetID: active.assetID)
-            body["assistant"] = ["preparation": preparation.label, "ready": isPreparationReady(preparation)]
+        let jobs = store.state.books.flatMap { book in book.conversations.compactMap { conversation -> [String: String]? in
+            guard let status = conversation.summaryStatus else { return nil }
+            return ["title": book.title + " · " + conversation.title, "status": status]
+        } }
+        var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": jobs]
+        body["assistant"] = ["preparation": "本地章节地图 · 摘要按需生成", "ready": false]
+        body["readingPosition"] = "尚未取得有效阅读位置"
+        body["scopeSummary"] = ""
+        if let active = store.state.lastActive, let id = active.conversationID,
+           let conversation = store.conversation(assetID: active.assetID, conversationID: id) {
+            body["readingPosition"] = conversation.readingSnapshot?.label ?? "尚未取得有效阅读位置"
+            var safe = false
+            if let summary = conversation.summary, let snapshot = conversation.readingSnapshot,
+               let reading = try? assistant.reading(snapshot: snapshot, scope: conversation.scope ?? settings.settings.defaultScope) {
+                safe = summary.isAllowed(snapshot: snapshot, reading: reading)
+                if safe { body["scopeSummary"] = summary.text }
+            }
+            let status = conversation.summaryStatus ?? "本地章节地图 · 未生成范围摘要"
+            body["assistant"] = ["preparation": conversation.summary != nil && !safe && !status.hasPrefix("正在") ? "摘要与当前范围不匹配，已隔离；可重新生成" : status, "ready": safe]
         }
 
         body["detected"] = NSNull()
@@ -1137,6 +1204,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                             "role": message.role.rawValue,
                             "text": message.text,
                             "createdAt": ISO8601DateFormatter().string(from: message.createdAt),
+                            "isPositionCard": message.isPositionCard == true,
                         ] as [String: Any]
                     }
                 }

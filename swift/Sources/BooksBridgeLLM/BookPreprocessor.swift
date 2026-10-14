@@ -46,7 +46,12 @@ public struct BookPreprocessor: Sendable {
         epub: EpubDocument,
         onProgress: (@Sendable (Progress) -> Void)? = nil
     ) async throws -> BookKnowledge {
-        let chapters = Self.extractChapters(epub: epub)
+        return try await process(book: book, chapters: Self.extractChapters(epub: epub), onProgress: onProgress)
+    }
+
+    /// Only receives already-authorized source, never reloads the whole EPUB.
+    public func process(book: Book, chapters: [Chapter], scopeDescription: String = "所提供的原文范围", onProgress: (@Sendable (Progress) -> Void)? = nil) async throws -> BookKnowledge {
+        let restriction = "本次只处理\(scopeDescription)。只能依据提供的原文；不得补充之后的情节或训练记忆。不要把局部摘要称为全书摘要。\n"
         let fullText = chapters.map(\.text).joined(separator: "\n\n")
         let hash = Self.contentHash(of: fullText)
 
@@ -62,7 +67,7 @@ public struct BookPreprocessor: Sendable {
             let (text, usage) = try await client.complete(
                 model: model,
                 messages: [
-                    .system(Self.systemPrompt),
+                    .system(restriction + Self.systemPrompt),
                     .user(Self.buildSinglePassPrompt(book: book, text: fullText)),
                 ],
                 thinking: .disabled,
@@ -79,7 +84,7 @@ public struct BookPreprocessor: Sendable {
                 let (text, usage) = try await client.complete(
                     model: model,
                     messages: [
-                        .system(Self.mapSystemPrompt),
+                        .system(restriction + Self.mapSystemPrompt),
                         .user(Self.buildMapPrompt(book: book, index: index + 1, total: chunks.count, text: chunk.text)),
                     ],
                     thinking: .disabled,
@@ -95,7 +100,7 @@ public struct BookPreprocessor: Sendable {
             let (text, usage) = try await client.complete(
                 model: model,
                 messages: [
-                    .system(Self.systemPrompt),
+                    .system(restriction + Self.systemPrompt),
                     .user(Self.buildReducePrompt(book: book, partials: partials)),
                 ],
                 thinking: .disabled,
@@ -222,7 +227,7 @@ public struct BookPreprocessor: Sendable {
     /// 最终产出的说明要满足两件事：让模型"理解全书"，以及"知道哪里讲了什么"。
     /// 后者是为了支持按范围检索时定位。
     static let systemPrompt = """
-    你是一位资深的图书编辑与阅读分析者。你的任务是通读一本书，产出一份给 AI 助手使用的书籍说明书。
+    你是一位资深的图书编辑与阅读分析者。你的任务是阅读提供的原文，产出一份供读者回顾的范围摘要。
 
     这份说明书的读者是另一个 AI：它之后要在你产出的基础上回答读者关于这本书的提问。
     因此它需要同时具备两种信息：
@@ -238,7 +243,7 @@ public struct BookPreprocessor: Sendable {
 
     static func buildSinglePassPrompt(book: Book, text: String) -> String {
         """
-        请通读以下书籍，产出书籍说明书。
+        请梳理以下已提供原文，产出范围摘要。
 
         书名：《\(book.title)》
         作者：\(book.displayAuthor ?? "未知")
@@ -264,7 +269,7 @@ public struct BookPreprocessor: Sendable {
         若书中有特殊形式（书信体、剧本体、大量图表、代码示例等）要指出。
 
         ## 五、关键线索
-        贯穿全书的主线、反复出现的意象或母题、论证的核心链条。
+        所提供范围内的主线、反复出现的意象或母题、论证的核心链条。
         这一节用于回答"这本书想表达什么"类的问题。
         """
     }
@@ -279,7 +284,7 @@ public struct BookPreprocessor: Sendable {
     static func buildMapPrompt(book: Book, index: Int, total: Int, text: String) -> String {
         """
         书名：《\(book.title)》
-        这是全书的第 \(index)/\(total) 部分。
+        这是本次范围的第 \(index)/\(total) 部分。
 
         === 正文开始 ===
         \(text)
@@ -301,7 +306,7 @@ public struct BookPreprocessor: Sendable {
         书名：《\(book.title)》
         作者：\(book.displayAuthor ?? "未知")
 
-        以下是全书各部分的分段摘要（按阅读顺序）：
+        以下是本次范围各部分的分段摘要（按阅读顺序）：
 
         \(joined)
 

@@ -54,20 +54,17 @@ swift/
 
 ## 测试
 
-165 个用例，按关注点分文件：
+核心测试覆盖：
 
-| 文件 | 用例 | 覆盖 |
-|---|---|---|
-| `CFITests` | 21 | CFI 解析（含真实样本与边界） |
-| `LLMContextTests` | 38 | 范围边界、检索、分块、知识缓存 |
-| `LLMClientTests` | 19 | SSE 解析、请求构造、URL 规范化 |
-| `PermissionAndMenuTests` | 18 | 权限判定语义、状态栏菜单结构 |
-| `SettingsStoreTests` | 16 | 设置往返、0600 权限、向后兼容 |
-| `ConversationStoreTests` | 18 | 持久化、原子写、编号递增、损坏恢复 |
-| `ReadingAssistantTests` | 4 | 重启缓存复用、进度刷新、跨书隔离、旧缓存不触发付费调用 |
-| `IntegrationTests` | 9 | **跑在真实书库上** |
-| `BooksPathsTests` | 7 | 路径发现、作者字段清洗 |
-| `FileWatcherTests` | 5 | 触发、合并、文件后创建、停止 |
+| 测试 | 覆盖 |
+|---|---|
+| `BookMapTests` | EPUB 3/NCX 目录、锚点与跨文件章、划选确认、位置与任务状态持久化 |
+| `ReadingAssistantTests` | 本地导入、同对话位置沿用、源变化失效、缺失正文、摘要跨视图继续和取消 |
+| `ReadingRangeTests` / `LLMContextTests` | 页尾边界、重复锚点、三档范围、上下文预算、历史隔离 |
+| `WebRenderingTests` | 原生 WKWebView 的 Markdown、范围锁定、确认交互、位置与摘要展示 |
+| `LLMClientTests` | SSE 解析、请求体与接口地址 |
+| 其余 Core/App 测试 | CFI、设置、存储、权限、路径、文件监测 |
+| `IntegrationTests` | 真实书库，需要运行宿主具有权限 |
 
 ### 集成测试会跳过
 

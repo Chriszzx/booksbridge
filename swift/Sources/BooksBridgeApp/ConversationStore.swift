@@ -39,6 +39,9 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var scope: KnowledgeScope?
     /// 旧对话没有范围记录，其旧历史保留展示但不送入新的 agent。
     public var scopeHistoryStartIndex: Int?
+    public var readingSnapshot: ReadingSnapshot?
+    public var summary: ReadingSummary?
+    public var summaryStatus: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -69,11 +72,15 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         public var text: String
         public var createdAt: Date
         public var boundary: ReadingBoundary?
+        public var sourceHash: String?
+        public var isPositionCard: Bool?
 
-        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil) {
+        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false) {
             self.id = id
             self.role = role
             self.boundary = boundary
+            self.sourceHash = sourceHash
+            self.isPositionCard = isPositionCard
             self.text = text
             self.createdAt = createdAt
         }
@@ -127,6 +134,13 @@ public final class ConversationStore {
         self.fileURL = fileURL
         self.fileManager = fileManager
         self.state = ConversationStore.load(from: fileURL, fileManager: fileManager)
+        for bi in state.books.indices {
+            for ci in state.books[bi].conversations.indices {
+                if state.books[bi].conversations[ci].summaryStatus?.hasPrefix("正在") == true {
+                    state.books[bi].conversations[ci].summaryStatus = "摘要任务已中断，请手动重新生成"
+                }
+            }
+        }
     }
 
     // MARK: - 读取
@@ -299,11 +313,26 @@ public final class ConversationStore {
         return requested
     }
 
-    public func markLastQuestion(assetID: String, conversationID: String, boundary: ReadingBoundary?) {
+    public func updateReading(assetID: String, conversationID: String, snapshot: ReadingSnapshot) {
+        guard snapshot.assetID == assetID else { return }
+        updateConversation(assetID: assetID, conversationID: conversationID) { $0.readingSnapshot = snapshot }
+    }
+
+    public func updateConversation(assetID: String, conversationID: String, _ change: (inout Conversation) -> Void) {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }) else { return }
+        var value = state.books[bi].conversations[ci]
+        change(&value)
+        state.books[bi].conversations[ci] = value
+        persist()
+    }
+
+    public func markLastQuestion(assetID: String, conversationID: String, boundary: ReadingBoundary?, sourceHash: String? = nil) {
         guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
               let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }),
               let mi = state.books[bi].conversations[ci].messages.lastIndex(where: { $0.role == .user }) else { return }
         state.books[bi].conversations[ci].messages[mi].boundary = boundary
+        state.books[bi].conversations[ci].messages[mi].sourceHash = sourceHash
         persist()
     }
 

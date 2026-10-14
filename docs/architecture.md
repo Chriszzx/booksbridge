@@ -1,304 +1,119 @@
 # 架构
 
-## 分层
+## 分层与职责
 
-三层 + 一个宿主，依赖方向单向向上：
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ BooksBridgeApp           菜单栏宿主、窗口、WKWebView 前端    │
-│  ├ AppDelegate           生命周期、指令分发、状态推送         │
-│  ├ ReadingAssistant      预处理与问答编排                    │
-│  ├ ConversationStore     书库/对话持久化                     │
-│  ├ SettingsStore         设置与 API Key（0600）              │
-│  ├ StatusItemController  菜单栏 BR + 下拉菜单                │
-│  ├ PageWindowController  标准窗口 / 原生全屏                 │
-│  ├ WebBridge             WKWebView 双向 JSON 桥              │
-│  └ WebUI/                HTML / CSS / JS                     │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ 依赖
-┌───────────────────────────┴─────────────────────────────────┐
-│ BooksBridgeLLM           LLM 侧，不碰 UI                     │
-│  ├ ChatClient            OpenAI 兼容客户端（流式 + 非流式）   │
-│  ├ SSEDecoder            SSE 增量解析                        │
-│  ├ BookPreprocessor      整本书 → 结构化「书籍说明」          │
-│  ├ BookKnowledge         说明的数据结构与缓存                │
-│  ├ ContextBuilder        按知识范围检索与组装上下文           │
-│  └ PromptBuilder         提示词与消息序列                    │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ 依赖
-┌───────────────────────────┴─────────────────────────────────┐
-│ BooksBridgeCore          读取苹果图书，与 UI/LLM 无关         │
-│  ├ BooksPaths            容器/数据库/EPUB 路径发现            │
-│  ├ SQLite                系统 libsqlite3 只读薄封装           │
-│  ├ BooksStore            BKLibrary + AEAnnotation + plist    │
-│  ├ CFI                   EPUB CFI 解析                       │
-│  ├ EpubDocument          OPF 解析 + CFI → 章节正文            │
-│  ├ HTMLText              XHTML → 纯文本                      │
-│  ├ AccessibilityReader   屏幕可见正文 + 划选 + 屏幕矩形        │
-│  ├ FileWatcher           DispatchSource 监听 + 防抖           │
-│  ├ Permissions           权限检测与引导                       │
-│  ├ ReadingCoordinator    装配各层，对外推送变化                │
-│  └ AppPaths              应用自有数据目录                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Core 与 LLM 都不依赖 App**，可独立复用与测试。Core 甚至可以用在完全不同的界面里。
-
----
-
-## 读取链路
-
-```
-图书 App 翻页
-     │ 改写 .sqlite-wal
-     ▼
-FileWatcher（DispatchSource，150ms 合并）
-     │
-     ▼
-ReadingCoordinator ──────────► ReadingContext
-     │                          { 书, 位置(CFI), 屏幕正文, 划选 }
-     │ onUpdate（内部串行队列）
-     ▼
-AppDelegate（hop 回主线程）
-     ├─ 更新状态栏 tooltip 与菜单
-     └─ WebBridge.push ──► 前端渲染
-```
-
-三路数据各司其职：
-
-| 来源 | 提供 | 适合回答 |
+| 层 | 核心组件 | 职责 |
 |---|---|---|
-| `ReadingPosition`（CFI） | 读到哪一章 | 跨会话恢复、定位 |
-| `EpubDocument` | **整章**正文 | 「这段前后发生了什么」 |
-| `AccessibilityReader` | **当前屏**可见正文 + 划选 | 「这句话什么意思」 |
+| BooksBridgeCore | BooksStore、EpubDocument、AccessibilityReader、ReadingCoordinator | 读取本地 EPUB、目录、Books 活跃窗口、可见文字和划选 |
+| BooksBridgeLLM | BookMap、ReadingSnapshot、ScopedReading | 本地章节地图、对话阅读位置、统一原文边界 |
+| BooksBridgeLLM | ContextBuilder、PromptBuilder、ChatClient、BookPreprocessor | 预算内上下文、单次问答请求、手动范围摘要 |
+| BooksBridgeApp | AppDelegate、ReadingAssistant | 指令分发、一次位置刷新、问答编排 |
+| BooksBridgeApp | SummaryJobs、ConversationStore | 独立后台摘要任务、对话和状态持久化 |
+| BooksBridgeApp | WebBridge、WebUI | WKWebView 消息、Markdown、范围与位置展示 |
 
-> ⚠️ CFI 尾部的字符偏移**不能**用来切分正文。它是相对 XPath 指向的那个文本节点，
-> 不是相对章节开头。实测见 [findings.md](findings.md)。
+Core 与 LLM 不依赖 App。SQLite、网络、界面使用系统库，Swift 包没有外部依赖。
+Markdown 由随源码打包的 Marked 与 DOMPurify 渲染和清理。
 
----
+## 本地导入与章节地图
+
+进入书籍时按 EPUB spine 顺序读取正文，并解析 EPUB 3 TOC、EPUB 2 NCX、目录锚点和 XHTML 标题。
+一个章节可以横跨多个文件，一个文件也可以包含多个章节。没有目录或标题时明确标记为文档区段，不伪造原书章号。
+目录中的 page-list 不作为章节。无法读取的正文文件导致明确错误，不悄悄遗漏内容。
+
+`maps/` 只保存标题、层级、来源 href、规范化字符边界和完整正文指纹，不保存正文副本。
+正文仍来自本地 EPUB；刷新时重新校验源文件。导入、构建地图和检查位置都不调用 LLM。
+
+## 位置刷新与对话归属
+
+侧栏和菜单栏监测 Books 当前活跃窗口。文件变化、应用激活和一秒轮询触发检测；
+唤起应用和打开菜单也刷新。「现在在读」是提示，点击后才把书加入 BooksBridge 书库。
+
+每个对话绑定一本书，保存自己的 `ReadingSnapshot`：书籍 ID、源指纹、页尾边界、章名、进度和捕获时间。
+新建/打开对话、发送问题、检查原文、读取划选或生成摘要，统一经过 `refreshConversation`：
+
+1. 读取对话绑定书籍的本地正文，重建/校验章节地图。
+2. 活跃内容属于同一本书时，以可见文字在原文中的唯一匹配确定页尾。
+3. 没有同书活跃内容时，沿用本对话最后一次有效位置，并明确显示「沿用上次位置」。
+4. 没有历史位置时标记「尚未定位」。受限范围不能请求；全书范围可以使用本地全文。
+5. 有活跃文字但无法可靠定位时明确报错，不把错误当成无活跃内容，不静默沿用旧位置。
+
+另一本文本不会替换当前对话的书籍。文件指纹变化后旧位置失效。
+每次请求冻结自己的位置；流式回答期间翻页不会改变本次输入。
+CFI 仅辅助定位文档，不能把节点字符偏移当成整章百分比。
+
+## 三档读取边界
+
+| 模式 | 可读取的原文 |
+|---|---|
+| 读到这为止 | 书首到当前页末尾，包含之前全部正文 |
+| 整章（含未读） | 书首到当前目录节/章节末尾 |
+| 整本书 | 本书全部正文 |
+
+首次提问或确认生成摘要后固定对话模式；改变模式需要新建对话。
+固定的是读取模式，位置可随之后的提问前进或后退。
+
+`ScopedReading` 是原文、摘要输入与引用校验的共同边界。
+历史消息和摘要还必须具有相同源指纹，且生成时边界不超过本次边界。
+阅读回退后，未来范围的摘要和消息仍保留在本地历史中，但不会进入新请求；摘要展示也会隐藏。
+旧格式历史缺少可信边界或指纹时只供展示。
 
 ## 问答链路
 
-```
-用户提问
-   │ 对话范围已锁定；按 assetID 重新读取 Books 数据库进度
-   ▼
-ReadingAssistant.ask(question, scope, visibleText, history)
-   │
-   ├─ ContextBuilder.build(...)          按 scope 定边界 + 关键词检索
-   │     ├─ 范围：upToProgress / currentChapter / wholeBook
-   │     ├─ 优先带上屏幕可见正文
-   │     └─ 再从允许范围内检索相关段落
-   │
-   ├─ PromptBuilder.build(...)           拼成消息序列
-   │     ├─ system：角色 + 范围约束 + 反剧透 + 反幻觉
-   │     └─ user：可用材料 + 屏幕正文 + 进度 + 问题
-   │
-   ▼
-ChatClient.stream(...)  ──SSE──►  .content / .reasoning / .finished
-   │
-   ▼
-AppDelegate.handleAssistantEvent
-   ├─ 增量推给前端（逐字渲染）
-   └─ 结束后落盘到 ConversationStore
+```text
+用户发送 → 立即显示思考气泡 → 刷新并冻结本轮位置
+        → ScopedReading 裁剪 → 校验确认引用、摘要、历史
+        → ContextBuilder 按预算装配 → 一次模型调用 → 流式 Markdown
 ```
 
-### 三档知识范围 = 对话固定的剧透边界
+不再调用模型来规划检索或进行多轮工具读取。范围内正文能放进预算时按原书顺序完整发送；
+超预算时，概括问题分布选段，具体问题按中文 2-gram/英文整词检索，明确标记省略。
+上下文预算包含提示词、问题、原文、摘要和最近历史，发送前再次检查总量。
+历史最多八条。输出上限 8192 tokens；遇到 length 提示未完成，没有正文则显示错误。
 
-```
-      已读章节        当前章        后续章节
-   ┌──────────┬──────────────┬──────────────┐
-   │          │              │              │
-   │  读到这为止 ────────────┘              │
-   │          │                             │
-   │  整章（含未读）─────────────────────────┘   ← 不含后续章节
-   │          │              │              │
-   │  整本书 ──────────────────────────────┘
-   └──────────┴──────────────┴──────────────┘
-```
+`/now` 是本地命令：刷新位置并插入位置卡片，不锁定模式、不调用模型，也不要求 API Key。
+`/now 问题` 先显示位置卡片，再用该位置回答。普通问题也会刷新位置。
+新对话显示起始位置卡片，输入区上方持续显示该对话最后一次验证的位置。
 
-边界落在**章节**而非章内百分比 —— 因为章内位置无法可靠计算（见 findings）。
+## 划选确认
 
----
+用户在 Books 划选后点击「读取划选并确认」。有效的 AX 字符范围用于精确切分；
+系统只返回整段时，预览明确说明是段落候选。用户确认预览后才附加到问题。
 
-## 书籍预处理
+确认令牌绑定书籍、对话、源指纹与候选文字。发送时重新检查确认状态和授权原文包含关系。
+切书、切对话、源文件改变、未确认或引用超出范围都不能借此扩大读取权限。
 
-一本 10 万字的书约 15 万 token，每次提问都带上既慢又贵。预处理把它压缩成
-几 k token 的「书籍说明」：
+## 手动摘要
 
-```
-整本书正文
-    │
-    ├─ ≤ 6 万字符 ──► 一次调用，直接产出说明书
-    │
-    └─ > 6 万字符 ──► map-reduce
-                         │
-                         ├─ 按章节边界切成 ≤2 万字符的块
-                         ├─ 每块单独摘要（map）
-                         └─ 各块摘要汇总成说明书（reduce）
-```
+用户确认读取范围、服务商和模型后才调用 `BookPreprocessor`。
+短范围一次处理，长范围分块 map-reduce；处理器只能拿到已裁剪原文，不能自行读取 EPUB。
+摘要保存文本、源指纹、生成边界、模式和时间。它是可选辅助材料，不能替代原文证据。
 
-产出结构固定为五节：书籍概览 / 内容脉络 / 核心概念与术语 / 结构形式 / 关键线索。
-其中「内容脉络」承担**定位能力** —— 让模型知道某内容大致在书里哪个位置。
+`SummaryJobs` 由宿主持有，以书籍和对话 ID 区分任务。切换对话、书籍和设置不会取消已经开始的摘要任务。
+状态回写所属对话，侧栏显示进度，切回后可查看结果。显式取消会阻止晚到结果覆盖状态。
+应用退出后任务中断，重启显示中断，需要用户手动重试，不自动重发付费请求。
+目前不保存分块中间结果；重试重新处理该范围。旧版整书知识缓存不自动导入新对话。
 
-**缓存失效**依据完整 UTF-8 正文的 `sha256-v1:` 指纹，读取和写入使用同一函数。
-进入书籍只读取本地章节和有效缓存；全书预处理须在整本书范围显式触发。
+## 存储与权限
 
----
+应用数据位于 `~/Library/Application Support/BooksBridge/`：
 
-## 前后端契约
+- `store.json`：书库、对话、模式、消息、位置和范围摘要。
+- `maps/`：章节地图元数据，不含正文副本。
+- `settings.json`：模型、预算、思考摘要默认展开等设置。
+- `secret.json`：API Key，文件权限 0600。
 
-### Swift → Web
+已获授权时自动恢复检测；缺少权限时提供连接入口，启动不主动弹授权框。
+必须通过实际读取验证完全磁盘访问权限，不能仅使用 `isReadableFile`。
+签名身份和指定要求保持稳定；构建脚本验证签名成功后才替换应用。
+从 Finder 或 `run-app.sh` 启动验证应用自身权限，终端直跑可执行文件不能证明其独立授权。
+详见 [权限与签名](permissions.md)。
 
-宿主只有一个推送入口（`WebBridge.push` → `window.booksbridge.onState`），
-前端按 payload 里出现哪些字段决定更新什么。
+## 并发与界面
 
-```jsonc
-{
-  // 一句话状态
-  "message": "已进入《…》",
-  "facts": { "…": "…" },              // 自检键值对
+AppDelegate、ReadingAssistant、SummaryJobs 和 WebBridge 在主线程编排。
+本地 EPUB 加载与状态采集通过后台任务执行；网络使用 URLSession。
+切换对话会取消该视图的问答/位置任务，后台摘要持有冻结的输入继续运行。
+异步结果写回时校验对话或任务代次，避免迟到结果落入其他对话。
 
-  // 实时检测（只提示，不代表已进入）
-  "detected": {
-    "assetID": "…", "title": "…", "author": "…",
-    "progress": 0.471, "kind": "EPUB", "cfi": "…", "inLibrary": true
-  },
-  "detectionState": "ok",   // ok | disconnected | dataUnavailable
-                            // | noFullDiskAccess | booksNotRunning
-                            // | noBookOpen | transientError | waiting
-
-  // 持久化的书与对话（不含消息正文）
-  "library": [{
-    "assetID": "…", "title": "…", "author": "…",
-    "conversations": [
-      { "id": "…", "title": "对话 1", "messageCount": 3, "updatedAt": "…" }
-    ]
-  }],
-
-  // 当前停留位置；消息正文随它一起来，供前端整段重绘历史
-  "active": {
-    "assetID": "…", "conversationID": "…",
-    "messages": [{ "role": "user", "text": "…", "createdAt": "…" }]
-  },
-
-  // 设置与元数据
-  "settings": { "provider": "deepseek", "model": "deepseek-flash",
-                "defaultScope": "upToProgress", "thinkingLevel": "off",
-                "hasAPIKey": true, "isConfigured": true, "…": "…" },
-  "providers": [ … ], "knowledgeScopes": [ … ], "thinkingLevels": [ … ],
-  "permissionProbe": { "probes": [ … ], "signature": "…" },
-  "assistant": { "preparation": "已理解全书 · 39 章 / 128k 字", "ready": true },
-
-  // 问答流式事件
-  "chatEvent": { "kind": "delta", "text": "…" },
-                // kind: reasoning | delta | finished | error
-  "openSettings": true       // 让前端切到设置页
-}
-```
-
-### Web → Swift
-
-| 指令 | 参数 | 作用 |
-|---|---|---|
-| `ready` | — | 前端就绪，开通推送 |
-| `openBook` | `assetID` | 进入某书 workspace（不存在则加入并建首条对话） |
-| `newConversation` | `assetID` | 新建对话并切过去 |
-| `selectConversation` | `assetID, conversationID` | 切换对话 |
-| `deleteConversation` | `assetID, conversationID` | 删除对话 |
-| `removeBook` | `assetID` | 移出书库 |
-| `backToLibrary` | — | 取消停留，回到选择态 |
-| `ask` | `question, scope` | 提问 |
-| `cancelAnswer` | — | 中断回答 |
-| `reprocessBook` | — | 强制重做预处理 |
-| `connectBooks` | — | 连接苹果图书（含请求辅助功能） |
-| `recheckPermissions` | — | 只重新检测，不弹授权框 |
-| `openSystemSettings` | `which` | 打开系统设置对应面板 |
-| `saveSettings` | 设置字段 | 保存设置 |
-| `returnToReader` | — | 返回图书 App |
-| `hidePage` | — | 隐藏窗口 |
-| `quit` | — | 退出 |
-| `renderStats` | DOM 统计 | 前端回报渲染结果（自动化验证用） |
-
----
-
-## 关键设计决策
-
-### 检测到 ≠ 进入
-
-侧栏顶部「现在在读」只是**实时提示**，只有点击才把书写进 `store.json`。
-实现上检测到的书只存在于内存（`latestContext`），`ConversationStore` 完全不知道它。
-
-实测验证：只启动不点击时 `store.json` 哈希不变。
-
-### 启动不主动申请权限
-
-已具备辅助功能与数据读取权限时自动恢复检测；权限不足时显示连接入口，不主动弹授权框。
-这是为了解决 TCC 授权弹窗时机不可控的问题（详见 [permissions.md](permissions.md)）。
-
-### 统一的阅读范围
-
-`ScopedReading` 为同一份本地 EPUB 计算三种权限前缀：书首至当前页末尾、书首至当前章末尾、全书。
-当前窗口可见文字与原文唯一匹配，确定章内边界；不能可靠定位时停止请求。
-CFI 只辅助定位章节，不能把节点偏移当成章节百分比。双页跨章按文本顺序匹配。
-`ReadingTools` 仅持有裁剪后的内容，提供有长度限制的 search/read；模型最多补充读取两轮。
-正文只保留当前书的内存副本，不创建三份磁盘数据。
-
-实时状态由当前 Books 阅读窗口识别，文件变化、应用激活和一秒轮询触发采集。
-唤起应用和打开菜单也主动刷新；检测失效会清空旧状态。聊天仍绑定原书。
-对话消息记录读取边界，回退后不再把超过新边界的消息送给模型；旧的未标记消息仅用于展示。
-
-### 离线构建与前端依赖
-
-SQLite 用系统 `libsqlite3`（自带 module map）；网络用 `URLSession`；
-界面用系统 WebKit。整个工程 `Package.swift` 没有任何外部依赖，
-构建不需要联网拉包。Markdown 使用随源码打包的 Marked 与 DOMPurify，版本和许可证见 WebUI/vendor。
-
-### 前端用 WKWebView 而非纯原生
-
-最值得复用的恰好是**消息区的排版**（流式 Markdown、行内样式、折叠块），
-用原生重写性价比极低。侧栏那种规则列表用哪边都行，于是整体走 Web。
-
-### 为什么不用 NSPanel
-
-形态是「接管整屏 + 返回按钮」，此时「不抢焦点」的需求已消失，
-而输入框必须能正常成为 key window，所以用普通 `NSWindow`。
-
-### 权限判断必须真读文件
-
-`FileManager.isReadableFile` 对 TCC 拦截会误报 `true`，必须真正 `opendir`/`open`。
-且受保护时 `errno` 是 `ENOENT`，与「文件真的不存在」无法从错误码区分 ——
-需借助「图书 App 是否安装」这一外部信号（详见 permissions.md）。
-
----
-
-## 线程约定
-
-| 组件 | 所在线程 | 说明 |
-|---|---|---|
-| `FileWatcher` | 自有串行队列 | DispatchSource |
-| `ReadingCoordinator` | 自有串行队列 | 采集与去重 |
-| `AppDelegate` / `WebBridge` | 主线程 | `@MainActor`，AppKit 与 WKWebView 要求 |
-| `ReadingAssistant` | 主线程 | `@MainActor`，内部用 Task 并发网络请求 |
-| `BookKnowledgeStore` | actor | 文件读写隔离 |
-| `ChatClient` | 无状态 | 可任意并发调用 |
-
-跨层回调统一 `Task { @MainActor in … }` hop 回主线程。
-
-## 2026-10-14 问答边界修订
-
-对话首次提问时持久化 scope；后续请求无法切换范围，设置里的默认范围只影响新对话。
-每次提问按对话书籍的 assetID 重新读取书目与 CFI，屏幕正文仅来自当前确实打开的同一本书。
-受限范围无法定位时停止请求。全书摘要只用于 wholeBook，其他两档检索允许的原文。
-旧格式对话的历史保留展示，但锁定范围之前的旧消息不作为 agent 上下文。
-upToProgress 包含当前章开头至当前页末尾；第一章同样通过可见文本定位前缀。
-
-## 可选摘要与请求预算
-
-新建或切换对话仅检查本地正文和摘要指纹，不调用 API。用户点击生成并确认服务商、模型与用量后才上传全书生成摘要；可取消和清除。该操作不锁定或扩大对话权限。
-缓存保存全书摘要和 SHA-256 指纹，摘要只用于全书权限。摘要失效不自动重做。
-请求预算包含提示词、问题、最近历史及原文。范围内的全部原文（包括来源标记）放得下时，按原书顺序完整发送，不再受 12 个片段限制；否则概括问题按全范围分配覆盖，具体问题按检索选段，并明确标注省略。当前页单独标记，文档区段编号不作为原书章号。
-回答输出上限为 8192 tokens；模型报告 length 时显示未完成提示，只有思考、没有正文时显示错误，不再保存空答案。历史最多八条并按字符预算及阅读边界裁减，重试检索带上之前的问题。
-发送时前端立即建立助手气泡，随后显示本轮完整原文/选段字数。通用设置 autoExpandReasoning 控制新思考摘要的默认展开状态，旧配置默认折叠。
-API 测试只发送固定的极短探测文字，不发送书籍或聊天内容。前端展示检测时间、延迟与结果，配置改变后失效。
+前端通过 `window.booksbridge.onState` 接收状态，通过 WebBridge 发送指令。
+API 活跃检测只发送固定短探测内容，不发送书籍。思考摘要默认折叠，可在设置中改变。

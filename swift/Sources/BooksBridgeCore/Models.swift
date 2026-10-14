@@ -111,6 +111,7 @@ public struct ReadingContext: Sendable {
     public let visibleText: [String]
     /// 用户当前划选的文本。
     public let selection: String?
+    public let selectionIsExact: Bool
     public let capturedAt: Date
 
     public init(
@@ -118,12 +119,14 @@ public struct ReadingContext: Sendable {
         position: ReadingPosition?,
         visibleText: [String],
         selection: String?,
+        selectionIsExact: Bool = false,
         capturedAt: Date = Date()
     ) {
         self.book = book
         self.position = position
         self.visibleText = visibleText
         self.selection = selection
+        self.selectionIsExact = selectionIsExact
         self.capturedAt = capturedAt
     }
 }

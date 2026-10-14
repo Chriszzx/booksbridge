@@ -78,6 +78,12 @@ public struct AccessibilityReader: Sendable {
         /// 是否处于阅读视图（而非书库列表）。
         public var isReaderView: Bool { !visibleText.isEmpty }
 
+        public var selectionIsExact: Bool {
+            guard let node = selectionNodeText, let range = selectionRange else { return false }
+            return range.location >= 0 && range.length > 0 && range.location <= node.utf16.count
+                && range.length <= node.utf16.count - range.location
+        }
+
         /// 用户真正划中的那几个字。
         ///
         /// 优先用 `selectionRange` 精确切分；拿不到范围时退回整段

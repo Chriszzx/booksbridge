@@ -73,6 +73,7 @@ extension WebRenderingTests {
           const clear = !document.getElementById('rc-title').textContent.includes('当前书');
           booksbridge.onState({active:{assetID:'A',conversationID:'C',scope:'upToProgress',messages:[]}});
           return {confirmation, clear, locked:document.getElementById('scope-picker').disabled,
+            emptyHidden:getComputedStyle(document.getElementById('thread-empty')).display === 'none',
             model:document.getElementById('composer-model').textContent,
             markdown:!!document.querySelector('.msg-body h2'),options:document.getElementById('scope-picker').options.length};
         })()
@@ -80,6 +81,7 @@ extension WebRenderingTests {
         XCTAssertEqual(result["confirmation"] as? Bool, true)
         XCTAssertEqual(result["clear"] as? Bool, true)
         XCTAssertEqual(result["locked"] as? Bool, true)
+        XCTAssertEqual(result["emptyHidden"] as? Bool, true)
         XCTAssertEqual(result["model"] as? String, "test-model")
         XCTAssertEqual(result["markdown"] as? Bool, true)
         XCTAssertEqual(result["options"] as? Int, 3)
@@ -113,6 +115,31 @@ extension WebRenderingTests {
         for key in ["immediate", "status", "folded", "stopped", "expanded", "finished"] {
             XCTAssertEqual(live[key] as? Bool, true, key)
         }
+        let core = try await view.evaluateJavaScript("""
+        (() => {
+          booksbridge.onState({readingPosition:'真实章节 · 20% · 沿用上次位置',scopeSummary:'**范围内摘要**',selectionCandidate:{token:'selection-token',text:'已读原文',exact:false}});
+          const input = document.getElementById('input');
+          input.value = '解释这句话'; input.dispatchEvent(new Event('input'));
+          const blocked = document.getElementById('send-btn').disabled;
+          const paragraph = document.getElementById('selection-kind').textContent.includes('整段');
+          const checkbox = document.getElementById('selection-confirmed'); checkbox.checked = true; checkbox.dispatchEvent(new Event('change'));
+          document.getElementById('send-btn').click();
+          booksbridge.onState({chatEvent:{kind:'finished',text:'引用解读完成'},scopeSummary:''});
+          const cleared = document.getElementById('selection-preview').hidden;
+          const hiddenSummary = document.getElementById('scope-summary').hidden;
+          booksbridge.onState({settings:{isConfigured:false}});
+          input.value = '/now'; input.dispatchEvent(new Event('input'));
+          const commandEnabled = !document.getElementById('send-btn').disabled && !input.disabled;
+          document.getElementById('send-btn').click();
+          booksbridge.onState({chatEvent:{kind:'finished',text:'真实章节 · 20%'}});
+          return {blocked,paragraph,cleared,hiddenSummary,commandEnabled,position:document.getElementById('reading-position').textContent};
+        })()
+        """) as! [String: Any]
+        for key in ["blocked", "paragraph", "cleared", "hiddenSummary", "commandEnabled"] { XCTAssertEqual(core[key] as? Bool, true, key) }
+        XCTAssertTrue((core["position"] as? String)?.contains("沿用上次位置") == true)
+        try await Task.sleep(for: .milliseconds(100))
+        let quoteRequest = calls.calls.compactMap { $0["payload"] as? [String: Any] }.first { $0["selectionToken"] as? String == "selection-token" }
+        XCTAssertEqual(quoteRequest?["selectionConfirmed"] as? Bool, true)
         config.userContentController.removeScriptMessageHandler(forName: "booksbridge")
     }
 }

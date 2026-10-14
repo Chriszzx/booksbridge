@@ -29,6 +29,17 @@ For details on signing and permission setup, see [Permissions and Signing](docs/
 
 > To verify the app's own permissions, launch it with `./scripts/run-app.sh` or Finder. Running the executable directly from a terminal can use the terminal's TCC permissions, so those results do not establish that BooksBridge itself is authorized.
 
+## Reading Workflow
+
+Open a book in Apple Books, then select it in BooksBridge. Import builds a local chapter map from the EPUB without calling a model or saving another copy of the text.
+
+Each chat stays bound to one book and one reading mode: through the current page, through the current chapter, or the whole book. The mode locks after the first question or confirmed summary. Each question refreshes that chat's position; when the same book has no active content, the last verified position is reused and labeled.
+
+- Use `/now` to refresh and display your position locally, or `/now your question` to show it before asking.
+- Capture selected text, check the preview, and confirm it before sending. Paragraph fallbacks are labeled explicitly.
+- Generate an optional summary for the selected scope. Its progress and result stay with the chat when you navigate elsewhere.
+- Source text, summaries, quotes, and history are checked against the current reading boundary. Text within the configured budget is sent in full; larger ranges use explicitly labeled excerpts.
+
 ## Documentation
 
 The detailed documentation is currently in Chinese.

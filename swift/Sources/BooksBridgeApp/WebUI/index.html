@@ -92,6 +92,14 @@
             <button id="prep-clear" class="btn-plain btn-tiny" hidden>清除摘要</button>
           </div>
 
+          <div id="reading-position" class="empty-hint" aria-live="polite">尚未取得有效阅读位置</div>
+          <details id="scope-summary" hidden><summary>当前范围摘要</summary><div id="scope-summary-text" class="msg-body"></div></details>
+          <button id="capture-selection" class="btn-plain btn-tiny">读取划选并确认</button>
+          <div id="selection-preview" hidden>
+            <div id="selection-kind" class="empty-hint"></div><blockquote id="selection-text"></blockquote>
+            <label><input id="selection-confirmed" type="checkbox"> 确认将以上文字用于本次提问</label>
+            <button id="selection-clear" class="btn-plain btn-tiny">取消引用</button>
+          </div>
           <div id="reading-check-result" class="empty-hint" aria-live="polite"></div>
           <textarea id="input" rows="1"
             placeholder="就正在读的内容提问…（Enter 发送，Shift+Enter 换行）"></textarea>

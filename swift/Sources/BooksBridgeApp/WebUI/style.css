@@ -463,6 +463,7 @@ button { cursor: pointer; }
   padding: 20px 24px;
 }
 
+.thread-empty[hidden] { display: none; }
 .thread-empty {
   height: 100%;
   display: flex;
@@ -1003,3 +1004,7 @@ dialog::backdrop { background: #0005; }
 @media (max-width: 800px) { :root { --side-w: 210px; } .composer-model { max-width: 100px; } .thread { padding: 18px; } }
 
 #preparation-jobs { white-space: pre-line; max-height: 160px; overflow-y: auto; }
+
+#selection-preview { padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+#selection-text, #scope-summary-text { max-height: 180px; overflow: auto; white-space: pre-wrap; }
+#reading-position { font-size: 12px; }

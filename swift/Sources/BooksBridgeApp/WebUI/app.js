@@ -434,16 +434,18 @@
 
   function renderComposerState() {
     const configured = settingsState.settings?.isConfigured ?? false;
-    const canSend = configured && hasConversation() && !chatState.streaming
-      && els.input.value.trim().length > 0;
+    const localCommand = /^\/now\s*$/.test(els.input.value.trim());
+    const canSend = (configured || localCommand) && hasConversation() && !chatState.streaming
+      && els.input.value.trim().length > 0 && (!selectedQuote || document.getElementById("selection-confirmed").checked);
 
     els.sendBtn.disabled = !canSend;
     els.sendBtn.hidden = chatState.streaming;
     els.cancelBtn.hidden = !chatState.streaming;
-    els.input.disabled = !configured || !hasConversation();
+    els.input.disabled = !hasConversation();
+    document.getElementById("capture-selection").disabled = !hasConversation() || chatState.streaming;
 
     if (!configured) {
-      els.input.placeholder = "请先在「设置 → 模型与 API」里填写 API Key";
+      els.input.placeholder = "输入 /now 查看位置；提问前请在设置中填写 API Key";
     } else if (!hasConversation()) {
       els.input.placeholder = "先在左侧选择一本书";
     } else {
@@ -536,6 +538,7 @@
   function finishAssistantMessage(event) {
     showCursor(false);
     if (chatState.streamNode) {
+      if (event.roleLabel) chatState.streamNode.closest(".msg").querySelector(".msg-role").textContent = event.roleLabel;
       renderMarkdown(chatState.streamNode, event.text ?? chatState.streamText);
       // 在气泡下方补一行出处与用量
       const bits = [];
@@ -720,6 +723,7 @@
   }
 
   /** 当前会话标识，用于判断是否需要整段重绘历史。 */
+  let selectedQuote = null;
   let renderedConversationKey = null;
 
   /** 切换会话时把历史消息整段重绘。 */
@@ -733,6 +737,7 @@
     // 会话没变就不动 DOM——流式渲染正在进行时更不能重绘
     if (key === renderedConversationKey) return;
     renderedConversationKey = key;
+    clearSelection();
     chatState.streaming = false;
     document.getElementById("reading-check-result").textContent = "";
     chatState.preparation = ""; chatState.preparationReady = false; chatState.preparationFailed = false;
@@ -747,7 +752,7 @@
     // 历史消息随 active 一起推送（library 里只有计数，不带正文）
     for (const message of state.active?.messages ?? []) {
       appendMessage(message.role, message.text, {
-        roleLabel: message.role === "user" ? "我" : settingsState.settings?.model ?? "助手",
+        roleLabel: message.isPositionCard ? "阅读位置" : message.role === "user" ? "我" : settingsState.settings?.model ?? "助手",
       });
     }
     renderThreadShell();
@@ -785,6 +790,28 @@
       // 问答事件（流式增量等）
       if (payload.chatEvent) handleChatEvent(payload.chatEvent);
 
+      if (payload.readingPosition !== undefined) {
+        document.getElementById("reading-position").textContent = payload.readingPosition;
+      }
+      if (payload.positionCard) {
+        const card = appendMessage("assistant", payload.positionCard, {roleLabel:"阅读位置"});
+        if (chatState.streamNode) els.messages.insertBefore(card.closest(".msg"), chatState.streamNode.closest(".msg"));
+      }
+      if (payload.scopeSummary !== undefined) {
+        document.getElementById("scope-summary").hidden = !payload.scopeSummary;
+        renderMarkdown(document.getElementById("scope-summary-text"), payload.scopeSummary);
+      }
+      if (payload.selectionCandidate) {
+        clearSelection();
+        const value = payload.selectionCandidate;
+        if (value.error) appendError(value.error);
+        else {
+          selectedQuote = value;
+          document.getElementById("selection-preview").hidden = false;
+          document.getElementById("selection-text").textContent = value.text;
+          document.getElementById("selection-kind").textContent = value.exact ? "已识别精确选中文字，请核对" : "Books 仅提供所在段落，未识别精确划词；请确认是否引用整段";
+        }
+      }
       if (payload.readingCheck) document.getElementById("reading-check-result").textContent = payload.readingCheck;
       if (payload.preparationJobs) {
         document.getElementById("preparation-jobs").textContent = payload.preparationJobs.map(job => `${job.title}：${job.status}`).join("\n");
@@ -930,17 +957,29 @@
 
   els.returnBtn.addEventListener("click", () => invoke("returnToReader"));
 
+  function clearSelection() {
+    selectedQuote = null;
+    document.getElementById("selection-preview").hidden = true;
+    document.getElementById("selection-confirmed").checked = false;
+  }
+  document.getElementById("capture-selection").addEventListener("click", () => invoke("captureSelection"));
+  document.getElementById("selection-clear").addEventListener("click", () => { clearSelection(); renderComposerState(); });
+  document.getElementById("selection-confirmed").addEventListener("change", renderComposerState);
+
   function send() {
     const question = els.input.value.trim();
     if (!question || chatState.streaming) return;
 
-    appendMessage("user", question, { roleLabel: "我" });
+    if (selectedQuote && !document.getElementById("selection-confirmed").checked) return;
+    appendMessage("user", question + (selectedQuote ? "\n\n引用：\n" + selectedQuote.text : ""), { roleLabel: "我" });
     els.input.value = "";
     autoGrow();
     startStreaming();
     startAssistantMessage();
 
-    invoke("ask", { question, scope: chatState.scope });
+    invoke("ask", { question, scope: chatState.scope,
+      ...(selectedQuote ? {selectionToken:selectedQuote.token, selectionConfirmed:true} : {}) });
+    clearSelection();
   }
 
   els.sendBtn.addEventListener("click", send);
@@ -955,11 +994,11 @@
   });
   els.prepRetry.addEventListener("click", () => {
     const dialog = document.getElementById("prepare-confirm");
-    document.getElementById("prepare-destination").textContent = `将整本书正文发送至 ${settingsState.settings?.baseURL ?? "当前接口"}，使用 ${settingsState.settings?.model ?? "当前模型"} 生成摘要，会产生 API 用量。摘要保存在本机，可随时清除。不会更改本对话的读取权限。`;
+    document.getElementById("prepare-destination").textContent = `将当前对话所选范围内的正文发送至 ${settingsState.settings?.baseURL ?? "当前接口"}，使用 ${settingsState.settings?.model ?? "当前模型"} 生成摘要，会产生 API 用量。摘要保存在本机，可随时清除。首次生成摘要后，本对话的读取权限也会固定。`;
     dialog.showModal();
   });
   document.getElementById("prepare-yes").addEventListener("click", () => {
-    document.getElementById("prepare-confirm").close(); invoke("reprocessBook", { confirmed: true });
+    document.getElementById("prepare-confirm").close(); invoke("reprocessBook", { confirmed: true, scope: chatState.scope });
   });
   document.getElementById("prepare-no").addEventListener("click", () => document.getElementById("prepare-confirm").close());
   document.getElementById("reading-check").addEventListener("click", () => {
