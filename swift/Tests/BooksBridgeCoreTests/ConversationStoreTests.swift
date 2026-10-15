@@ -25,6 +25,52 @@ final class ConversationStoreTests: XCTestCase {
         ConversationStore(fileURL: fileURL)
     }
 
+    func testBookMovesPersistWithoutChangingConversationState() throws {
+        let store = makeStore()
+        for id in ["A", "B", "C"] { store.addBook(assetID: id, title: id, author: "") }
+        let c = try XCTUnwrap(store.createConversation(assetID: "B"))
+        store.setActive(assetID: "B", conversationID: c.id)
+        store.lockScope(assetID: "B", conversationID: c.id, requested: .upToProgress)
+        XCTAssertTrue(store.moveBook(assetID: "C", beforeAssetID: "A"))
+        XCTAssertEqual(makeStore().state.books.map(\.assetID), ["C", "A", "B"])
+        XCTAssertTrue(store.moveBook(assetID: "C", beforeAssetID: nil))
+        XCTAssertEqual(makeStore().state.books.map(\.assetID), ["A", "B", "C"])
+        XCTAssertFalse(store.moveBook(assetID: "B", beforeAssetID: "missing"))
+        XCTAssertFalse(store.moveBook(assetID: "B", beforeAssetID: "B"))
+        XCTAssertEqual(makeStore().state.lastActive?.conversationID, c.id)
+        XCTAssertEqual(makeStore().conversation(assetID: "B", conversationID: c.id)?.scope, .upToProgress)
+    }
+
+    func testArchiveAndRestorePreserveScopeMessagesSnapshotAndRunningSummary() throws {
+        let store = makeStore(); store.addBook(assetID: "A", title: "书", author: "")
+        let c = try XCTUnwrap(store.createConversation(assetID: "A"))
+        let next = try XCTUnwrap(store.createConversation(assetID: "A"))
+        store.setActive(assetID: "A", conversationID: c.id)
+        store.lockScope(assetID: "A", conversationID: c.id, requested: .currentChapter)
+        let snapshot = ReadingSnapshot(assetID: "A", sourceHash: "hash", page: .init(chapter: 0, end: 10), chapterTitle: "第一章", progress: 0.2)
+        let summary = ReadingSummary(text: "范围摘要", sourceHash: "hash", boundary: .init(chapter: 0, end: 10), scope: .currentChapter)
+        store.updateReading(assetID: "A", conversationID: c.id, snapshot: snapshot)
+        store.updateConversation(assetID: "A", conversationID: c.id) { $0.summary = summary; $0.summaryStatus = "正在生成摘要 1/3" }
+        store.appendMessage(assetID: "A", conversationID: c.id, message: .init(role: .user, text: "问题"))
+        XCTAssertTrue(store.setArchived(assetID: "A", conversationID: c.id, archived: true))
+        XCTAssertEqual(store.state.lastActive?.conversationID, next.id)
+        XCTAssertEqual(store.conversation(assetID: "A", conversationID: c.id)?.summaryStatus, "正在生成摘要 1/3")
+        XCTAssertNotNil(makeStore().conversation(assetID: "A", conversationID: c.id)?.archivedAt)
+        XCTAssertTrue(store.setArchived(assetID: "A", conversationID: c.id, archived: false))
+        let restored = try XCTUnwrap(makeStore().conversation(assetID: "A", conversationID: c.id))
+        XCTAssertNil(restored.archivedAt)
+        XCTAssertEqual(restored.scope, .currentChapter)
+        XCTAssertEqual(restored.messages.first?.text, "问题")
+        XCTAssertEqual(restored.readingSnapshot?.page, snapshot.page)
+        XCTAssertEqual(restored.summary?.text, summary.text)
+        store.setActive(assetID: "A", conversationID: next.id)
+        store.setArchived(assetID: "A", conversationID: c.id, archived: true)
+        store.setArchived(assetID: "A", conversationID: next.id, archived: true)
+        XCTAssertNil(store.state.lastActive?.conversationID)
+        XCTAssertEqual(store.book(assetID: "A")?.conversations.count, 2)
+        XCTAssertFalse(store.setArchived(assetID: "A", conversationID: "missing", archived: true))
+    }
+
     func testScopeCannotBeChangedAndPersists() {
         let store = makeStore()
         store.addBook(assetID: "A", title: "书", author: "")

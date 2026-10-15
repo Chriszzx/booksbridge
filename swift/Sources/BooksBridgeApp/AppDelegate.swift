@@ -436,6 +436,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             pushState(message: "已切换对话")
             prepareBook(assetID: assetID)
 
+        case "moveBook":
+            guard let assetID = invocation.payload["assetID"] as? String else { return }
+            store.moveBook(assetID: assetID, beforeAssetID: invocation.payload["beforeAssetID"] as? String)
+            pushState(message: "书籍顺序已保存")
+
+        case "archiveConversation", "restoreConversation":
+            guard let assetID = invocation.payload["assetID"] as? String,
+                  let id = invocation.payload["conversationID"] as? String else { return }
+            let archived = invocation.type == "archiveConversation"
+            let wasActive = store.state.lastActive?.assetID == assetID && store.state.lastActive?.conversationID == id
+            if !archived || wasActive { cancelPendingAnswer() }
+            guard store.setArchived(assetID: assetID, conversationID: id, archived: archived) else { return }
+            if !archived { store.setActive(assetID: assetID, conversationID: id) }
+            pushState(message: archived ? "对话已归档" : "对话已恢复")
+            if !archived || wasActive, let active = store.state.lastActive { prepareBook(assetID: active.assetID) }
+
         case "deleteConversation":
             guard let assetID = invocation.payload["assetID"] as? String,
                   let conversationID = invocation.payload["conversationID"] as? String else { return }
@@ -581,12 +597,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         var book = store.book(assetID: assetID)
 
         // 1:N —— 新进入的书默认有一条对话，用户可继续新建
-        if book?.conversations.isEmpty ?? false {
+        if book?.conversations.contains(where: { $0.archivedAt == nil }) != true {
             store.createConversation(assetID: assetID)
             book = store.book(assetID: assetID)
         }
 
-        store.setActive(assetID: assetID, conversationID: book?.conversations.first?.id)
+        store.setActive(assetID: assetID, conversationID: book?.conversations.first(where: { $0.archivedAt == nil })?.id)
         NSLog("[BooksBridge] 进入《\(resolvedTitle)》的 workspace，对话数=\(book?.conversations.count ?? 0)")
         pushState(message: "已进入《\(resolvedTitle)》")
         prepareBook(assetID: assetID)
@@ -656,7 +672,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func prepareBook(assetID: String) {
-        guard let id = store.state.lastActive?.conversationID else { return }
+        guard let id = store.state.lastActive?.conversationID,
+              store.conversation(assetID: assetID, conversationID: id)?.archivedAt == nil else { return }
         positionTask?.cancel()
         positionTask = Task { @MainActor in
             do {
@@ -676,7 +693,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func generateSummary(_ payload: [String: Any]) {
-        guard let active = store.state.lastActive, let id = active.conversationID else { return }
+        guard let active = store.state.lastActive, let id = active.conversationID,
+              store.conversation(assetID: active.assetID, conversationID: id)?.archivedAt == nil else { return }
         let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
         guard let scope = store.lockScope(assetID: active.assetID, conversationID: id, requested: requested) else { return }
         positionTask?.cancel()
@@ -694,7 +712,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func captureSelection() {
-        guard let active = store.state.lastActive, let id = active.conversationID else { return }
+        guard let active = store.state.lastActive, let id = active.conversationID,
+              store.conversation(assetID: active.assetID, conversationID: id)?.archivedAt == nil else { return }
         positionTask?.cancel()
         positionTask = Task { @MainActor in
             do {
@@ -742,7 +761,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkReading(_ payload: [String: Any]) {
-        guard let active = store.state.lastActive, let id = active.conversationID else { return }
+        guard let active = store.state.lastActive, let id = active.conversationID,
+              store.conversation(assetID: active.assetID, conversationID: id)?.archivedAt == nil else { return }
         positionTask?.cancel()
         positionTask = Task { @MainActor in
             do {
@@ -763,7 +783,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func ask(_ payload: [String: Any]) {
         guard let question = (payload["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !question.isEmpty,
-              let active = store.state.lastActive, let conversationID = active.conversationID else { return }
+              let active = store.state.lastActive, let conversationID = active.conversationID,
+              store.conversation(assetID: active.assetID, conversationID: conversationID)?.archivedAt == nil else { return }
         guard connectionRequested, dataAccess.isGranted else {
             bridge.push(["chatEvent": ["kind": "error", "text": "请先连接 Apple Books，以读取本书最新进度"]])
             return
@@ -1115,6 +1136,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         body["assistant"] = ["preparation": "本地章节地图 · 摘要按需生成", "ready": false]
         body["readingPosition"] = "尚未取得有效阅读位置"
         body["scopeSummary"] = ""
+        body["summaryMetadata"] = "尚未生成摘要"
         if let active = store.state.lastActive, let id = active.conversationID,
            let conversation = store.conversation(assetID: active.assetID, conversationID: id) {
             body["readingPosition"] = conversation.readingSnapshot?.label ?? "尚未取得有效阅读位置"
@@ -1125,6 +1147,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 if safe { body["scopeSummary"] = summary.text }
             }
             let status = conversation.summaryStatus ?? "本地章节地图 · 未生成范围摘要"
+            if let summary = conversation.summary {
+                body["summaryMetadata"] = "\(summary.coverageLabel ?? summary.scope.label) · \(summary.generatedAt.formatted(date: .abbreviated, time: .shortened)) · \(safe ? "适用于当前范围" : "当前不可用")"
+            }
             body["assistant"] = ["preparation": conversation.summary != nil && !safe && !status.hasPrefix("正在") ? "摘要与当前范围不匹配，已隔离；可重新生成" : status, "ready": safe]
         }
 
@@ -1179,6 +1204,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         "id": conversation.id,
                         "title": conversation.title,
                         "messageCount": conversation.messages.count,
+                        "archived": conversation.archivedAt != nil,
+                        "summaryStatus": conversation.summaryStatus ?? "",
                         "updatedAt": ISO8601DateFormatter().string(from: conversation.updatedAt),
                     ]
                 },
@@ -1199,6 +1226,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     assetID: active.assetID, conversationID: conversationID
                 ) {
                     payload["scope"] = conversation.scope?.rawValue ?? NSNull() as Any
+                    payload["archived"] = conversation.archivedAt != nil
                     payload["messages"] = conversation.messages.map { message in
                         [
                             "role": message.role.rawValue,

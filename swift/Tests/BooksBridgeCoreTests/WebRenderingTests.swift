@@ -143,3 +143,145 @@ extension WebRenderingTests {
         config.userContentController.removeScriptMessageHandler(forName: "booksbridge")
     }
 }
+
+extension WebRenderingTests {
+    private func workspaceFixture() async throws -> (WKWebView, UIInvocations) {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/BooksBridgeApp/WebUI")
+        let config = WKWebViewConfiguration(); let calls = UIInvocations()
+        config.userContentController.add(calls, name: "booksbridge")
+        let view = WKWebView(frame: CGRect(x: 0, y: 0, width: 1000, height: 700), configuration: config)
+        let ready = expectation(description: "workspace loaded"); let navigation = NavigationReady(ready)
+        view.navigationDelegate = navigation
+        view.loadFileURL(root.appendingPathComponent("index.html"), allowingReadAccessTo: root)
+        await fulfillment(of: [ready], timeout: 10)
+        _ = try await view.evaluateJavaScript("""
+        window.fixtureBooks = [{assetID:'A',title:'书A',conversations:[{id:'C',title:'对话1',messageCount:1}]},{assetID:'B',title:'书B',conversations:[]}];
+        booksbridge.onState({settings:{model:'test',baseURL:'https://example.test/v1',isConfigured:true,defaultScope:'upToProgress'},
+          knowledgeScopes:[{id:'upToProgress',label:'读到这为止'},{id:'currentChapter',label:'整章'},{id:'wholeBook',label:'整书'}],
+          library:fixtureBooks,active:{assetID:'A',conversationID:'C',scope:'upToProgress',messages:[{role:'assistant',text:'已有回答'}]},
+          readingPosition:'第一章 · 20% · 沿用上次位置',assistant:{preparation:'未生成摘要',ready:false}}); undefined;
+        """)
+        return (view, calls)
+    }
+
+    func testSlashCommandsAndPlusMenuShareLocalActions() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id), input = $('input');
+          const type = value => { input.value = value; input.dispatchEvent(new Event('input')); };
+          const key = value => input.dispatchEvent(new KeyboardEvent('keydown',{key:value,bubbles:true,cancelable:true}));
+          $('actions-btn').click();
+          const menu = !$('actions-menu').hidden;
+          document.querySelector('[data-action="select"]').click();
+          type('/'); const count = $('command-list').children.length;
+          key('ArrowDown'); key('Enter');
+          const selected = input.value === '/select ';
+          key('Enter');
+          type('/bogus'); key('Enter');
+          const unknown = !$('command-feedback').hidden && input.value === '/bogus';
+          type('/'); key('Escape'); const escaped = $('command-list').hidden;
+          type('/summary'); $('send-btn').click();
+          const summary = $('reading-panel').open && !$('summary-panel').hidden;
+          $('prep-retry').click(); const confirmed = $('prepare-confirm').open;
+          $('prepare-no').click(); $('reading-panel').close();
+          type('/scope'); $('send-btn').click();
+          const scope = $('reading-panel').open && !$('range-panel').hidden;
+          $('reading-panel').close();
+          type('/new'); $('send-btn').click();
+          booksbridge.onState({settings:{isConfigured:false}});
+          type('/summary'); const noKey = !$('send-btn').disabled; $('send-btn').click(); $('reading-panel').close();
+          type('/now'); $('send-btn').click();
+          booksbridge.onState({chatEvent:{kind:'finished',text:'第一章 · 20%',roleLabel:'阅读位置'}});
+          booksbridge.onState({settings:{isConfigured:true}});
+          type('/now 解释当前段落'); $('send-btn').click();
+          const thinking = document.querySelector('.msg:last-child').textContent.includes('正在思考');
+          return {menu,count,selected,unknown,escaped,summary,confirmed,scope,noKey,thinking,
+            clean:!document.querySelector('.composer #prep-bar') && !document.querySelector('.composer #capture-selection')};
+        })()
+        """) as! [String: Any]
+        for key in ["menu", "selected", "unknown", "escaped", "summary", "confirmed", "scope", "noKey", "thinking", "clean"] { XCTAssertEqual(result[key] as? Bool, true, key) }
+        XCTAssertEqual(result["count"] as? Int, 5)
+        try await Task.sleep(for: .milliseconds(100))
+        let types = calls.calls.compactMap { $0["type"] as? String }
+        XCTAssertEqual(types.filter { $0 == "captureSelection" }.count, 2)
+        XCTAssertTrue(types.contains("checkReading")); XCTAssertTrue(types.contains("newConversation"))
+        XCTAssertFalse(types.contains("returnToReader")); XCTAssertFalse(types.contains("reprocessBook"))
+        let questions = calls.calls.filter { $0["type"] as? String == "ask" }.compactMap { ($0["payload"] as? [String: Any])?["question"] as? String }
+        XCTAssertEqual(questions, ["/now", "/now 解释当前段落"])
+    }
+
+    func testBookMovementArchiveAndRestoreControls() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          document.querySelector('[aria-label="移动《书A》"]').click();
+          [...$('sidebar-menu').children].find(el => el.textContent === '下移').click();
+          booksbridge.onState({library:[fixtureBooks[1],fixtureBooks[0]]});
+          const moved = document.querySelector('.book-group').dataset.assetId === 'B';
+          const groups = [...document.querySelectorAll('.book-group')];
+          const transfer = new DataTransfer();
+          groups[1].querySelector('.book-row').dispatchEvent(new DragEvent('dragstart',{dataTransfer:transfer,bubbles:true}));
+          groups[0].dispatchEvent(new DragEvent('dragover',{dataTransfer:transfer,clientY:groups[0].getBoundingClientRect().top,bubbles:true,cancelable:true}));
+          groups[0].dispatchEvent(new DragEvent('drop',{dataTransfer:transfer,bubbles:true,cancelable:true}));
+          groups[1].querySelector('.book-row').dispatchEvent(new DragEvent('dragend',{dataTransfer:transfer,bubbles:true}));
+          document.querySelector('[aria-label="对话1的操作"]').click(); $('sidebar-menu').querySelector('button').click();
+          const library = [{...fixtureBooks[0],conversations:[{id:'C',title:'对话1',messageCount:1,archived:true}]}];
+          booksbridge.onState({library,active:{assetID:'A'}});
+          const hidden = document.querySelectorAll('.conv-row').length === 0;
+          $('archives-btn').click();
+          const listed = $('archives-panel').open && $('archives-list').textContent.includes('对话1');
+          document.querySelector('.archive-title').click();
+          booksbridge.onState({active:{assetID:'A',conversationID:'C',archived:true,scope:'upToProgress',messages:[{role:'assistant',text:'已保留的原对话'}]}});
+          const readOnly = $('input').disabled && !$('archive-banner').hidden && $('messages').textContent.includes('已保留的原对话');
+          $('restore-active').click();
+          booksbridge.onState({library:fixtureBooks,active:{assetID:'A',conversationID:'C',archived:false,scope:'upToProgress',messages:[]}});
+          return {moved,hidden,listed,readOnly,restored:!$('input').disabled && $('archive-banner').hidden,locked:$('scope-picker').disabled};
+        })()
+        """) as! [String: Any]
+        for key in ["moved", "hidden", "listed", "readOnly", "restored", "locked"] { XCTAssertEqual(result[key] as? Bool, true, key) }
+        try await Task.sleep(for: .milliseconds(100))
+        let moves = calls.calls.filter { $0["type"] as? String == "moveBook" }.compactMap { $0["payload"] as? [String: Any] }
+        XCTAssertEqual(moves.count, 2)
+        XCTAssertEqual(moves.first?["assetID"] as? String, "A")
+        XCTAssertTrue(moves.first?["beforeAssetID"] is NSNull)
+        XCTAssertEqual(moves.last?["beforeAssetID"] as? String, "B")
+        for type in ["archiveConversation", "restoreConversation"] {
+            let payload = try XCTUnwrap(calls.calls.first { $0["type"] as? String == type }?["payload"] as? [String: Any])
+            XCTAssertEqual(payload["conversationID"] as? String, "C"); XCTAssertEqual(payload["assetID"] as? String, "A")
+        }
+        XCTAssertFalse(calls.calls.contains { $0["type"] as? String == "deleteConversation" })
+    }
+
+    func testCompactLayoutAndSummaryProgressRemainVisible() async throws {
+        let (view, _) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        for size in [CGSize(width:720,height:460), CGSize(width:1440,height:900)] {
+            view.frame.size = size
+            _ = try await view.evaluateJavaScript("""
+            booksbridge.onState({assistant:{preparation:'正在生成摘要 2/5',ready:false},summaryMetadata:'读到这为止 · 今天',selectionCandidate:{token:'T',text:'这是需要确认的引用内容。'.repeat(50),exact:false}}); undefined;
+            """)
+            try await Task.sleep(for: .milliseconds(40))
+            let result = try await view.evaluateJavaScript("""
+            (() => {
+              const $ = id => document.getElementById(id);
+              const r = document.querySelector('.composer').getBoundingClientRect(), status = document.querySelector('.reading-status').getBoundingClientRect();
+              const within = r.left >= 0 && r.right <= innerWidth && r.top >= 0 && status.bottom <= innerHeight;
+              $('selection-confirmed').checked = true; $('selection-confirmed').dispatchEvent(new Event('change'));
+              const compact = !$('selection-details').open;
+              document.querySelector('[data-action="summary"]').click();
+              const progress = $('prep-text').textContent.includes('2/5') && $('summary-status').textContent.includes('2/5');
+              booksbridge.onState({assistant:{preparation:'摘要已完成',ready:true},scopeSummary:'**摘要结果**',summaryMetadata:'读到这为止 · 今天'});
+              const result = !!$('scope-summary-text').querySelector('strong') && !$('scope-summary').hidden;
+              $('reading-panel').close();
+              return {within,compact,progress,result};
+            })()
+            """) as! [String: Any]
+            for key in ["within", "compact", "progress", "result"] { XCTAssertEqual(result[key] as? Bool, true, "\(size): \(key)") }
+        }
+    }
+}

@@ -27,8 +27,7 @@ public struct StoredBook: Codable, Sendable, Equatable, Identifiable {
 
 /// 一条对话。
 ///
-/// 骨架期 `messages` 恒为空——LLM 尚未接入。保留字段是为了让持久化结构稳定，
-/// 将来接入时不需要迁移数据。
+/// 消息、阅读位置、权限和摘要一起保存；归档只改变可见性。
 public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var title: String
@@ -42,6 +41,7 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var readingSnapshot: ReadingSnapshot?
     public var summary: ReadingSummary?
     public var summaryStatus: String?
+    public var archivedAt: Date?
 
     public init(
         id: String = UUID().uuidString,
@@ -204,6 +204,32 @@ public final class ConversationStore {
     }
 
     // MARK: - 变更
+
+    /// Move the existing record, preserving all conversations and their reading state.
+    @discardableResult
+    public func moveBook(assetID: String, beforeAssetID: String?) -> Bool {
+        guard assetID != beforeAssetID,
+              let from = state.books.firstIndex(where: { $0.assetID == assetID }),
+              beforeAssetID == nil || state.books.contains(where: { $0.assetID == beforeAssetID }) else { return false }
+        let value = state.books.remove(at: from)
+        let target = beforeAssetID.flatMap { id in state.books.firstIndex { $0.assetID == id } } ?? state.books.endIndex
+        state.books.insert(value, at: target)
+        persist()
+        return true
+    }
+
+    @discardableResult
+    public func setArchived(assetID: String, conversationID: String, archived: Bool) -> Bool {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }) else { return false }
+        if archived { state.books[bi].conversations[ci].archivedAt = state.books[bi].conversations[ci].archivedAt ?? Date() }
+        else { state.books[bi].conversations[ci].archivedAt = nil }
+        if archived, state.lastActive?.assetID == assetID, state.lastActive?.conversationID == conversationID {
+            state.lastActive = .init(assetID: assetID, conversationID: state.books[bi].conversations.first { $0.archivedAt == nil }?.id)
+        }
+        persist()
+        return true
+    }
 
     /// 把一本书加入书库（已存在则同步标题作者，不覆盖对话）。
     ///

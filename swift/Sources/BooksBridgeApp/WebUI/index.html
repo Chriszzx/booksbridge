@@ -46,6 +46,7 @@
       <!-- 左下角：设置 -->
       <footer class="side-foot">
         <div id="preparation-jobs" class="empty-hint" aria-live="polite"></div>
+        <button id="archives-btn" class="side-action"><span>▤</span><span id="archives-label">已归档</span></button>
         <button id="settings-btn" class="side-action">
           <span class="sa-icon">⚙</span>
           <span class="sa-text">设置</span>
@@ -69,6 +70,8 @@
           </div>
         </header>
 
+        <div id="archive-banner" hidden>此对话已归档，内容保留。<button id="restore-active" class="btn-plain">恢复对话</button></div>
+
         <!-- 会话流 -->
         <div id="thread" class="thread">
           <div id="thread-empty" class="thread-empty">
@@ -83,30 +86,18 @@
 
         <!-- Composer -->
         <div class="composer">
-          <div id="prep-bar" class="prep-bar" hidden>
-            <span class="prep-dot"></span>
-            <span id="prep-text"></span>
-            <button id="reading-check" class="btn-plain btn-tiny">检查原文范围</button>
-            <button id="prep-retry" class="btn-plain btn-tiny" hidden>生成阅读摘要</button>
-            <button id="prep-cancel" class="btn-plain btn-tiny" hidden>取消</button>
-            <button id="prep-clear" class="btn-plain btn-tiny" hidden>清除摘要</button>
-          </div>
-
-          <div id="reading-position" class="empty-hint" aria-live="polite">尚未取得有效阅读位置</div>
-          <details id="scope-summary" hidden><summary>当前范围摘要</summary><div id="scope-summary-text" class="msg-body"></div></details>
-          <button id="capture-selection" class="btn-plain btn-tiny">读取划选并确认</button>
           <div id="selection-preview" hidden>
-            <div id="selection-kind" class="empty-hint"></div><blockquote id="selection-text"></blockquote>
-            <label><input id="selection-confirmed" type="checkbox"> 确认将以上文字用于本次提问</label>
-            <button id="selection-clear" class="btn-plain btn-tiny">取消引用</button>
+            <div class="quote-head"><span id="selection-kind"></span><button id="selection-clear" class="icon-btn" aria-label="移除引用">×</button></div>
+            <details id="selection-details" open><summary id="selection-excerpt">引用文字</summary><blockquote id="selection-text"></blockquote></details>
+            <label class="quote-confirm"><input id="selection-confirmed" type="checkbox"> 确认用于本次提问</label>
           </div>
-          <div id="reading-check-result" class="empty-hint" aria-live="polite"></div>
+          <div id="command-list" class="command-list" role="listbox" aria-label="斜杠命令" hidden></div>
           <textarea id="input" rows="1"
             placeholder="就正在读的内容提问…（Enter 发送，Shift+Enter 换行）"></textarea>
 
           <div class="composer-row">
             <!-- 知识范围：三档剧透边界 -->
-            <button class="icon-btn composer-plus" aria-label="更多" title="更多" type="button">＋</button>
+            <button id="actions-btn" class="icon-btn composer-plus" aria-label="阅读操作" title="阅读操作 · 输入 / 使用命令" aria-haspopup="menu" aria-expanded="false" type="button">＋</button>
             <select class="scope-picker" id="scope-picker" aria-label="读取权限"></select>
             <span id="composer-model" class="composer-model"></span>
             <span class="spacer"></span>
@@ -115,6 +106,8 @@
             <button id="send-btn" class="btn-send">发送</button>
           </div>
         </div>
+        <div class="reading-status" aria-live="polite"><span id="reading-position">尚未取得有效阅读位置</span><span id="summary-status">未生成摘要</span></div>
+        <div id="command-feedback" class="command-feedback" role="status" hidden></div>
       </section>
 
       <!-- ══════════ 设置视图（两栏，不重叠）══════════ -->
@@ -269,7 +262,33 @@
     </main>
   </div>
 
-  <dialog id="prepare-confirm"><h3>生成整书阅读摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
+  <div id="actions-menu" class="floating-menu" role="menu" aria-label="阅读操作" hidden>
+    <div class="menu-label">阅读位置</div>
+    <button data-action="now" role="menuitem">刷新当前进度 <kbd>/now</kbd></button>
+    <button id="reading-check" data-action="scope" role="menuitem">查看读取范围 <kbd>/scope</kbd></button>
+    <div class="menu-label">引用</div>
+    <button id="capture-selection" data-action="select" role="menuitem">读取 Books 划选 <kbd>/select</kbd></button>
+    <div class="menu-label">阅读摘要</div>
+    <button data-action="summary" role="menuitem">查看与管理摘要 <kbd>/summary</kbd></button>
+    <button data-action="generate" role="menuitem">生成阅读摘要</button>
+    <button data-action="cancelSummary" role="menuitem" hidden>取消摘要生成</button>
+    <button data-action="clearSummary" role="menuitem" hidden>清除摘要</button>
+    <div class="menu-label">对话</div>
+    <button data-action="new" role="menuitem">新建对话 <kbd>/new</kbd></button>
+  </div>
+  <div id="sidebar-menu" class="floating-menu" role="menu" aria-label="侧栏操作" hidden></div>
+  <dialog id="reading-panel" class="reading-panel" aria-labelledby="reading-panel-title">
+    <div class="panel-head"><h3 id="reading-panel-title">阅读摘要</h3><button class="icon-btn" data-close="reading-panel" aria-label="关闭阅读面板">×</button></div>
+    <section id="range-panel" hidden><p id="range-position"></p><p id="range-mode"></p><p id="reading-check-result" role="status"></p></section>
+    <section id="summary-panel">
+      <div id="prep-bar" class="prep-bar"><span class="prep-dot"></span><span id="prep-text"></span></div>
+      <p id="summary-metadata" class="empty-hint"></p>
+      <div id="scope-summary" hidden><div id="scope-summary-text" class="msg-body"></div></div>
+      <div class="dialog-actions"><button id="prep-clear" data-action="clearSummary" class="btn-plain" hidden>清除摘要</button><button id="prep-cancel" data-action="cancelSummary" class="btn-plain" hidden>取消生成</button><button id="prep-retry" data-action="generate" class="btn-primary">生成阅读摘要</button></div>
+    </section>
+  </dialog>
+  <dialog id="archives-panel" class="reading-panel" aria-labelledby="archives-title"><div class="panel-head"><h3 id="archives-title">已归档对话</h3><button class="icon-btn" data-close="archives-panel" aria-label="关闭归档面板">×</button></div><div id="archives-list"></div></dialog>
+  <dialog id="prepare-confirm" aria-labelledby="prepare-title"><h3 id="prepare-title">生成当前范围摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
 <script src="vendor/marked.js"></script>
 <script src="vendor/purify.js"></script>
 <script src="markdown.js"></script>

@@ -35,10 +35,22 @@ Open a book in Apple Books, then select it in BooksBridge. Import builds a local
 
 Each chat stays bound to one book and one reading mode: through the current page, through the current chapter, or the whole book. The mode locks after the first question or confirmed summary. Each question refreshes that chat's position; when the same book has no active content, the last verified position is reused and labeled.
 
-- Use `/now` to refresh and display your position locally, or `/now your question` to show it before asking.
-- Capture selected text, check the preview, and confirm it before sending. Paragraph fallbacks are labeled explicitly.
-- Generate an optional summary for the selected scope. Its progress and result stay with the chat when you navigate elsewhere.
-- Source text, summaries, quotes, and history are checked against the current reading boundary. Text within the configured budget is sent in full; larger ranges use explicitly labeled excerpts.
+Use the **+** menu for reading actions. The composer keeps only the reading mode, model, send controls, and a compact position/summary status line. Selected text appears as a confirmation card; summary progress, coverage, and results open in a separate panel.
+
+Type `/` at the beginning of the input to browse commands. Use the arrow keys and Enter or Tab to select a command, and Esc to dismiss the list.
+
+| Command | Action |
+|---|---|
+| `/now` | Refresh and display the chat's reading position locally |
+| `/now your question` | Refresh the position, then ask your question |
+| `/select` | Capture selected text in Apple Books for preview and confirmation |
+| `/scope` | Inspect the reading mode, position, and permitted source length |
+| `/summary` | View summary progress/results or explicitly generate a summary |
+| `/new` | Start another chat for the current book |
+
+Local commands do not require an API key. Generating a summary still requires confirmation before sending source text to the configured model. Source text, summaries, quotes, and history are checked against the current reading boundary. Text within the configured budget is sent in full; larger ranges use explicitly labeled excerpts.
+
+Drag books in the sidebar to reorder them, or use a book's **… → Move up / Move down** menu. The order is saved locally and does not move files in Apple Books. Use a chat's **… → Archive** action to hide it from the regular list. **Archived** at the bottom of the sidebar lets you inspect and restore chats, retaining their reading mode, messages, position, and summaries. Running summary jobs continue after a chat is archived.
 
 ## Documentation
 

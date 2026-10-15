@@ -122,9 +122,11 @@ public struct ReadingSummary: Codable, Sendable, Equatable {
     public let boundary: ReadingBoundary
     public let scope: KnowledgeScope
     public let generatedAt: Date
+    public let coverageLabel: String?
 
-    public init(text: String, sourceHash: String, boundary: ReadingBoundary, scope: KnowledgeScope, generatedAt: Date = Date()) {
+    public init(text: String, sourceHash: String, boundary: ReadingBoundary, scope: KnowledgeScope, generatedAt: Date = Date(), coverageLabel: String? = nil) {
         self.text = text; self.sourceHash = sourceHash; self.boundary = boundary; self.scope = scope; self.generatedAt = generatedAt
+        self.coverageLabel = coverageLabel
     }
     public func isAllowed(snapshot: ReadingSnapshot, reading: ScopedReading) -> Bool {
         sourceHash == snapshot.sourceHash && boundary <= reading.boundary

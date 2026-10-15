@@ -43,7 +43,8 @@ final class SummaryJobs {
                 try Task.checkCancellation()
                 guard !result.readme.isEmpty else { throw ReadingAssistant.AssistantError.notLoaded }
                 let summary = ReadingSummary(text: result.readme, sourceHash: snapshot.sourceHash,
-                    boundary: reading.boundary, scope: scope, generatedAt: Date())
+                    boundary: reading.boundary, scope: scope, generatedAt: Date(),
+                    coverageLabel: scope == .wholeBook ? "全书" : "书首 → " + snapshot.chapterTitle + (scope == .currentChapter ? "章末" : String(format: " · %.1f%%", snapshot.progress * 100)))
                 onUpdate?(book.assetID, conversationID, "摘要已完成 · \(scope.label)", summary)
             } catch {
                 guard generations[key] == generation, !Task.isCancelled else { return }
