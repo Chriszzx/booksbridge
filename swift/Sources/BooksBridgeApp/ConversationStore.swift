@@ -42,6 +42,7 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var summary: ReadingSummary?
     public var summaryStatus: String?
     public var archivedAt: Date?
+    public var titleProgress: Double?
 
     public init(
         id: String = UUID().uuidString,
@@ -58,6 +59,14 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         self.messages = messages
         self.scope = scope
         self.scopeHistoryStartIndex = nil
+    }
+
+    public static func readingTitle(progress: Double?, createdAt: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let position = progress.flatMap { $0.isFinite ? "\(Int((min(1, max(0, $0)) * 100).rounded()))%" : nil } ?? "进度未知"
+        return "\(position) · \(formatter.string(from: createdAt))"
     }
 
     /// Resolve legacy replies by order; new replies retain their question identity after deletion.
@@ -85,9 +94,12 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         public var sourceHash: String?
         public var isPositionCard: Bool?
         public var inReplyTo: String?
+        public var reasoning: String?
+        public var reasoningExpanded: Bool?
 
-        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false) {
+        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false, reasoning: String? = nil) {
             self.id = id
+            self.reasoning = reasoning
             self.role = role
             self.boundary = boundary
             self.sourceHash = sourceHash
@@ -145,13 +157,22 @@ public final class ConversationStore {
         self.fileURL = fileURL
         self.fileManager = fileManager
         self.state = ConversationStore.load(from: fileURL, fileManager: fileManager)
+        var migratedTitles = false
         for bi in state.books.indices {
             for ci in state.books[bi].conversations.indices {
+                var conversation = state.books[bi].conversations[ci]
+                if conversation.title.range(of: "^对话 [0-9]+$", options: .regularExpression) != nil {
+                    conversation.titleProgress = conversation.readingSnapshot?.page == nil ? nil : conversation.readingSnapshot?.progress
+                    conversation.title = Conversation.readingTitle(progress: conversation.titleProgress, createdAt: conversation.createdAt)
+                    state.books[bi].conversations[ci] = conversation
+                    migratedTitles = true
+                }
                 if state.books[bi].conversations[ci].summaryStatus?.hasPrefix("正在") == true {
                     state.books[bi].conversations[ci].summaryStatus = "摘要任务已中断，请手动重新生成"
                 }
             }
         }
+        if migratedTitles { persist() }
     }
 
     // MARK: - 读取
@@ -263,31 +284,16 @@ public final class ConversationStore {
         return book
     }
 
-    /// 在指定书下新建一条对话。标题按该书已有对话数自动编号。
+    /// New chats acquire their first verified progress while keeping their creation timestamp.
     @discardableResult
-    public func createConversation(assetID: String) -> Conversation? {
+    public func createConversation(assetID: String, createdAt: Date = Date()) -> Conversation? {
         guard let index = state.books.firstIndex(where: { $0.assetID == assetID }) else { return nil }
         var book = state.books[index]
-        let conversation = Conversation(title: "对话 \(nextConversationNumber(in: book))")
+        let conversation = Conversation(title: Conversation.readingTitle(progress: nil, createdAt: createdAt), createdAt: createdAt)
         book.conversations.append(conversation)
         state.books[index] = book
         persist()
         return conversation
-    }
-
-    /// 计算下一个对话编号。
-    ///
-    /// 用"已有标题里出现过的最大编号 + 1"，而不是 `count + 1`——
-    /// 否则删掉中间一条后会出现重名。
-    private func nextConversationNumber(in book: StoredBook) -> Int {
-        var maxNumber = 0
-        for conversation in book.conversations {
-            let digits = conversation.title.filter(\.isNumber)
-            if let value = Int(digits), value > maxNumber {
-                maxNumber = value
-            }
-        }
-        return maxNumber + 1
     }
 
     /// 删除一条对话。
@@ -352,7 +358,13 @@ public final class ConversationStore {
 
     public func updateReading(assetID: String, conversationID: String, snapshot: ReadingSnapshot) {
         guard snapshot.assetID == assetID else { return }
-        updateConversation(assetID: assetID, conversationID: conversationID) { $0.readingSnapshot = snapshot }
+        updateConversation(assetID: assetID, conversationID: conversationID) {
+            $0.readingSnapshot = snapshot
+            if $0.titleProgress == nil, snapshot.page != nil {
+                $0.titleProgress = snapshot.progress
+                $0.title = Conversation.readingTitle(progress: snapshot.progress, createdAt: $0.createdAt)
+            }
+        }
     }
 
     public func updateConversation(assetID: String, conversationID: String, _ change: (inout Conversation) -> Void) {
@@ -401,6 +413,15 @@ public final class ConversationStore {
             value.messages[qi].sourceHash = answer.sourceHash
             value.updatedAt = Date()
         }
+    }
+
+    @discardableResult
+    public func setReasoningExpanded(assetID: String, conversationID: String, messageID: String, expanded: Bool) -> Bool {
+        guard let conversation = conversation(assetID: assetID, conversationID: conversationID),
+              let index = conversation.messages.firstIndex(where: { $0.id == messageID && $0.role == .assistant }),
+              conversation.messages[index].reasoning?.isEmpty == false else { return false }
+        updateConversation(assetID: assetID, conversationID: conversationID) { $0.messages[index].reasoningExpanded = expanded }
+        return true
     }
 
     public func markLastQuestion(assetID: String, conversationID: String, boundary: ReadingBoundary?, sourceHash: String? = nil) {

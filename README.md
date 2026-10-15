@@ -35,7 +35,7 @@ Open a book in Apple Books, then select it in BooksBridge. Import builds a local
 
 Each chat stays bound to one book and one reading mode: through the current page, through the current chapter, or the whole book. The mode locks after the first question or confirmed summary. Each question refreshes that chat's position; when the same book has no active content, the last verified position is reused and labeled.
 
-Use the **+** menu for reading actions. The composer keeps only the reading mode, model, send controls, and a compact position/summary status line. Selected text appears as a confirmation card; summary progress, coverage, and results open in a separate panel.
+Use the **+** menu for reading actions. The composer keeps the reading mode, model, and send controls. Reading position and summary status appear after the book/chat names in the top bar; click them to inspect their details. Selected text appears as a confirmation card; summary progress, coverage, and results open in a separate panel.
 
 Press **Enter** to send and **Shift+Enter** for a new line. While generating, click the stop icon or press **Esc twice within 500 ms**. Stopping keeps any partial answer; stopping a retry preserves the original answer.
 
@@ -54,7 +54,11 @@ Type `/` at the beginning of the input to browse commands. Use the arrow keys an
 
 Local commands do not require an API key. Generating a summary still requires confirmation before sending source text to the configured model. Source text, summaries, quotes, and history are checked against the current reading boundary. Text within the configured budget is sent in full; larger ranges use explicitly labeled excerpts.
 
-Drag books in the sidebar to reorder them, or use a book's **… → Move up / Move down** menu. The order is saved locally and does not move files in Apple Books. Use a chat's **… → Archive** action to hide it from the regular list. **Archived** at the bottom of the sidebar lets you inspect and restore chats, retaining their reading mode, messages, position, and summaries. Running summary jobs continue after a chat is archived.
+Drag books in the sidebar to reorder them, or use a book's **… → Move up / Move down** menu. The order is saved locally and does not move files in Apple Books. Use a chat's **… → Archive** action to hide it from the regular list. **Settings → Archived** lets you inspect and restore chats, retaining their reading mode, messages, position, and summaries. Running summary jobs continue after a chat is archived.
+
+Chat names use their first verified reading percentage and creation timestamp, for example `42% · 2026-10-15 18:30:00`. They remain stable as you keep reading. A chat without a verified position is labeled with unknown progress until one is available. Existing numbered chats use their saved position and creation time.
+
+Settings save when you switch sections or return to a book/chat in the sidebar. Click the Settings button again to return to the chat. Model-provided reasoning is saved with each reply, including interrupted output, and can be expanded or collapsed manually. The last manual expansion choice is retained; otherwise **Auto-expand reasoning** supplies the default. Reasoning is kept for display and is not included in subsequent model history. Previously unsaved reasoning cannot be recovered.
 
 ## Documentation
 

@@ -46,7 +46,6 @@
       <!-- 左下角：设置 -->
       <footer class="side-foot">
         <div id="preparation-jobs" class="empty-hint" aria-live="polite"></div>
-        <button id="archives-btn" class="side-action"><span>▤</span><span id="archives-label">已归档</span></button>
         <button id="settings-btn" class="side-action">
           <span class="sa-icon">⚙</span>
           <span class="sa-text">设置</span>
@@ -63,6 +62,10 @@
           <div class="crumb">
             <span id="crumb-book"></span>
             <span id="crumb-conv"></span>
+          </div>
+          <div class="reading-status" aria-live="polite">
+            <button id="reading-position" data-action="scope" class="header-status">尚未取得有效阅读位置</button>
+            <button id="summary-status" data-action="summary" class="header-status">未生成摘要</button>
           </div>
           <div class="topbar-right">
             <span id="ctx-chip" class="chip" hidden></span>
@@ -106,7 +109,6 @@
             <button id="send-btn" class="btn-send" aria-label="发送消息" title="发送消息（Enter）；Shift+Enter 换行"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 14V2M2.5 7.5 8 2l5.5 5.5" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
           </div>
         </div>
-        <div class="reading-status" aria-live="polite"><span id="reading-position">尚未取得有效阅读位置</span><span id="summary-status">未生成摘要</span></div>
         <div id="command-feedback" class="command-feedback" role="status" hidden></div>
       </section>
 
@@ -114,9 +116,7 @@
       <section id="view-settings" class="view" hidden>
         <header class="topbar">
           <div class="crumb"><span class="crumb-strong">设置</span></div>
-          <div class="topbar-right">
-            <button id="settings-close" class="btn-plain">完成</button>
-          </div>
+          <span class="settings-save-hint">切换时自动保存</span>
         </header>
 
         <div class="settings-body">
@@ -125,10 +125,14 @@
             <button class="nav-item active" data-section="general">通用</button>
             <button class="nav-item" data-section="model">模型与 API</button>
             <button class="nav-item" data-section="permissions">权限</button>
+            <button id="archives-btn" class="nav-item" data-section="archives"><span id="archives-label">已归档</span></button>
           </nav>
 
           <!-- 设置内容 -->
           <div class="settings-pane" id="settings-pane">
+            <section class="pane" data-pane="archives" hidden>
+              <h2>已归档对话</h2><p class="field-hint">按书籍查看和恢复归档对话。</p><div id="archives-list"></div>
+            </section>
             <!-- 通用 -->
             <section class="pane" data-pane="general">
               <h2>通用</h2>
@@ -287,7 +291,6 @@
       <div class="dialog-actions"><button id="prep-clear" data-action="clearSummary" class="btn-plain" hidden>清除摘要</button><button id="prep-cancel" data-action="cancelSummary" class="btn-plain" hidden>取消生成</button><button id="prep-retry" data-action="generate" class="btn-primary">生成阅读摘要</button></div>
     </section>
   </dialog>
-  <dialog id="archives-panel" class="reading-panel" aria-labelledby="archives-title"><div class="panel-head"><h3 id="archives-title">已归档对话</h3><button class="icon-btn" data-close="archives-panel" aria-label="关闭归档面板">×</button></div><div id="archives-list"></div></dialog>
   <dialog id="prepare-confirm" aria-labelledby="prepare-title"><h3 id="prepare-title">生成当前范围摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
 <script src="vendor/marked.js"></script>
 <script src="vendor/purify.js"></script>

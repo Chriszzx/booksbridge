@@ -234,8 +234,8 @@ extension WebRenderingTests {
           const library = [{...fixtureBooks[0],conversations:[{id:'C',title:'对话1',messageCount:1,archived:true}]}];
           booksbridge.onState({library,active:{assetID:'A'}});
           const hidden = document.querySelectorAll('.conv-row').length === 0;
-          $('archives-btn').click();
-          const listed = $('archives-panel').open && $('archives-list').textContent.includes('对话1');
+          $('settings-btn').click(); $('archives-btn').click();
+          const listed = !$('view-settings').hidden && !document.querySelector('[data-pane=archives]').hidden && $('archives-list').textContent.includes('对话1');
           document.querySelector('.archive-title').click();
           booksbridge.onState({active:{assetID:'A',conversationID:'C',archived:true,scope:'upToProgress',messages:[{role:'assistant',text:'已保留的原对话'}]}});
           const readOnly = $('input').disabled && !$('archive-banner').hidden && $('messages').textContent.includes('已保留的原对话');
@@ -363,5 +363,86 @@ extension WebRenderingTests {
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(calls.calls.filter { $0["type"] as? String == "ask" }.count, 1)
         XCTAssertEqual(calls.calls.filter { $0["type"] as? String == "cancelAnswer" }.count, 1)
+    }
+}
+
+@MainActor
+extension WebRenderingTests {
+    func testSettingsNavigationSavesWithoutDoneAndTopbarShowsReadingState() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        for size in [CGSize(width:720,height:460), CGSize(width:1440,height:900)] {
+            view.frame.size = size
+            let result = try await view.evaluateJavaScript("""
+            (() => {
+              const $ = id => document.getElementById(id);
+              $('settings-btn').click();
+              document.querySelector('[data-section="model"]').click();
+              $('set-model').value = 'new-model'; $('set-model').dispatchEvent(new Event('input'));
+              document.querySelector('.conv-row').click();
+              const switched = !$('view-chat').hidden && $('view-settings').hidden;
+              $('settings-btn').click(); $('archives-btn').click();
+              const archives = !$('view-settings').hidden && !document.querySelector('[data-pane="archives"]').hidden && !$('archives-btn').closest('.side-foot');
+              $('settings-btn').click();
+              const toggle = !$('view-chat').hidden && !document.querySelector('#settings-close');
+              const header = $('reading-position').closest('.topbar');
+              const status = document.querySelector('.reading-status').getBoundingClientRect();
+              const crumb = document.querySelector('#view-chat .crumb').getBoundingClientRect();
+              const back = $('return-btn').getBoundingClientRect();
+              const layout = !!header && $('summary-status').closest('.topbar') === header && status.left >= crumb.right && status.right <= back.left && status.bottom <= header.getBoundingClientRect().bottom;
+              $('summary-status').click(); const summary = $('reading-panel').open && !$('summary-panel').hidden; $('reading-panel').close();
+              return {switched,archives,toggle,layout,summary};
+            })()
+            """) as! [String: Any]
+            for (key,value) in result { XCTAssertEqual(value as? Bool, true, "\(size): \(key)") }
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let saves = calls.calls.filter { $0["type"] as? String == "saveSettings" }
+        XCTAssertEqual(saves.count, 2)
+        XCTAssertEqual((saves.first?["payload"] as? [String: Any])?["model"] as? String, "new-model")
+    }
+
+    func testSavedReasoningReloadsAndCanBeManuallyToggled() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        _ = try await view.evaluateJavaScript("""
+        window.reasoningFixture = {assetID:'A',conversationID:'C',scope:'upToProgress',messages:[
+          {id:'q',role:'user',text:'问题'}, {id:'a',role:'assistant',text:'正文',reasoning:'保存的思考内容',reasoningExpanded:false,canRetry:true}]};
+        booksbridge.onState({settings:{model:'test',isConfigured:true,autoExpandReasoning:true}, active:reasoningFixture}); undefined;
+        """)
+        try await Task.sleep(for: .milliseconds(50))
+        let initial = try await view.evaluateJavaScript("!!document.querySelector('.msg-reasoning') && !document.querySelector('.msg-reasoning').open && document.querySelector('.reasoning-body').textContent === '保存的思考内容'")
+        XCTAssertEqual(initial as? Bool, true)
+        _ = try await view.evaluateJavaScript("document.querySelector('.msg-reasoning summary').click(); undefined")
+        try await Task.sleep(for: .milliseconds(50))
+        let opened = try await view.evaluateJavaScript("document.querySelector('.msg-reasoning').open")
+        XCTAssertEqual(opened as? Bool, true)
+        _ = try await view.evaluateJavaScript("""
+        booksbridge.onState({active:{assetID:'B',conversationID:'D',messages:[]}});
+        booksbridge.onState({active:{...reasoningFixture,messages:[reasoningFixture.messages[0],{...reasoningFixture.messages[1],reasoningExpanded:true}]}});
+        document.querySelector('.msg-reasoning summary').click(); undefined;
+        """)
+        try await Task.sleep(for: .milliseconds(50))
+        let closed = try await view.evaluateJavaScript("document.querySelector('.msg-reasoning').open")
+        XCTAssertEqual(closed as? Bool, false)
+        let toggles = calls.calls.filter { $0["type"] as? String == "setReasoningExpanded" }.compactMap { $0["payload"] as? [String: Any] }
+        XCTAssertEqual(toggles.compactMap { $0["expanded"] as? Bool }, [true,false])
+        XCTAssertTrue(toggles.allSatisfy { $0["messageID"] as? String == "a" && $0["conversationID"] as? String == "C" })
+        _ = try await view.evaluateJavaScript("""
+        booksbridge.onState({settings:{model:'test',isConfigured:true,autoExpandReasoning:false},active:{assetID:'A',conversationID:'live',messages:[]}});
+        const input = document.getElementById('input'); input.value = '新问题'; input.dispatchEvent(new Event('input'));
+        document.getElementById('send-btn').click(); booksbridge.onState({chatEvent:{kind:'reasoning',text:'流式思考'}});
+        document.querySelector('.msg-reasoning summary').click(); undefined;
+        """)
+        try await Task.sleep(for: .milliseconds(50))
+        _ = try await view.evaluateJavaScript("""
+        booksbridge.onState({chatEvent:{kind:'finished',text:'新回答'}});
+        booksbridge.onState({active:{assetID:'A',conversationID:'live',messages:[{id:'live-q',role:'user',text:'新问题'},{id:'live-a',role:'assistant',text:'新回答',reasoning:'流式思考',canRetry:true}]}}); undefined;
+        """)
+        try await Task.sleep(for: .milliseconds(50))
+        let liveChoice = calls.calls.last { $0["type"] as? String == "setReasoningExpanded" }?["payload"] as? [String: Any]
+        XCTAssertEqual(liveChoice?["messageID"] as? String, "live-a")
+        XCTAssertEqual(liveChoice?["expanded"] as? Bool, true)
+
     }
 }

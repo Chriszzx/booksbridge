@@ -146,29 +146,55 @@ final class ConversationStoreTests: XCTestCase {
 
     // MARK: - 对话
 
-    func testCreateConversationAutoNumbers() {
-        let store = makeStore()
-        store.addBook(assetID: "A1", title: "书", author: "")
-
-        let first = store.createConversation(assetID: "A1")
-        let second = store.createConversation(assetID: "A1")
-
-        XCTAssertEqual(first?.title, "对话 1")
-        XCTAssertEqual(second?.title, "对话 2")
-        XCTAssertEqual(store.book(assetID: "A1")?.conversations.count, 2)
+    func testConversationTitlesUseFirstProgressAndCreationTimestamp() throws {
+        let store = makeStore(); store.addBook(assetID: "A1", title: "书", author: "")
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let first = try XCTUnwrap(store.createConversation(assetID: "A1", createdAt: date))
+        XCTAssertEqual(first.title, Conversation.readingTitle(progress: nil, createdAt: date))
+        XCTAssertTrue(first.title.hasPrefix("进度未知 · "))
+        store.updateReading(assetID: "A1", conversationID: first.id, snapshot: .init(assetID: "A1", sourceHash: "hash", page: nil, chapterTitle: "尚未定位", progress: 0))
+        XCTAssertEqual(store.conversation(assetID: "A1", conversationID: first.id)?.title, first.title)
+        let snapshot = ReadingSnapshot(assetID: "A1", sourceHash: "hash", page: .init(chapter: 0, end: 10), chapterTitle: "第一章", progress: 0.42)
+        store.updateReading(assetID: "A1", conversationID: first.id, snapshot: snapshot)
+        store.updateReading(assetID: "A1", conversationID: first.id, snapshot: .init(assetID: "A1", sourceHash: "hash", page: .init(chapter: 0, end: 20), chapterTitle: "第一章", progress: 0.6))
+        let loaded = try XCTUnwrap(makeStore().conversation(assetID: "A1", conversationID: first.id))
+        XCTAssertEqual(loaded.title, Conversation.readingTitle(progress: 0.42, createdAt: date))
+        XCTAssertEqual(loaded.readingSnapshot?.progress, 0.6)
+        XCTAssertEqual(loaded.createdAt, date)
+        XCTAssertTrue(store.deleteConversation(assetID: "A1", conversationID: first.id))
+        let next = try XCTUnwrap(store.createConversation(assetID: "A1", createdAt: date.addingTimeInterval(60)))
+        XCTAssertNotEqual(next.title, first.title)
     }
 
-    func testConversationNumberingSurvivesDeletion() {
-        let store = makeStore()
-        store.addBook(assetID: "A1", title: "书", author: "")
-        let first = store.createConversation(assetID: "A1")!
-        _ = store.createConversation(assetID: "A1")
+    func testLegacyTitlesMigrateFromSavedProgressWithoutInventingIt() throws {
+        let store = makeStore(); store.addBook(assetID: "A", title: "书", author: "")
+        var old = Conversation(title: "对话 1", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        old.readingSnapshot = .init(assetID: "A", sourceHash: "hash", page: .init(chapter: 0, end: 10), chapterTitle: "章", progress: 0.25)
+        let unknown = Conversation(title: "对话 2")
+        var state = store.state; state.books[0].conversations = [old, unknown]
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(state).write(to: fileURL)
+        let restored = makeStore().book(assetID: "A")!.conversations
+        XCTAssertEqual(restored[0].title, Conversation.readingTitle(progress: 0.25, createdAt: old.createdAt))
+        XCTAssertTrue(restored[1].title.hasPrefix("进度未知 · "))
+        XCTAssertEqual(makeStore().book(assetID: "A")?.conversations.map(\.title), restored.map(\.title))
+    }
 
-        // 删掉"对话 1"，下一条应该是"对话 3"而不是重复的"对话 2"
-        XCTAssertTrue(store.deleteConversation(assetID: "A1", conversationID: first.id))
-        let third = store.createConversation(assetID: "A1")
-
-        XCTAssertEqual(third?.title, "对话 3", "编号应取已有最大值 +1，避免重名")
+    func testReasoningAndManualExpansionSurviveReloadAndRetry() throws {
+        let store = makeStore(); store.addBook(assetID: "A", title: "书", author: "")
+        let c = try XCTUnwrap(store.createConversation(assetID: "A"))
+        store.appendMessage(assetID: "A", conversationID: c.id, message: .init(id: "q", role: .user, text: "问题"))
+        store.saveAnswer(assetID: "A", conversationID: c.id, questionID: "q", replacing: nil,
+                         answer: .init(id: "a", role: .assistant, text: "回答", reasoning: "模型返回的思考内容"))
+        XCTAssertTrue(store.setReasoningExpanded(assetID: "A", conversationID: c.id, messageID: "a", expanded: true))
+        let loaded = try XCTUnwrap(makeStore().conversation(assetID: "A", conversationID: c.id)?.messages.last)
+        XCTAssertEqual(loaded.reasoning, "模型返回的思考内容"); XCTAssertEqual(loaded.reasoningExpanded, true)
+        XCTAssertFalse(store.setReasoningExpanded(assetID: "A", conversationID: c.id, messageID: "q", expanded: true))
+        store.saveAnswer(assetID: "A", conversationID: c.id, questionID: "q", replacing: "a",
+                         answer: .init(role: .assistant, text: "新回答", reasoning: "新思考"))
+        XCTAssertEqual(makeStore().conversation(assetID: "A", conversationID: c.id)?.messages.last?.reasoning, "新思考")
+        XCTAssertTrue(store.changeMessage(assetID: "A", conversationID: c.id, messageID: "a"))
+        XCTAssertEqual(makeStore().conversation(assetID: "A", conversationID: c.id)?.messages.count, 1)
     }
 
     func testCreateConversationOnUnknownBookReturnsNil() {

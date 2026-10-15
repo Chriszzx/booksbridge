@@ -31,7 +31,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var apiTestTask: Task<Void, Never>?
     private var apiTestGeneration = 0
     private var answerStream: Task<Void, Never>?
-    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String)?
+    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String, reasoning: String)?
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
     private var selectionCandidate: ConfirmedReference?
@@ -482,6 +482,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case "ask":
             ask(invocation.payload)
 
+        case "setReasoningExpanded":
+            if let active = store.state.lastActive, let cid = active.conversationID,
+               invocation.payload["assetID"] as? String == active.assetID,
+               invocation.payload["conversationID"] as? String == cid,
+               let id = invocation.payload["messageID"] as? String,
+               let expanded = invocation.payload["expanded"] as? Bool {
+                store.setReasoningExpanded(assetID: active.assetID, conversationID: cid, messageID: id, expanded: expanded)
+            }
+
         case "copyMessage", "editMessage", "deleteMessage", "retryMessage":
             handleMessageAction(invocation.type, payload: invocation.payload)
 
@@ -517,6 +526,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case "openSettings":
             openSettings()
+
+        case "getSettings":
+            pushSettings()
 
         case "saveSettings":
             saveSettings(invocation.payload)
@@ -655,9 +667,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         answerStream = nil
         positionTask?.cancel()
         assistant.cancelAnswer()
-        if let pending = pendingReply, pending.retryID == nil, !pending.text.isEmpty {
+        if let pending = pendingReply, pending.retryID == nil, (!pending.text.isEmpty || !pending.reasoning.isEmpty) {
             store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
-                answer: .init(role: .assistant, text: pending.text, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash))
+                answer: .init(role: .assistant, text: pending.text.isEmpty ? "已停止" : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning))
         }
         pendingReply = nil
     }
@@ -841,7 +853,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let userMessage = Conversation.Message(id: questionID ?? UUID().uuidString, role: .user, text: question, isPositionCard: request.isEmpty)
         if retryID == nil { store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: userMessage) }
         cancelPendingAnswer()
-        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "")
+        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "", "")
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { if !Task.isCancelled { answerStream = nil; pendingReply = nil } }
@@ -901,6 +913,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case .contextPrepared(let text):
             bridge.push(["chatEvent": ["kind": "status", "text": text]])
         case .reasoningDelta(let delta):
+            pendingReply?.reasoning += delta
             bridge.push(["chatEvent": ["kind": "reasoning", "text": delta]])
 
         case .answerDelta(let delta):
@@ -908,12 +921,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             bridge.push(["chatEvent": ["kind": "delta", "text": delta]])
 
         case .finished(let answer, let scopeDescription, let usage):
+            let reasoning = pendingReply?.reasoning
             pendingReply = nil
             // 落盘助手回答
             if let active = store.state.lastActive,
                let conversationID = active.conversationID {
                 store.saveAnswer(assetID: active.assetID, conversationID: conversationID, questionID: questionID, replacing: retryID,
-                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash))
+                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: reasoning?.isEmpty == false ? reasoning : nil))
             }
             var payload: [String: Any] = [
                 "kind": "finished",
@@ -931,6 +945,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             pushState(message: "回答完成")
 
         case .failed(let message):
+            if let pending = pendingReply, pending.retryID == nil, (!pending.text.isEmpty || !pending.reasoning.isEmpty) {
+                store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
+                    answer: .init(role: .assistant, text: pending.text.isEmpty ? "生成失败：" + message : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary,
+                        sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning))
+            }
             pendingReply = nil
             bridge.push(["chatEvent": ["kind": "error", "text": message]])
             pushState(message: "问答失败")
@@ -1274,6 +1293,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                             "canRetry": conversation.retryQuestion(for: message.id) != nil,
                             "role": message.role.rawValue,
                             "text": message.text,
+                            "reasoning": message.reasoning ?? NSNull() as Any,
+                            "reasoningExpanded": message.reasoningExpanded ?? NSNull() as Any,
                             "createdAt": ISO8601DateFormatter().string(from: message.createdAt),
                             "isPositionCard": message.isPositionCard == true,
                         ] as [String: Any]

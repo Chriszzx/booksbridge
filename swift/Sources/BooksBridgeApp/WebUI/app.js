@@ -16,6 +16,7 @@
   // ---------- 与宿主通信 ----------
 
   function invoke(type, payload) {
+    if (["openBook", "selectConversation", "newConversation", "restoreConversation"].includes(type)) showView("chat");
     const handler = window.webkit?.messageHandlers?.booksbridge;
     if (!handler) {
       console.warn("[booksbridge] 宿主桥未就绪:", type);
@@ -115,7 +116,6 @@
     prepRetry: $("prep-retry"),
 
     settingsNav: $("settings-nav"),
-    settingsClose: $("settings-close"),
     permFda: $("perm-fda"),
     permAx: $("perm-ax"),
     permRecheck: $("perm-recheck"),
@@ -285,7 +285,6 @@
     const open = $("actions-menu").hidden; closeMenus(); hideCommands();
     if (open) { renderActionAvailability(); showMenu($("actions-menu"), $("actions-btn")); $("actions-btn").setAttribute("aria-expanded", "true"); $("actions-menu").querySelector("button:not(:disabled):not([hidden])")?.focus(); }
   });
-  $("archives-btn").addEventListener("click", () => { renderArchives(); $("archives-panel").showModal(); });
   $("restore-active").addEventListener("click", () => invoke("restoreConversation", {assetID:state.active.assetID, conversationID:state.active.conversationID}));
   document.querySelectorAll("[data-close]").forEach(el => el.addEventListener("click", () => $(el.dataset.close).close()));
   document.addEventListener("click", e => { if (!e.target.closest(".floating-menu, #actions-btn, .row-action")) closeMenus(); });
@@ -372,7 +371,8 @@
       for (const conversation of book.conversations.filter(c => !c.archived)) {
         const wrap = document.createElement("div"); wrap.className = "conversation-row";
         const row = button(conversation.title, "conv-row", () => invoke("selectConversation", {assetID:book.assetID, conversationID:conversation.id}));
-        if (state.active?.assetID === book.assetID && state.active?.conversationID === conversation.id) wrap.classList.add("active");
+        if (els.viewSettings.hidden && state.active?.assetID === book.assetID && state.active?.conversationID === conversation.id) wrap.classList.add("active");
+        row.title = conversation.title;
         const badge = document.createElement("span"); badge.className = "cc";
         badge.textContent = conversation.summaryStatus?.startsWith("正在") ? "◌" : "";
         badge.title = conversation.summaryStatus || "";
@@ -395,8 +395,8 @@
       for (const c of archived) {
         count++;
         const row = document.createElement("div"); row.className = "archive-row";
-        const view = button(c.title, "archive-title", () => { $("archives-panel").close(); invoke("selectConversation", {assetID:book.assetID, conversationID:c.id}); });
-        const restore = button("恢复", "btn-plain", () => { $("archives-panel").close(); invoke("restoreConversation", {assetID:book.assetID, conversationID:c.id}); });
+        const view = button(c.title, "archive-title", () => { invoke("selectConversation", {assetID:book.assetID, conversationID:c.id}); });
+        const restore = button("恢复", "btn-plain", () => { invoke("restoreConversation", {assetID:book.assetID, conversationID:c.id}); });
         row.append(view, restore); list.append(row);
       }
     }
@@ -432,6 +432,7 @@
         (c) => c.id === state.active?.conversationID
       );
       els.crumbConv.textContent = activeConversation ? activeConversation.title : "";
+      els.crumbConv.title = els.crumbConv.textContent; els.crumbBook.title = activeBook.title;
 
       // 有历史时不该再显示空态
       const hasHistory = (activeConversation?.messageCount ?? 0) > 0;
@@ -487,10 +488,10 @@
     roleLabel.textContent = options.roleLabel ?? (role === "user" ? "我" : settingsState.settings?.model ?? "助手");
     wrap.append(roleLabel);
 
-    if (options.reasoning !== undefined) {
+    if (options.reasoning) {
       const details = document.createElement("details");
       details.className = "msg-reasoning";
-      details.open = settingsState.settings?.autoExpandReasoning === true;
+      details.open = options.reasoningExpanded ?? (settingsState.settings?.autoExpandReasoning === true);
       const summary = document.createElement("summary");
       summary.textContent = "思考摘要";
       const body = document.createElement("div");
@@ -514,6 +515,7 @@
     }
 
     els.messages.append(wrap);
+    bindReasoning(wrap, options.reasoningExpanded);
     scrollToBottom();
     return body;
   }
@@ -528,10 +530,27 @@
   function messagePayload(id) {
     return {assetID: state.active.assetID, conversationID: state.active.conversationID, messageID: id};
   }
+  function bindReasoning(wrap, explicitChoice) {
+    const details = wrap.querySelector('.msg-reasoning');
+    if (!details) return;
+    if (explicitChoice != null) details.dataset.manual = 'true';
+    if (details.dataset.bound) return;
+    details.dataset.bound = 'true'; details.dataset.expanded = String(details.open);
+    details.addEventListener('toggle', () => {
+      if (details.dataset.expanded === String(details.open) || !wrap.isConnected) return;
+      details.dataset.expanded = String(details.open); details.dataset.manual = 'true';
+      if (wrap.dataset.messageId) invoke('setReasoningExpanded', {...messagePayload(wrap.dataset.messageId), expanded:details.open});
+    });
+  }
   function attachMessageActions(wrap, message) {
     wrap.dataset.messageId = message.id || "";
     wrap.dataset.rawText = message.text;
     wrap.dataset.positionCard = String(!!message.isPositionCard);
+    bindReasoning(wrap, message.reasoningExpanded);
+    const reasoning = wrap.querySelector('.msg-reasoning');
+    if (message.id && message.reasoning && reasoning?.dataset.manual === 'true' && message.reasoningExpanded !== reasoning.open) {
+      invoke('setReasoningExpanded', {...messagePayload(message.id), expanded:reasoning.open});
+    }
     wrap.querySelector('.msg-actions')?.remove();
     if (!message.id) return;
     const bar = document.createElement('div'); bar.className = 'msg-actions';
@@ -583,7 +602,9 @@
   function restoreRetry() {
     if (!retryBackup) return;
     const {wrap,original,message} = retryBackup;
-    wrap.replaceWith(original); attachMessageActions(original,message); retryBackup = null;
+    wrap.replaceWith(original);
+    if (original.querySelector('.msg-reasoning')) delete original.querySelector('.msg-reasoning').dataset.bound;
+    attachMessageActions(original,message); retryBackup = null;
   }
   function syncMessages() {
     if (chatState.streaming) return;
@@ -596,7 +617,7 @@
       let wrap = existing.find(el => message.id && el.dataset.messageId === message.id);
       if (!wrap) wrap = existing.find(el => !el.dataset.messageId && el.classList.contains(message.role) && (el.dataset.rawText ?? el.querySelector('.msg-body')?.textContent) === message.text);
       if (!wrap || (wrap.dataset.rawText !== undefined && wrap.dataset.rawText !== message.text)) {
-        wrap = appendMessage(message.role, message.text, {roleLabel: message.isPositionCard ? '阅读位置' : undefined}).closest('.msg');
+        wrap = appendMessage(message.role, message.text, {roleLabel: message.isPositionCard ? '阅读位置' : undefined, reasoning:message.reasoning, reasoningExpanded:message.reasoningExpanded}).closest('.msg');
       }
       const index = existing.indexOf(wrap); if (index >= 0) existing.splice(index,1);
       attachMessageActions(wrap,message); els.messages.append(wrap);
@@ -718,6 +739,7 @@
           details.append(summary, body);
           chatState.streamNode.parentElement.insertBefore(details, chatState.streamNode);
           chatState.streamReasoning = body;
+          bindReasoning(chatState.streamNode.closest(".msg"));
         }
         scrollToBottom();
         break;
@@ -949,6 +971,7 @@
   }
 
   function showSection(name) {
+    if (name !== activeSection) collectAndSave();
     activeSection = name;
     for (const button of els.settingsNav.querySelectorAll(".nav-item")) {
       button.classList.toggle("active", button.dataset.section === name);
@@ -960,10 +983,15 @@
 
   function showView(which) {
     const toSettings = which === "settings";
+    if (!toSettings && !els.viewSettings.hidden) collectAndSave();
+    closeMenus(); hideCommands();
     els.viewChat.hidden = toSettings;
     els.viewSettings.hidden = !toSettings;
     document.querySelectorAll(".nav-item").forEach((b) => b.classList.remove("active"));
     if (toSettings) showSection(activeSection);
+    els.settingsBtn.classList.toggle('active', toSettings);
+    els.settingsBtn.setAttribute('aria-pressed', String(toSettings));
+    librarySignature = ''; renderLibrary();
   }
 
   /** 当前会话标识，用于判断是否需要整段重绘历史。 */
@@ -1020,6 +1048,12 @@
       // --- 设置 ---
       if (payload.settings) {
         settingsState.settings = payload.settings;
+        for (const details of document.querySelectorAll('.msg-reasoning')) {
+          if (details.dataset.manual !== 'true') {
+            details.dataset.expanded = String(payload.settings.autoExpandReasoning === true);
+            details.open = payload.settings.autoExpandReasoning === true;
+          }
+        }
         for (const wrap of document.querySelectorAll('.msg.assistant')) {
           if (wrap.dataset.positionCard !== 'true') wrap.querySelector('.msg-role').textContent = payload.settings.model ?? '助手';
         }
@@ -1203,9 +1237,8 @@
   });
 
   els.settingsBtn.addEventListener("click", () => {
-    showView("settings");
-    // 让宿主把最新设置推过来
-    invoke("openSettings");
+    if (els.viewSettings.hidden) { showView("settings"); invoke("getSettings"); }
+    else showView("chat");
   });
 
   els.hideBtn.addEventListener("click", () => invoke("hidePage"));
@@ -1310,11 +1343,6 @@
   }
 
   // ---------- 交互：设置 ----------
-
-  els.settingsClose.addEventListener("click", () => {
-    collectAndSave();
-    showView("chat");
-  });
 
   els.settingsNav.addEventListener("click", (event) => {
     const button = event.target.closest(".nav-item");
