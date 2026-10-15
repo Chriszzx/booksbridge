@@ -4,6 +4,40 @@ import WebKit
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
+    func testSharedSummaryStatisticsSurviveConversationSwitchAndClearRequiresConfirmation() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let checks = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          const shared = {assistant:{preparation:'正在生成第 2/3 章 · 已完成 1 章',ready:true,hasSharedSummary:true},
+            scopeSummary:'第一章安全摘要',summaryMetadata:'全书摘要尚未生成',
+            bookStatistics:{characters:12000,estimatedTokens:36000,documents:5,headings:6,completed:1,wholeComplete:false,
+              chapters:[{number:1,title:'第一章',characters:4000,estimatedTokens:12000,complete:true,allowed:true},
+                {number:2,title:'第 2 章（范围外）',characters:4000,estimatedTokens:12000,complete:false,allowed:false}]}};
+          booksbridge.onState({...shared,active:{assetID:'A',conversationID:'first',scope:'upToProgress',messages:[]}});
+          const before = $('summary-status').textContent;
+          booksbridge.onState({...shared,active:{assetID:'A',conversationID:'second',scope:'upToProgress',messages:[]}});
+          $('summary-status').click();
+          const same = $('summary-status').textContent === before && $('prep-text').textContent === before;
+          const statistics = $('book-statistics').textContent.includes('12,000') && $('chapter-statistics-list').children.length === 2;
+          const isolated = $('chapter-statistics-list').textContent.includes('当前权限不读取') && !$('scope-summary-text').textContent.includes('未读秘密');
+          $('reading-panel').close();
+          booksbridge.onState({assistant:{preparation:'章节摘要 3/3 · 全书摘要已完成',ready:false,hasSharedSummary:true},scopeSummary:''});
+          $('summary-status').click(); $('prep-clear').click();
+          const confirmation = $('prepare-confirm').open && $('prepare-destination').textContent.includes('所有对话');
+          $('prepare-no').click();
+          return {same,statistics,isolated,confirmation,hidden:$('scope-summary').hidden};
+        })()
+        """) as! [String: Bool]
+        for value in checks.values { XCTAssertTrue(value) }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertFalse(calls.calls.contains { ["clearKnowledge", "reprocessBook", "ask", "testAPI"].contains($0["type"] as? String ?? "") })
+        _ = try await view.evaluateJavaScript("document.getElementById('prep-clear').click(); document.getElementById('prepare-yes').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual((calls.calls.last { $0["type"] as? String == "clearKnowledge" }?["payload"] as? [String: Any])?["confirmed"] as? Bool, true)
+    }
+
     func testRenameAndDeletionDialogsTargetIDsAndRequireConfirmation() async throws {
         let (view, calls) = try await workspaceFixture()
         defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }

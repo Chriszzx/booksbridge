@@ -1122,3 +1122,8 @@ button:disabled { cursor: default; opacity: .45; }
   .scope-picker { max-width: 115px; }
   .composer-row .chip { display: none; }
 }
+
+#chapter-statistics { margin: 12px 0; font-size: 12px; }
+#chapter-statistics summary { cursor: pointer; color: var(--muted); }
+#chapter-statistics-list { max-height: 220px; overflow-y: auto; }
+.chapter-stat-row { line-height: 1.6; padding: 7px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }

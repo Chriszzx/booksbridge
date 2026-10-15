@@ -6,7 +6,7 @@
 |---|---|---|
 | BooksBridgeCore | BooksStore、EpubDocument、AccessibilityReader、ReadingCoordinator | 读取本地 EPUB、目录、Books 活跃窗口、可见文字和划选 |
 | BooksBridgeLLM | BookMap、ReadingSnapshot、ScopedReading | 本地章节地图、对话阅读位置、统一原文边界 |
-| BooksBridgeLLM | ContextBuilder、PromptBuilder、ChatClient、BookPreprocessor | 预算内上下文、单次问答请求、手动范围摘要 |
+| BooksBridgeLLM | ContextBuilder、PromptBuilder、ChatClient、BookStatistics、ChapterSummarizer | 预算内上下文、单次问答请求、手动范围摘要 |
 | BooksBridgeApp | AppDelegate、ReadingAssistant | 指令分发、一次位置刷新、问答编排 |
 | BooksBridgeApp | SummaryJobs、ConversationStore | 独立后台摘要任务、对话和状态持久化 |
 | BooksBridgeApp | WebBridge、WebUI | WKWebView 消息、Markdown、范围与位置展示 |
@@ -84,20 +84,23 @@ CFI 仅辅助定位文档，不能把节点字符偏移当成整章百分比。
 
 ## 手动摘要
 
-用户确认读取范围、服务商和模型后才调用 `BookPreprocessor`。
-短范围一次处理，长范围分块 map-reduce；处理器只能拿到已裁剪原文，不能自行读取 EPUB。
-摘要保存文本、源指纹、生成边界、模式和时间。它是可选辅助材料，不能替代原文证据。
+`BookStatistics` 在本地按目录与标题生成不重叠的章节边界，统计全书、章节、其他区段的字符数与保守 token 估计，并保留正文文档数。章节地图和统计不保存原文副本。
 
-`SummaryJobs` 由宿主持有，以书籍和对话 ID 区分任务。切换对话、书籍和设置不会取消已经开始的摘要任务。
-状态回写所属对话，侧栏显示进度，切回后可查看结果。显式取消会阻止晚到结果覆盖状态。
-应用退出后任务中断，重启显示中断，需要用户手动重试，不自动重发付费请求。
-目前不保存分块中间结果；重试重新处理该范围。旧版整书知识缓存不自动导入新对话。
+`StoredBook.libraryID` 是本 app 的 UUID，源关联沿用 assetID、sourceAliases 和指纹。`StoredBook.study` 保存统计、章节摘要、全书摘要及任务状态；同书所有对话共享。Apple Books 数据库和 EPUB 始终只读。
+
+用户确认后，`SummaryJobs` 每本书最多运行一个任务，冻结源版本和允许范围。`ChapterSummarizer` 对每章独立生成，不接收后续章节原文；超长章节分段压缩后归并，全书汇总只接收章节摘要。每次调用同时检查字符预算与用户配置的模型 token 窗口，预留提示词、输出和消息封装。UTF-8 字节数用于保守估算 token。截断或空响应不能标记为完成。
+
+读到这里只生成此前完整章节的摘要，当前章使用截止节点的原文；整章包括当前章及之前章节；全书模式生成所有章节后汇总全书。展示层共享状态，但仅返回权限内摘要，范围外标题也隐藏。提问优先携带允许的摘要/当前章原文，同时从允许原文检索证据；超出预算会明确标注省略。
+
+每章完成立即保存。切换、归档或删除对话不取消书籍任务。取消/重启保留已完成章节，用户继续时复用；未完成章节的内部片段不保存。原文变化后仅保留指纹和位置仍匹配的章节摘要，废弃全书汇总。删除书籍取消任务并清理 app 数据；任务同时校验 UUID、源指纹和任务代次，防止晚到结果重建删除记录。
+
+旧对话中的全书摘要在原文指纹一致时迁入共享资料；生成新章节摘要不会自动发起付费请求。旧受限摘要保留在原记录中，不冒充章节摘要。清除共享摘要也清除旧对话摘要，避免再次迁入。
 
 ## 存储与权限
 
 应用数据位于 `~/Library/Application Support/BooksBridge/`：
 
-- `store.json`：书库、对话、模式、消息、位置和范围摘要。
+- `store.json`：书籍 UUID 与源关联、统计、共享章节/全书摘要、对话、模式、消息和位置。
 - `maps/`：章节地图元数据，不含正文副本。
 - `settings.json`：模型、预算、思考摘要默认展开等设置。
 - `secret.json`：API Key，文件权限 0600。

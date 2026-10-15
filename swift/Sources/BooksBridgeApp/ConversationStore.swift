@@ -16,6 +16,8 @@ public struct StoredBook: Codable, Sendable, Equatable, Identifiable {
     public var customTitle: String?
     public var sourceIdentity: BookSourceIdentity?
     public var sourceAliases: [String]?
+    public var libraryID: UUID?
+    public var study: BookStudy?
 
     public var id: String { assetID }
     public var displayTitle: String { customTitle ?? title }
@@ -27,6 +29,7 @@ public struct StoredBook: Codable, Sendable, Equatable, Identifiable {
         self.author = author
         self.addedAt = addedAt
         self.conversations = conversations
+        self.libraryID = UUID()
     }
 }
 
@@ -168,6 +171,11 @@ public final class ConversationStore {
         self.state = ConversationStore.load(from: fileURL, fileManager: fileManager)
         var migratedTitles = false
         for bi in state.books.indices {
+            if state.books[bi].libraryID == nil { state.books[bi].libraryID = UUID(); migratedTitles = true }
+            if state.books[bi].study?.status.hasPrefix("正在") == true {
+                state.books[bi].study?.status = "摘要任务已中断；已完成章节保留，可继续生成"
+                migratedTitles = true
+            }
             for ci in state.books[bi].conversations.indices {
                 var conversation = state.books[bi].conversations[ci]
                 if conversation.customTitle == nil, conversation.title.range(of: "^对话 [0-9]+$", options: .regularExpression) != nil {
@@ -185,6 +193,43 @@ public final class ConversationStore {
     }
 
     // MARK: - 读取
+
+    /// Shared summaries survive chat deletion/archive. A deleted book can never be recreated by a late job.
+    @discardableResult
+    public func saveStudy(assetID: String, study: BookStudy) -> Bool {
+        guard let index = state.books.firstIndex(where: { $0.assetID == assetID }) else { return false }
+        let previous = state
+        state.books[index].study = study
+        return persistOrRollback(previous)
+    }
+
+    @discardableResult
+    public func updateStatistics(assetID: String, statistics: BookStatistics) -> Bool {
+        guard let book = book(assetID: assetID) else { return false }
+        var study = book.study ?? BookStudy(statistics: statistics)
+        study.reconcile(statistics)
+        // Legacy full-book summaries are safe to reuse only for the exact same source.
+        if book.study == nil, let legacy = book.conversations.compactMap(\.summary)
+            .filter({ $0.scope == .wholeBook && $0.sourceHash == statistics.sourceHash })
+            .max(by: { $0.generatedAt < $1.generatedAt }) {
+            study.whole = legacy
+            study.status = "旧版全书摘要已迁移 · 章节摘要待生成"
+        }
+        if book.study == study { return true }
+        return saveStudy(assetID: book.assetID, study: study)
+    }
+
+    @discardableResult
+    public func clearStudy(assetID: String) -> Bool {
+        guard let index = state.books.firstIndex(where: { $0.assetID == assetID }), let statistics = state.books[index].study?.statistics else { return false }
+        let previous = state
+        state.books[index].study = BookStudy(statistics: statistics)
+        for i in state.books[index].conversations.indices {
+            state.books[index].conversations[i].summary = nil
+            state.books[index].conversations[i].summaryStatus = nil
+        }
+        return persistOrRollback(previous)
+    }
 
     private static func load(from url: URL, fileManager: FileManager) -> StoredState {
         guard fileManager.fileExists(atPath: url.path) else {

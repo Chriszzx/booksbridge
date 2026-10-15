@@ -33,6 +33,15 @@ For details on signing and permission setup, see [Permissions and Signing](docs/
 
 Open a book in Apple Books, then select it in BooksBridge. Import builds a local chapter map from the EPUB without calling a model or saving another copy of the text.
 
+The summary panel shows whole-book and per-chapter character counts, conservative token estimates, and generation progress. EPUB document counts are listed separately from recognized chapters and other sections. Chapter boundaries come from the local table of contents and headings; unidentified sections remain labeled as such.
+
+Summaries belong to the book and are shared by its chats. Confirm generation to summarize complete chapters within the selected reading mode, saving each completed chapter immediately. Whole-book mode then combines chapter summaries into a book summary. Oversized chapters and summary collections are processed in bounded stages. Configure the model's context window under **Model & API**; generation also respects the request character budget, with space reserved for instructions and output. Token estimates use UTF-8 byte counts conservatively, not a model-specific tokenizer.
+
+Through-page mode uses earlier chapter summaries and the current chapter's already-read text; through-chapter mode includes the current chapter and all earlier chapters. Whole-book mode can use the book summary. Missing summaries fall back to permitted source text or labeled excerpts. Every chat can see shared progress, but future summaries are excluded from restricted chats. Cancelling or restarting retains completed chapters; continuing is manual and reuses them. Deleting a chat retains the book's summaries. Clearing shared summaries requires confirmation.
+
+Apple Books is a read-only source. App-owned book UUIDs, source identifiers, fingerprints, statistics, and summaries are stored under BooksBridge's own Application Support directory; no metadata or summaries are written into the original EPUB or Apple Books database.
+
+
 Each chat stays bound to one book and one reading mode: through the current page, through the current chapter, or the whole book. The mode locks after the first question or confirmed summary. Each question refreshes that chat's position; when the same book has no active content, the last verified position is reused and labeled.
 
 Use the **+** menu for reading actions. The composer keeps the reading mode, model, and send controls. Reading position and summary status appear after the book/chat names in the top bar; click them to inspect their details. Selected text appears as a confirmation card; summary progress, coverage, and results open in a separate panel.

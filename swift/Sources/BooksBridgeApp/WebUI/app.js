@@ -297,7 +297,7 @@
     if (id === "cancelSummary") return !chatState.preparation.startsWith("正在");
     if (chatState.streaming) return true;
     if (id === "generate") return chatState.preparation.startsWith("正在") || !settingsState.settings?.isConfigured;
-    if (id === "clearSummary") return !chatState.preparationReady;
+    if (id === "clearSummary") return !(chatState.hasSharedSummary || chatState.preparationReady);
     return false;
   }
   function renderActionAvailability() {
@@ -305,7 +305,7 @@
     for (const el of document.querySelectorAll("[data-action]")) {
       const id = el.dataset.action; el.disabled = actionDisabled(id);
       if (id === "cancelSummary") el.hidden = !chatState.preparation.startsWith("正在");
-      if (id === "clearSummary") el.hidden = !chatState.preparationReady;
+      if (id === "clearSummary") el.hidden = !(chatState.hasSharedSummary || chatState.preparationReady);
       if (id === "generate") el.hidden = chatState.preparation.startsWith("正在");
     }
     $("range-mode").textContent = `读取模式：${settingsState.knowledgeScopes.find(s => s.id === (state.active?.scope || chatState.scope))?.label ?? "尚未选择"}${state.active?.scope ? " · 本对话已固定" : " · 首次提问或生成摘要后固定"}`;
@@ -341,12 +341,18 @@
         openPanel("scope"); invoke("checkReading", {scope:state.active?.scope || chatState.scope}); break;
       case "summary": openPanel("summary"); break;
       case "generate": {
+        $("prepare-confirm").dataset.action = "generate";
+        $("prepare-title").textContent = "按章节生成当前范围摘要？";
+        $("prepare-yes").textContent = "确认生成";
         const scope = settingsState.knowledgeScopes.find(s => s.id === (state.active?.scope || chatState.scope))?.label ?? "当前范围";
-        $("prepare-destination").textContent = `读取范围：${scope}。将该范围内的正文发送至 ${settingsState.settings?.baseURL ?? "当前接口"}，使用 ${settingsState.settings?.model ?? "当前模型"} 生成摘要，会产生 API 用量。确认后刷新本书进度，按刷新后的边界生成。首次生成会固定本对话模式。`;
+        $("prepare-destination").textContent = `读取范围：${scope}。将该范围内的正文发送至 ${settingsState.settings?.baseURL ?? "当前接口"}，使用 ${settingsState.settings?.model ?? "当前模型"} 生成摘要，会产生 API 用量。确认后刷新本书进度，按刷新后的边界生成。首次生成会固定本对话模式。只生成权限内完整章节；读到这里的当前章使用已读原文。已完成章节会复用，选择整本书时最后汇总全书。同一本书下所有对话共享进度和结果。`;
         if (!$("prepare-confirm").open) $("prepare-confirm").showModal(); break;
       }
       case "cancelSummary": invoke("cancelPreparation"); break;
-      case "clearSummary": invoke("clearKnowledge"); break;
+      case "clearSummary":
+        $("prepare-confirm").dataset.action = "clear"; $("prepare-title").textContent = "清除本书共享摘要？";
+        $("prepare-destination").textContent = "将取消本书摘要任务，清除全部章节摘要和全书摘要，影响本书所有对话。章节统计和 Apple Books 原书保留。";
+        $("prepare-yes").textContent = "清除共享摘要"; $("prepare-confirm").showModal(); $("prepare-no").focus(); break;
       case "new": invoke("newConversation", {assetID:state.active.assetID}); break;
     }
   }
@@ -410,7 +416,7 @@
       assetID:book.assetID, ...(conversation ? {conversationID:conversation.id} : {}), requestID:`management-${Date.now()}-${++managementSequence}`};
     $("management-title").textContent = `${deleting ? "删除" : "重命名"}${conversation ? "对话" : "书籍"}`;
     $("management-description").textContent = deleting
-      ? (conversation ? `确定删除「${title}」？\n将永久删除本对话的消息、思考内容、阅读快照和摘要。书籍与其他对话保留，此操作不可撤销。`
+      ? (conversation ? `确定删除「${title}」？\n将永久删除本对话的消息、思考内容、阅读快照和旧版对话摘要。书籍共享摘要、书籍与其他对话保留，此操作不可撤销。`
         : `确定删除《${title}》？\n将永久删除 BooksBridge 中该书的资料、章节地图、摘要文档与缓存，以及全部下属对话（包括已归档）、消息和思考内容。\nApple Books 中的原书文件保留。此操作不可撤销。`)
       : (conversation ? "留空可恢复按阅读位置和时间自动命名。" : `原书名：${book.originalTitle ?? book.title}\n仅修改 BooksBridge 中的显示名称；留空可恢复原名。`);
     $("management-name-field").hidden = deleting;
@@ -850,10 +856,10 @@
     els.prepRetry.hidden = !hasConversation();
     const processing = /正在/.test(text);
     document.getElementById("prep-cancel").hidden = !processing;
-    document.getElementById("prep-clear").hidden = !chatState.preparationReady;
+    document.getElementById("prep-clear").hidden = !(chatState.hasSharedSummary || chatState.preparationReady);
     els.prepRetry.hidden = processing || !hasConversation();
     els.prepRetry.disabled = chatState.streaming || !(settingsState.settings?.isConfigured ?? false);
-    els.prepRetry.textContent = chatState.preparationReady ? "重新生成摘要" : "生成阅读摘要（可选）";
+    els.prepRetry.textContent = "生成 / 继续当前范围摘要";
   }
 
   // ---------- 渲染：知识范围选择器 ----------
@@ -1081,6 +1087,7 @@
       els.setThinking.value = s.thinkingLevel;
       document.getElementById("set-auto-expand-reasoning").checked = s.autoExpandReasoning === true;
       els.setMaxTokens.value = String(s.maxContextCharacters);
+      $("set-summary-context").value = String(s.summaryContextTokens || 32768);
       els.setTemp.value = String(s.temperature);
       els.setTempValue.textContent = Number(s.temperature).toFixed(1);
       els.setApiKey.value = s.hasAPIKey ? "••••••••••••" : "";
@@ -1209,7 +1216,7 @@
     $("summary-status").textContent = "未生成摘要";
     chatState.streaming = false;
     document.getElementById("reading-check-result").textContent = "";
-    chatState.preparation = ""; chatState.preparationReady = false; chatState.preparationFailed = false;
+    chatState.preparation = ""; chatState.preparationReady = false; chatState.preparationFailed = false; chatState.hasSharedSummary = false;
     renderComposerState();
     renderScopePicker();
 
@@ -1293,6 +1300,17 @@
       if (payload.positionCard) {
         const card = appendMessage("assistant", payload.positionCard, {roleLabel:"阅读位置"});
         if (chatState.streamNode) els.messages.insertBefore(card.closest(".msg"), chatState.streamNode.closest(".msg"));
+      }
+      if (payload.assistant) chatState.hasSharedSummary = payload.assistant.hasSharedSummary === true;
+      if (payload.bookStatistics !== undefined) {
+        const stats = payload.bookStatistics;
+        $("book-statistics").textContent = stats ? `全书 ${stats.characters.toLocaleString()} 字符 · ${stats.chapterCount ?? stats.chapters.length} 个可识别章节、${stats.chapters.length - (stats.chapterCount ?? stats.chapters.length)} 个其他区段 · ${stats.documents} 个正文文档 · ${stats.headings} 个目录/标题节点 · token 保守估计 ${stats.estimatedTokens.toLocaleString()}。摘要 ${stats.completed}/${stats.chapters.length}，全书摘要${stats.wholeComplete ? "已完成" : "待汇总"}。` : "尚未取得本地书籍统计";
+        $("chapter-statistics-list").replaceChildren();
+        for (const chapter of stats?.chapters || []) {
+          const row = document.createElement("p"); row.className = "chapter-stat-row";
+          row.textContent = `${chapter.number}. ${chapter.title} · ${chapter.kind || "章节"} · ${chapter.characters.toLocaleString()} 字符 · token 估计 ${chapter.estimatedTokens.toLocaleString()} · ${chapter.complete ? "摘要已完成" : "未生成"}${chapter.partial ? " · 当前章使用已读原文，完整章摘要隔离" : chapter.allowed ? "" : " · 当前权限不读取"}`;
+          $("chapter-statistics-list").append(row);
+        }
       }
       if (payload.summaryMetadata !== undefined) $("summary-metadata").textContent = payload.summaryMetadata;
       if (payload.scopeSummary !== undefined) {
@@ -1508,7 +1526,11 @@
   });
   document.querySelectorAll("[data-action]").forEach(el => el.addEventListener("click", () => runAction(el.dataset.action)));
   $("prepare-yes").addEventListener("click", () => {
-    $("prepare-confirm").close(); invoke("reprocessBook", {confirmed:true, scope:state.active?.scope || chatState.scope}); openPanel("summary");
+    const action = $("prepare-confirm").dataset.action;
+    $("prepare-confirm").close();
+    if (action === "clear") invoke("clearKnowledge", {confirmed:true});
+    else invoke("reprocessBook", {confirmed:true, scope:state.active?.scope || chatState.scope});
+    openPanel("summary");
   });
   $("prepare-no").addEventListener("click", () => $("prepare-confirm").close());
   let apiRequestID = "";
@@ -1584,7 +1606,7 @@
   // 任何设置控件的改动都标记为 dirty，防止推送覆盖
   for (const el of [
     els.setProvider, els.setBaseURL, els.setModel,
-    els.setScope, els.setMaxTokens, els.setApiKey, els.setThinking, document.getElementById("set-auto-expand-reasoning"),
+    els.setScope, els.setMaxTokens, $("set-summary-context"), els.setApiKey, els.setThinking, document.getElementById("set-auto-expand-reasoning"),
   ]) {
     el.addEventListener("input", () => { settingsState.dirty = true; });
     el.addEventListener("change", () => { settingsState.dirty = true; });
@@ -1611,6 +1633,7 @@
       thinkingLevel: els.setThinking.value,
       autoExpandReasoning: document.getElementById("set-auto-expand-reasoning").checked,
       maxContextCharacters: Number(els.setMaxTokens.value) || 12000,
+      summaryContextTokens: Number($("set-summary-context").value) || 32768,
       temperature: Number(els.setTemp.value) || 0,
     };
     // 密码框里是掩码占位符时不要提交

@@ -95,6 +95,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var maxContextCharacters: Int
     public var thinkingLevel: ThinkingLevel
     public var autoExpandReasoning: Bool
+    /// User-declared model window; no network capability probing or guessed model-name limits.
+    public var summaryContextTokens: Int
 
     public init(
         provider: Provider = .deepseek,
@@ -104,7 +106,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         defaultScope: KnowledgeScope = .upToProgress,
         maxContextCharacters: Int = 12_000,
         thinkingLevel: ThinkingLevel = .off,
-        autoExpandReasoning: Bool = false
+        autoExpandReasoning: Bool = false,
+        summaryContextTokens: Int = 32768
     ) {
         self.provider = provider
         self.baseURL = baseURL
@@ -114,6 +117,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.maxContextCharacters = maxContextCharacters
         self.thinkingLevel = thinkingLevel
         self.autoExpandReasoning = autoExpandReasoning
+        self.summaryContextTokens = summaryContextTokens
     }
 
     /// 解码旧版本配置文件时缺字段要能兜底，否则升级后会读不出设置。
@@ -127,6 +131,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         maxContextCharacters = (try? c.decode(Int.self, forKey: .maxContextCharacters)) ?? 12_000
         thinkingLevel = (try? c.decode(ThinkingLevel.self, forKey: .thinkingLevel)) ?? .off
         autoExpandReasoning = (try? c.decode(Bool.self, forKey: .autoExpandReasoning)) ?? false
+        summaryContextTokens = (try? c.decode(Int.self, forKey: .summaryContextTokens)) ?? 32768
     }
 }
 

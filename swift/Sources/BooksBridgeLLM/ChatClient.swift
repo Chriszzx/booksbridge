@@ -133,7 +133,8 @@ public struct ChatClient: Sendable {
         messages: [ChatMessage],
         thinking: ThinkingMode = .disabled,
         temperature: Double? = nil,
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        requireComplete: Bool = false
     ) async throws -> (text: String, usage: TokenUsage?) {
         let request = try makeRequest(
             model: model, messages: messages, thinking: thinking,
@@ -142,6 +143,10 @@ public struct ChatClient: Sendable {
         let (data, response) = try await send(request)
         try validate(response, data)
 
+        return try Self.decodeCompletion(data, requireComplete: requireComplete)
+    }
+
+    static func decodeCompletion(_ data: Data, requireComplete: Bool) throws -> (text: String, usage: TokenUsage?) {
         struct Completion: Decodable {
             struct Choice: Decodable {
                 struct Message: Decodable { let content: String? }
@@ -158,6 +163,9 @@ public struct ChatClient: Sendable {
         do {
             let decoded = try JSONDecoder().decode(Completion.self, from: data)
             let text = decoded.choices.first?.message.content ?? ""
+            if requireComplete, let reason = decoded.choices.first?.finishReason, reason != "stop" {
+                throw ClientError.decoding("摘要未完整结束（\(reason)），未标记为完成；请调整预算后继续。")
+            }
             return (text, decoded.usage)
         } catch {
             throw ClientError.decoding(String(describing: error))

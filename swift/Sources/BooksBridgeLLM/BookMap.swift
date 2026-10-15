@@ -111,7 +111,8 @@ public struct ReadingSnapshot: Codable, Sendable, Equatable {
         guard map.sourceHash == sourceHash, BookPreprocessor.contentHash(of: chapters) == sourceHash else { throw ScopedReading.Failure.cannotLocatePage }
         if scope == .wholeBook { return try ScopedReading.resolve(chapters: chapters, current: page?.chapter, scope: scope, visible: []) }
         guard let page else { throw ScopedReading.Failure.cannotLocatePage }
-        let boundary = scope == .currentChapter ? (map.entry(at: page)?.end ?? page) : page
+        let statistics = scope == .currentChapter ? BookStatistics.build(map: map, chapters: chapters) : nil
+        let boundary = scope == .currentChapter ? (statistics?.sections.first { $0.start < page && page <= $0.end }?.end ?? page) : page
         return try ScopedReading.prefix(chapters: chapters, through: boundary, current: page.chapter)
     }
 }

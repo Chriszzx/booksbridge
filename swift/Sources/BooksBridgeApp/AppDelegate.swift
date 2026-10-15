@@ -123,14 +123,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         AppPaths.ensureSupportDirectory()
         store = ConversationStore()
         settings = SettingsStore()
-        summaryJobs.onUpdate = { [weak self] assetID, conversationID, status, summary in
-            guard let self else { return }
-            self.store.updateConversation(assetID: assetID, conversationID: conversationID) {
-                $0.summaryStatus = status
-                if let summary { $0.summary = summary }
-            }
-            self.pushState(message: status)
-        }
+        summaryJobs.onUpdate = { [weak self] _ in self?.pushState(message: "书籍摘要状态已更新") }
         assistant.update(settings: settings.settings, apiKey: settings.apiKey)
         writeReport()
 
@@ -503,9 +496,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                   invocation.payload["confirmed"] as? Bool == true,
                   store.conversation(assetID: assetID, conversationID: conversationID) != nil else { return }
             if store.state.lastActive?.assetID == assetID && store.state.lastActive?.conversationID == conversationID { cancelPendingAnswer(); selectionCandidate = nil }
-            summaryJobs.cancel(assetID: assetID, conversationID: conversationID)
             let success = store.deleteConversation(assetID: assetID, conversationID: conversationID)
-            managementResult(success, message: success ? "对话及其消息、思考、摘要已删除" : store.lastWriteError ?? "删除失败", requestID: invocation.payload["requestID"] as? String)
+            managementResult(success, message: success ? "对话及其消息、思考已删除，书籍共享摘要保留" : store.lastWriteError ?? "删除失败", requestID: invocation.payload["requestID"] as? String)
 
         case "removeBook":
             guard let assetID = invocation.payload["assetID"] as? String,
@@ -514,9 +506,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // Stop local parsing too, even if another chat initiated it before deletion.
             positionTask?.cancel(); pendingSourceImport = nil
             if store.state.lastActive?.assetID == assetID { cancelPendingAnswer(); selectionCandidate = nil }
-            for conversation in book.conversations {
-                summaryJobs.cancel(assetID: assetID, conversationID: conversation.id)
-            }
+            summaryJobs.cancel(assetID: assetID, store: store)
             assistant.forgetBook(assetID: assetID)
             do {
                 try BookDataRemoval(directory: AppPaths.supportDirectory).removeBook(assetID: assetID, store: store)
@@ -588,14 +578,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case "captureSelection":
             captureSelection()
         case "cancelPreparation":
-            if let active = store.state.lastActive, let id = active.conversationID {
-                summaryJobs.cancel(assetID: active.assetID, conversationID: id)
+            if let active = store.state.lastActive, active.conversationID != nil {
+                summaryJobs.cancel(assetID: active.assetID, store: store)
             }
         case "clearKnowledge":
-            if let active = store.state.lastActive, let id = active.conversationID {
-                summaryJobs.cancel(assetID: active.assetID, conversationID: id)
-                store.updateConversation(assetID: active.assetID, conversationID: id) { $0.summary = nil; $0.summaryStatus = nil }
-                pushState(message: "已清除本对话摘要")
+            guard invocation.payload["confirmed"] as? Bool == true else { return }
+            if let active = store.state.lastActive, active.conversationID != nil {
+                summaryJobs.cancel(assetID: active.assetID, store: store)
+                let cleared = store.clearStudy(assetID: active.assetID)
+                pushState(message: cleared ? "已清除本书共享摘要，章节统计保留" : "清除失败：\(store.lastWriteError ?? "未取得书籍统计")")
             }
         case "testAPI":
             testAPI(invocation.payload)
@@ -818,6 +809,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             if let value = payload["maxContextCharacters"] as? Int {
                 draft.maxContextCharacters = min(max(value, 4000), 200_000)
             }
+            if let value = payload["summaryContextTokens"] as? Int { draft.summaryContextTokens = min(max(value, 4096), 2_000_000) }
             if let value = payload["autoExpandReasoning"] as? Bool { draft.autoExpandReasoning = value }
             if let raw = payload["thinkingLevel"] as? String,
                let level = AppSettings.ThinkingLevel(rawValue: raw) {
@@ -866,7 +858,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         try Task.checkCancellation()
         guard store.conversation(assetID: assetID, conversationID: conversationID) != nil else { throw CancellationError() }
         store.bindSource(assetID: assetID, identity: fresh.2)
-        let snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: previous)
+        let snapshot: ReadingSnapshot
+        do { snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: previous) }
+        catch {
+            // Page recognition can fail while the local book statistics remain valid.
+            if !Task.isCancelled, assistant.currentBook?.assetID == assetID, let statistics = assistant.currentStatistics {
+                _ = store.updateStatistics(assetID: assetID, statistics: statistics)
+                pushState(message: "本地书籍统计已更新；当前页定位仍需确认")
+            }
+            throw error
+        }
+        if let statistics = assistant.currentStatistics {
+            guard store.updateStatistics(assetID: assetID, statistics: statistics) else { throw SummaryJobs.JobError.writeFailed }
+        }
         try Task.checkCancellation()
         store.updateReading(assetID: assetID, conversationID: conversationID, snapshot: snapshot)
         pushState(message: snapshot.label)
@@ -903,11 +907,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         positionTask = Task { @MainActor in
             do {
                 let (book, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
-                let reading = try assistant.reading(snapshot: snapshot, scope: scope)
-                summaryJobs.start(book: book, conversationID: id, snapshot: snapshot, reading: reading,
-                    scope: scope, settings: settings.settings, apiKey: settings.apiKey)
+                _ = try assistant.reading(snapshot: snapshot, scope: scope)
+                summaryJobs.start(book: book, snapshot: snapshot, chapters: assistant.currentChapters,
+                    scope: scope, settings: settings.settings, apiKey: settings.apiKey, store: store)
             } catch is CancellationError {} catch {
-                store.updateConversation(assetID: active.assetID, conversationID: id) { $0.summaryStatus = "摘要失败：\(error)" }
+                if var study = store.book(assetID: active.assetID)?.study {
+                    study.status = "摘要失败：\(error)"; _ = store.saveStudy(assetID: active.assetID, study: study)
+                }
                 pushState(message: "摘要未发送")
             }
         }
@@ -1070,7 +1076,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 let stream = assistant.ask(book: book, currentCFI: live?.book.assetID == assetID ? live?.position?.cfi : nil,
                     question: prompt, scope: scope, visibleText: visible, history: history,
                     historyBoundaries: previous.map(\.boundary), historySourceHashes: previous.map(\.sourceHash),
-                    snapshot: snapshot, summary: conversation.summary)
+                    snapshot: snapshot, summary: store.book(assetID: assetID)?.study?.summary(snapshot: snapshot, scope: scope), study: store.book(assetID: assetID)?.study)
                 for await event in stream {
                     guard !Task.isCancelled, store.state.lastActive?.assetID == assetID,
                           store.state.lastActive?.conversationID == conversationID else { break }
@@ -1323,6 +1329,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 "maxContextCharacters": settings.settings.maxContextCharacters,
                 "thinkingLevel": settings.settings.thinkingLevel.rawValue,
                 "autoExpandReasoning": settings.settings.autoExpandReasoning,
+                "summaryContextTokens": settings.settings.summaryContextTokens,
                 // 只暴露"是否已填"，不回传明文
                 "hasAPIKey": settings.hasAPIKey,
                 "isConfigured": settings.isConfigured,
@@ -1374,29 +1381,39 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             "书库本数": String(store.state.books.count),
         ]
 
-        let jobs = store.state.books.flatMap { book in book.conversations.compactMap { conversation -> [String: String]? in
-            guard let status = conversation.summaryStatus else { return nil }
-            return ["title": book.displayTitle + " · " + conversation.displayTitle, "status": status]
-        } }
+        let jobs = store.state.books.compactMap { book -> [String: String]? in
+            guard let study = book.study else { return nil }
+            return ["title": book.displayTitle, "status": summaryJobs.failureStatus(assetID: book.assetID) ?? study.status]
+        }
         var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": jobs, "sidebarLayout": sidebarLayout.payload]
         body["assistant"] = ["preparation": "本地章节地图 · 摘要按需生成", "ready": false]
         body["readingPosition"] = "尚未取得有效阅读位置"
         body["scopeSummary"] = ""
         body["summaryMetadata"] = "尚未生成摘要"
+        body["bookStatistics"] = NSNull()
         if let active = store.state.lastActive, let id = active.conversationID,
            let conversation = store.conversation(assetID: active.assetID, conversationID: id) {
             body["readingPosition"] = conversation.readingSnapshot?.label ?? "尚未取得有效阅读位置"
-            var safe = false
-            if let summary = conversation.summary, let snapshot = conversation.readingSnapshot,
-               let reading = try? assistant.reading(snapshot: snapshot, scope: conversation.scope ?? settings.settings.defaultScope) {
-                safe = summary.isAllowed(snapshot: snapshot, reading: reading)
-                if safe { body["scopeSummary"] = summary.text }
+            if let study = store.book(assetID: active.assetID)?.study {
+                let scope = conversation.scope ?? settings.settings.defaultScope
+                let safe = conversation.readingSnapshot.flatMap { study.summary(snapshot: $0, scope: scope) }
+                body["scopeSummary"] = safe?.text ?? ""
+                body["summaryMetadata"] = (safe?.coverageLabel ?? "当前范围暂无可用摘要") + (study.whole != nil && scope != .wholeBook ? " · 全书摘要已生成，当前权限不读取" : "")
+                body["assistant"] = ["preparation": summaryJobs.failureStatus(assetID: active.assetID) ?? study.status, "ready": safe != nil, "hasSharedSummary": study.completedCount > 0 || study.whole != nil]
+                let allowed = conversation.readingSnapshot.map { study.allowedSections(snapshot: $0, scope: scope).map(\.id) } ?? []
+                body["bookStatistics"] = ["characters": study.statistics.characterCount, "estimatedTokens": study.statistics.estimatedTokens,
+                    "documents": study.statistics.documentCount, "headings": study.statistics.headingCount, "chapterCount": study.statistics.chapterCount,
+                    "completed": study.completedCount, "wholeComplete": study.whole != nil,
+                    "chapters": study.statistics.sections.enumerated().map { index, section -> [String: Any] in
+                        let partial = scope == .upToProgress && conversation.readingSnapshot.map { snapshot in
+                            snapshot.sourceHash == study.statistics.sourceHash && snapshot.page.map { section.start < $0 && $0 < section.end } == true
+                        } == true
+                        return ["number": index + 1, "title": allowed.contains(section.id) || partial ? section.title : "区段 \(index + 1)（范围外）",
+                         "kind": section.kind, "partial": partial,
+                         "characters": section.characterCount, "estimatedTokens": section.estimatedTokens,
+                         "complete": study.digest(for: section) != nil, "allowed": allowed.contains(section.id)]
+                    }]
             }
-            let status = conversation.summaryStatus ?? "本地章节地图 · 未生成范围摘要"
-            if let summary = conversation.summary {
-                body["summaryMetadata"] = "\(summary.coverageLabel ?? summary.scope.label) · \(summary.generatedAt.formatted(date: .abbreviated, time: .shortened)) · \(safe ? "适用于当前范围" : "当前不可用")"
-            }
-            body["assistant"] = ["preparation": conversation.summary != nil && !safe && !status.hasPrefix("正在") ? "摘要与当前范围不匹配，已隔离；可重新生成" : status, "ready": safe]
         }
 
         body["detected"] = NSNull()
@@ -1454,7 +1471,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         "customTitle": conversation.customTitle ?? "",
                         "messageCount": conversation.messages.count,
                         "archived": conversation.archivedAt != nil,
-                        "summaryStatus": conversation.summaryStatus ?? "",
+                        "summaryStatus": summaryJobs.failureStatus(assetID: book.assetID) ?? book.study?.status ?? "",
                         "updatedAt": ISO8601DateFormatter().string(from: conversation.updatedAt),
                     ]
                 },

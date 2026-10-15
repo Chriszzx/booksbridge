@@ -165,6 +165,10 @@
               <h2>模型与 API</h2>
               <div class="field"><button id="api-test" class="btn-plain">测试连接</button>
               <p id="api-test-result" class="field-hint" role="status">未检测 · 测试会产生少量 API 用量</p></div>
+              <div class="field"><label for="set-summary-context">摘要模型上下文上限（token）</label>
+                <input id="set-summary-context" type="number" min="4096" max="2000000" step="1024" value="32768">
+                <p class="field-hint">按所选模型填写；更换模型后请核对。摘要同时遵守请求字符预算，并预留提示词与输出空间。使用 UTF-8 字节数保守估算 token，不自动探测接口。</p>
+              </div>
 
               <div class="field">
                 <label for="set-provider">服务商</label>
@@ -289,6 +293,8 @@
     <div class="panel-head"><h3 id="reading-panel-title">阅读摘要</h3><button class="icon-btn" data-close="reading-panel" aria-label="关闭阅读面板">×</button></div>
     <section id="range-panel" hidden><p id="range-position"></p><p id="range-mode"></p><p id="reading-check-result" role="status"></p></section>
     <section id="summary-panel">
+      <p id="book-statistics" class="empty-hint">正在读取本地书籍统计…</p>
+      <details id="chapter-statistics"><summary>章节统计与生成情况</summary><div id="chapter-statistics-list"></div></details>
       <div id="prep-bar" class="prep-bar"><span class="prep-dot"></span><span id="prep-text"></span></div>
       <p id="summary-metadata" class="empty-hint"></p>
       <div id="scope-summary" hidden><div id="scope-summary-text" class="msg-body"></div></div>

@@ -26,6 +26,7 @@ public final class ReadingAssistant {
     public var currentBook: Book? { loaded?.book }
     public var currentChapters: [BookPreprocessor.Chapter] { loaded?.chapters ?? [] }
     public var currentMap: BookMap? { loaded?.map }
+    public var currentStatistics: BookStatistics? { loaded?.statistics }
     var currentChapterIndex: Int? { loaded?.currentChapterIndex }
     public var isConfigured: Bool { !apiKey.isEmpty && !settings.baseURL.isEmpty && !settings.model.isEmpty }
 
@@ -39,6 +40,7 @@ public final class ReadingAssistant {
         let epub: EpubDocument
         let chapters: [BookPreprocessor.Chapter]
         let map: BookMap
+        let statistics: BookStatistics
         var currentChapterIndex: Int?
     }
 
@@ -82,6 +84,7 @@ public final class ReadingAssistant {
             epub: epub,
             chapters: chapters,
             map: map,
+            statistics: BookStatistics.build(map: map, chapters: chapters),
             currentChapterIndex: Self.locateChapter(cfi: currentCFI, epub: epub, chapters: chapters)
         )
     }
@@ -126,7 +129,8 @@ public final class ReadingAssistant {
         historyBoundaries: [ReadingBoundary?] = [],
         historySourceHashes: [String?] = [],
         snapshot: ReadingSnapshot? = nil,
-        summary: ReadingSummary? = nil
+        summary: ReadingSummary? = nil,
+        study: BookStudy? = nil
     ) -> AsyncStream<Event> {
         answerTask?.cancel()
 
@@ -177,7 +181,12 @@ public final class ReadingAssistant {
                 let historyBudget = min(6000, totalBudget / 4)
                 let boundedHistory = PromptBuilder.trimHistory(safeHistory, characters: historyBudget)
                 let materialBudget = max(500, totalBudget - 2200 - question.count - boundedHistory.reduce(0) { $0 + $1.content.count })
-                let context = ContextBuilder(maxCharacters: materialBudget, maxExcerpts: 12, excerptCharacters: 1400).build(
+                let guide = snapshot.flatMap { snapshot in study.flatMap { study in
+                    study.summary(snapshot: snapshot, scope: scope) == nil ? nil : study.readingMaterial(snapshot: snapshot, scope: scope, source: loaded.chapters)
+                } } ?? ""
+                let guideBudget = max(0, materialBudget * 2 / 3 - 150)
+                let boundedGuide = guide.isEmpty ? "" : (guide.count <= guideBudget ? guide : String(guide.prefix(guideBudget)) + "\n[阅读材料超出预算，后续已省略；不能视为完整覆盖]")
+                let context = ContextBuilder(maxCharacters: max(300, materialBudget - boundedGuide.count - 100), maxExcerpts: 12, excerptCharacters: 1400).build(
                     knowledge: "",
                     chapters: allowed.chapters,
                     currentChapterIndex: allowed.currentChapter,
@@ -186,7 +195,9 @@ public final class ReadingAssistant {
                     visibleText: visibleText, preScoped: true
                 )
 
-                self.emit(.contextPrepared("正在思考 · 已读取\(context.isComplete ? "完整原文" : "原文选段") \(context.characterCount) 字"), to: continuation)
+                self.emit(.contextPrepared(boundedGuide.isEmpty
+                    ? "正在思考 · 已读取\(context.isComplete ? "完整原文" : "原文选段") \(context.characterCount) 字"
+                    : "正在思考 · 已读取权限内章节摘要与原文 \(boundedGuide.count + context.characterCount) 字"), to: continuation)
                 var messages = self.promptBuilder.build(
                     book: loaded.book,
                     question: question,
@@ -195,12 +206,13 @@ public final class ReadingAssistant {
                     progress: snapshot?.progress ?? loaded.book.progress,
                     history: boundedHistory
                 )
+                if !boundedGuide.isEmpty { messages.append(.user("本轮阅读材料（章节摘要可能省略细节，原文选段用于核对）：\n" + boundedGuide)) }
 
                 var answer = ""
                 var usage: TokenUsage?
                 var outputLimited = false
                 do {
-                    if let snapshot, let summary, summary.isAllowed(snapshot: snapshot, reading: allowed) {
+                    if boundedGuide.isEmpty, let snapshot, let summary, summary.isAllowed(snapshot: snapshot, reading: allowed) {
                         let remaining = max(0, totalBudget - messages.reduce(0) { $0 + $1.content.count } - 100)
                         if remaining > summary.text.count {
                             messages.append(.user("权限内的已生成摘要（原文优先，摘要可能有省略）：\n" + summary.text))
