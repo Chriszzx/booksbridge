@@ -31,7 +31,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var apiTestTask: Task<Void, Never>?
     private var apiTestGeneration = 0
     private var answerStream: Task<Void, Never>?
-    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String, reasoning: String)?
+    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String, reasoning: String, reasoningExpanded: Bool?)?
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
     private var selectionCandidate: ConfirmedReference?
@@ -308,6 +308,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        cancelPendingAnswer()
         bridge?.webView.configuration.userContentController
             .removeScriptMessageHandler(forName: WebBridge.handlerName)
     }
@@ -467,6 +468,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             pushState(message: "已移出书库")
 
         case "backToLibrary":
+            cancelPendingAnswer()
             store.setActive(assetID: nil, conversationID: nil)
             pushState(message: "回到书库")
 
@@ -482,13 +484,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case "ask":
             ask(invocation.payload)
 
+        case "setPendingReasoningExpanded":
+            if let pending = pendingReply,
+               invocation.payload["assetID"] as? String == pending.assetID,
+               invocation.payload["conversationID"] as? String == pending.conversationID,
+               let expanded = invocation.payload["expanded"] as? Bool {
+                pendingReply?.reasoningExpanded = expanded
+            }
+
         case "setReasoningExpanded":
-            if let active = store.state.lastActive, let cid = active.conversationID,
-               invocation.payload["assetID"] as? String == active.assetID,
-               invocation.payload["conversationID"] as? String == cid,
+            if let assetID = invocation.payload["assetID"] as? String,
+               let cid = invocation.payload["conversationID"] as? String,
                let id = invocation.payload["messageID"] as? String,
                let expanded = invocation.payload["expanded"] as? Bool {
-                store.setReasoningExpanded(assetID: active.assetID, conversationID: cid, messageID: id, expanded: expanded)
+                // A queued UI preference belongs to the original message even after navigation.
+                // The store rejects missing/deleted messages, so this cannot recreate deleted data.
+                store.setReasoningExpanded(assetID: assetID, conversationID: cid, messageID: id, expanded: expanded)
             }
 
         case "copyMessage", "editMessage", "deleteMessage", "retryMessage":
@@ -589,6 +600,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   3. 回查图书 App 的书库数据库
     ///   4. 都没有才退化为 assetID
     private func openBook(assetID: String) {
+        cancelPendingAnswer()
         var title: String?
         var author: String?
 
@@ -669,7 +681,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         assistant.cancelAnswer()
         if let pending = pendingReply, pending.retryID == nil, (!pending.text.isEmpty || !pending.reasoning.isEmpty) {
             store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
-                answer: .init(role: .assistant, text: pending.text.isEmpty ? "已停止" : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning))
+                answer: .init(role: .assistant, text: pending.text.isEmpty ? "已停止" : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning, reasoningExpanded: pending.reasoningExpanded))
         }
         pendingReply = nil
     }
@@ -853,7 +865,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let userMessage = Conversation.Message(id: questionID ?? UUID().uuidString, role: .user, text: question, isPositionCard: request.isEmpty)
         if retryID == nil { store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: userMessage) }
         cancelPendingAnswer()
-        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "", "")
+        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "", "", nil)
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { if !Task.isCancelled { answerStream = nil; pendingReply = nil } }
@@ -922,12 +934,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case .finished(let answer, let scopeDescription, let usage):
             let reasoning = pendingReply?.reasoning
+            let reasoningExpanded = pendingReply?.reasoningExpanded
             pendingReply = nil
             // 落盘助手回答
             if let active = store.state.lastActive,
                let conversationID = active.conversationID {
                 store.saveAnswer(assetID: active.assetID, conversationID: conversationID, questionID: questionID, replacing: retryID,
-                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: reasoning?.isEmpty == false ? reasoning : nil))
+                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: reasoning?.isEmpty == false ? reasoning : nil, reasoningExpanded: reasoningExpanded))
             }
             var payload: [String: Any] = [
                 "kind": "finished",
@@ -948,7 +961,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             if let pending = pendingReply, pending.retryID == nil, (!pending.text.isEmpty || !pending.reasoning.isEmpty) {
                 store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
                     answer: .init(role: .assistant, text: pending.text.isEmpty ? "生成失败：" + message : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary,
-                        sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning))
+                        sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning, reasoningExpanded: pending.reasoningExpanded))
             }
             pendingReply = nil
             bridge.push(["chatEvent": ["kind": "error", "text": message]])

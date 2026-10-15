@@ -482,6 +482,8 @@
   function appendMessage(role, text, options = {}) {
     const wrap = document.createElement("div");
     wrap.className = `msg ${role}`;
+    wrap.dataset.assetId = state.active?.assetID ?? '';
+    wrap.dataset.conversationId = state.active?.conversationID ?? '';
 
     const roleLabel = document.createElement("div");
     roleLabel.className = "msg-role";
@@ -536,11 +538,21 @@
     if (explicitChoice != null) details.dataset.manual = 'true';
     if (details.dataset.bound) return;
     details.dataset.bound = 'true'; details.dataset.expanded = String(details.open);
-    details.addEventListener('toggle', () => {
+    const saveChoice = () => {
       if (details.dataset.expanded === String(details.open) || !wrap.isConnected) return;
       details.dataset.expanded = String(details.open); details.dataset.manual = 'true';
-      if (wrap.dataset.messageId) invoke('setReasoningExpanded', {...messagePayload(wrap.dataset.messageId), expanded:details.open});
+      const payload = {assetID:wrap.dataset.assetId, conversationID:wrap.dataset.conversationId, expanded:details.open};
+      if (chatState.streaming && chatState.streamNode?.closest('.msg') === wrap) {
+        invoke('setPendingReasoningExpanded', payload);
+      } else if (wrap.dataset.messageId) {
+        invoke('setReasoningExpanded', {...payload, messageID:wrap.dataset.messageId});
+      }
+    };
+    // Native toggle events are queued; persist the click before navigation/archiving can remove the node.
+    details.querySelector('summary').addEventListener('click', event => {
+      event.preventDefault(); details.open = !details.open; saveChoice();
     });
+    details.addEventListener('toggle', saveChoice);
   }
   function attachMessageActions(wrap, message) {
     wrap.dataset.messageId = message.id || "";

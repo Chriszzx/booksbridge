@@ -97,9 +97,10 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         public var reasoning: String?
         public var reasoningExpanded: Bool?
 
-        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false, reasoning: String? = nil) {
+        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false, reasoning: String? = nil, reasoningExpanded: Bool? = nil) {
             self.id = id
             self.reasoning = reasoning
+            self.reasoningExpanded = reasoningExpanded
             self.role = role
             self.boundary = boundary
             self.sourceHash = sourceHash

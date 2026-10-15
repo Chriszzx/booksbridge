@@ -1,5 +1,6 @@
 import XCTest
 import WebKit
+@testable import BooksBridgeApp
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
@@ -41,8 +42,9 @@ private final class NavigationReady: NSObject, WKNavigationDelegate {
 @MainActor
 private final class UIInvocations: NSObject, WKScriptMessageHandler {
     var calls: [[String: Any]] = []
+    var onCall: (([String: Any]) -> Void)?
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        if let body = message.body as? [String: Any] { calls.append(body) }
+        if let body = message.body as? [String: Any] { calls.append(body); onCall?(body) }
     }
 }
 
@@ -444,5 +446,103 @@ extension WebRenderingTests {
         XCTAssertEqual(liveChoice?["messageID"] as? String, "live-a")
         XCTAssertEqual(liveChoice?["expanded"] as? Bool, true)
 
+    }
+}
+
+@MainActor
+extension WebRenderingTests {
+    /// Real WKWebView controls + a temporary on-disk store. No model client is created.
+    func testReasoningLifecycleAcrossSwitchArchiveReloadAndDeletion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("reasoning-lifecycle-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("store.json")
+        var store = ConversationStore(fileURL: file)
+        store.addBook(assetID: "A", title: "测试书", author: "")
+        let first = try XCTUnwrap(store.createConversation(assetID: "A"))
+        let second = try XCTUnwrap(store.createConversation(assetID: "A"))
+        store.appendMessage(assetID: "A", conversationID: first.id, message: .init(id: "q", role: .user, text: "问题"))
+        store.saveAnswer(assetID: "A", conversationID: first.id, questionID: "q", replacing: nil,
+            answer: .init(id: "a", role: .assistant, text: "回答", reasoning: "LOCAL_REASONING_DELETE_MARKER", reasoningExpanded: false))
+        store.setActive(assetID: "A", conversationID: first.id)
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        calls.calls.removeAll()
+        calls.onCall = { call in
+            let payload = call["payload"] as? [String: Any] ?? [:]
+            let cid = payload["conversationID"] as? String ?? ""
+            switch call["type"] as? String {
+            case "setReasoningExpanded":
+                store.setReasoningExpanded(assetID: "A", conversationID: cid, messageID: payload["messageID"] as? String ?? "", expanded: payload["expanded"] as? Bool ?? false)
+            case "selectConversation": store.setActive(assetID: "A", conversationID: cid)
+            case "archiveConversation": store.setArchived(assetID: "A", conversationID: cid, archived: true)
+            case "restoreConversation":
+                store.setArchived(assetID: "A", conversationID: cid, archived: false)
+                store.setActive(assetID: "A", conversationID: cid)
+            case "deleteMessage": store.changeMessage(assetID: "A", conversationID: cid, messageID: payload["messageID"] as? String ?? "")
+            case "ask", "retryMessage", "testAPI", "reprocessBook": XCTFail("Lifecycle audit must not request model work")
+            default: break
+            }
+        }
+        func pushPersistedState() async throws {
+            let activeID = store.state.lastActive?.conversationID ?? ""
+            let c = store.conversation(assetID: "A", conversationID: activeID)
+            let messages: [[String: Any]] = (c?.messages ?? []).map { m in
+                ["id":m.id, "role":m.role.rawValue, "text":m.text, "reasoning":m.reasoning ?? NSNull() as Any,
+                 "reasoningExpanded":m.reasoningExpanded ?? NSNull() as Any, "canRetry":m.role == .assistant]
+            }
+            let library: [[String: Any]] = [["assetID":"A", "title":"测试书", "conversations":store.book(assetID:"A")!.conversations.map { c in
+                ["id":c.id, "title":c.id == first.id ? "第一对话" : "第二对话", "messageCount":c.messages.count, "archived":c.archivedAt != nil] as [String: Any]
+            }]]
+            let payload: [String: Any] = ["settings":["model":"local-test", "isConfigured":false, "autoExpandReasoning":true],
+                "library":library, "active":["assetID":"A", "conversationID":activeID, "archived":c?.archivedAt != nil, "messages":messages]]
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
+            _ = try await view.evaluateJavaScript("booksbridge.onState(" + json + "); undefined;")
+        }
+        func assertReasoning(open: Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+            let result = try await view.evaluateJavaScript("({text:document.querySelector('.reasoning-body')?.textContent, open:document.querySelector('.msg-reasoning')?.open})") as! [String: Any]
+            XCTAssertEqual(result["text"] as? String, "LOCAL_REASONING_DELETE_MARKER", file:file,line:line)
+            XCTAssertEqual(result["open"] as? Bool, open, file:file,line:line)
+        }
+        try await pushPersistedState(); try await assertReasoning(open:false)
+        // Click then navigate in the same JS turn, before a native details toggle event can run.
+        _ = try await view.evaluateJavaScript("document.querySelector('.msg-reasoning summary').click(); [...document.querySelectorAll('.conv-row')].find(b => b.textContent === '第二对话').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(100))
+        let order = calls.calls.compactMap { $0["type"] as? String }.filter { ["setReasoningExpanded", "selectConversation"].contains($0) }
+        XCTAssertEqual(order, ["setReasoningExpanded", "selectConversation"])
+        XCTAssertEqual(store.state.lastActive?.conversationID, second.id)
+        try await pushPersistedState()
+        store.setActive(assetID:"A",conversationID:first.id); try await pushPersistedState(); try await assertReasoning(open:true)
+        // Collapse and archive immediately; archiving must keep the whole reply and its preference.
+        _ = try await view.evaluateJavaScript("document.querySelector('.msg-reasoning summary').click(); document.querySelector('.conversation-row.active .row-action').click(); document.querySelector('#sidebar-menu button').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNotNil(store.conversation(assetID:"A",conversationID:first.id)?.archivedAt)
+        store = ConversationStore(fileURL:file)
+        store.setActive(assetID:"A",conversationID:first.id)
+        try await pushPersistedState(); try await assertReasoning(open:false)
+        // Reload both persistence and the Web document, as on restart; global auto-expand must not override false.
+        let loaded = expectation(description:"reasoning document reloaded")
+        let navigation = NavigationReady(loaded); view.navigationDelegate = navigation; view.reload()
+        await fulfillment(of:[loaded],timeout:10)
+        store = ConversationStore(fileURL:file)
+        try await pushPersistedState(); try await assertReasoning(open:false)
+        _ = try await view.evaluateJavaScript("document.querySelector('.msg-reasoning summary').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(100))
+        store = ConversationStore(fileURL:file)
+        XCTAssertEqual(store.conversation(assetID:"A",conversationID:first.id)?.messages.last?.reasoningExpanded,true)
+        let expandedReload = expectation(description:"expanded archived reasoning reloaded")
+        let secondNavigation = NavigationReady(expandedReload); view.navigationDelegate = secondNavigation; view.reload()
+        await fulfillment(of:[expandedReload],timeout:10)
+        try await pushPersistedState(); try await assertReasoning(open:true)
+        // Restoring permits deletion; neither the DOM nor the JSON may retain the reply's reasoning.
+        _ = try await view.evaluateJavaScript("document.getElementById('restore-active').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(100)); try await pushPersistedState()
+        _ = try await view.evaluateJavaScript("document.querySelector('.msg.assistant [data-message-action=delete]').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(100))
+        store = ConversationStore(fileURL:file); try await pushPersistedState()
+        let remaining = try await view.evaluateJavaScript("document.querySelectorAll('.msg-reasoning,.reasoning-body,.msg.assistant').length")
+        XCTAssertEqual(remaining as? Int,0)
+        XCTAssertFalse(try String(contentsOf:file,encoding:.utf8).contains("LOCAL_REASONING_DELETE_MARKER"))
+        XCTAssertFalse(store.setReasoningExpanded(assetID:"A",conversationID:first.id,messageID:"a",expanded:true), "A delayed preference must not recreate a deleted reply")
+        XCTAssertEqual(store.conversation(assetID:"A",conversationID:first.id)?.messages.map(\.id),["q"])
     }
 }
