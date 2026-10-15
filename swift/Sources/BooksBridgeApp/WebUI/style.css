@@ -253,12 +253,6 @@ button { cursor: pointer; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.book-row .bc {
-  flex: 0 0 auto;
-  font-size: 11px;
-  color: var(--fg-faint);
-  font-variant-numeric: tabular-nums;
-}
 .book-row .row-add {
   flex: 0 0 auto;
   opacity: 0;
@@ -558,7 +552,9 @@ button { cursor: pointer; }
 .btn-send:disabled { opacity: .4; cursor: default; }
 .btn-send svg { width: 16px; height: 16px; }
 .msg-actions { display: flex; gap: 2px; margin-top: 6px; align-self: flex-start; }
-.msg.user .msg-actions { align-self: flex-end; }
+.msg.user .msg-actions { align-self: flex-end; opacity: 0; pointer-events: none; }
+.msg.user:hover .msg-actions, .msg.user:focus-within .msg-actions { opacity: 1; pointer-events: auto; }
+.msg.assistant .msg-actions { margin-top: 0; }
 .message-action {
   appearance: none; border: 0; background: transparent; color: var(--fg-dim);
   border-radius: 50%; padding: 0; width: 28px; height: 28px;
@@ -1008,6 +1004,7 @@ button { cursor: pointer; }
 .msg-body table { border-collapse: collapse; display: block; overflow-x: auto; }
 .msg-body th, .msg-body td { border: 1px solid var(--border); padding: 6px 10px; }
 .msg-body a { color: var(--accent); }
+.msg.assistant .msg-body > :last-child { margin-bottom: 0; }
 .composer { width: min(calc(100% - 48px), 800px); margin: 0 auto 20px; border-radius: 18px; padding: 12px 14px; flex-shrink: 0; }
 .composer textarea { font-size: 14px; min-height: 48px; }
 .composer-row { gap: 10px; min-height: 32px; }
@@ -1033,9 +1030,9 @@ button:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px
 button:disabled { cursor: default; opacity: .45; }
 .messages { max-width: var(--chat-width); gap: 24px; }
 .thread { padding: 24px; }
-.composer { position: relative; width: min(calc(100% - 48px), var(--chat-width)); margin: 0 auto 16px; padding: 12px; border-radius: 16px; }
-.composer textarea { min-height: 44px; }
-.composer-row { gap: 6px; }
+.composer { position: relative; width: min(calc(100% - 48px), var(--chat-width)); margin: 0 auto 16px; padding: 8px 8px 6px; border-radius: 16px; }
+.composer #input { min-height: 52px; padding: 4px 6px 0; line-height: 24px; }
+.composer-row { gap: 12px; margin-top: 12px; padding-top: 2px; }
 #ctx-chip { display: none; }
 #view-chat .crumb { flex: 0 1 44%; overflow: hidden; }
 #crumb-book { flex: 1 1 50%; }
@@ -1090,6 +1087,7 @@ button:disabled { cursor: default; opacity: .45; }
 .book-group.drop-after { border-bottom-color: var(--accent); }
 #preparation-jobs { font-size: 10px; max-height: 64px; }
 @media (max-width: 850px) {
+  .composer-row { gap: 8px; }
   .composer, .command-feedback { width: calc(100% - 32px); }
   .thread { padding: 18px 16px; }
   .composer-model { max-width: 110px; }

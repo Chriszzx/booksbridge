@@ -337,8 +337,6 @@
       bookRow.draggable = true; bookRow.title = "拖动调整书籍顺序";
       const title = button(book.title, "book-title", () => invoke("openBook", {assetID: book.assetID}));
       title.title = book.title;
-      const count = document.createElement("span"); count.className = "bc";
-      count.textContent = String(book.conversations.filter(c => !c.archived).length);
       const add = button("＋", "icon-btn row-action", () => invoke("newConversation", {assetID: book.assetID}));
       add.setAttribute("aria-label", `为《${book.title}》新建对话`); add.title = "新建对话";
       const more = button("⋯", "icon-btn row-action", () => sidebarMenu(more, [
@@ -346,7 +344,7 @@
         {label:"下移", disabled:index === state.library.length - 1, run:() => moveRelative(book.assetID, 1)},
       ]));
       more.setAttribute("aria-label", `移动《${book.title}》`); more.setAttribute("aria-haspopup", "menu");
-      bookRow.append(title, count, add, more);
+      bookRow.append(title, add, more);
       bookRow.addEventListener("dragstart", e => {
         draggingBook = book.assetID; e.dataTransfer.setData("text/plain", book.assetID); e.dataTransfer.effectAllowed = "move";
         group.classList.add("dragging"); closeMenus();
@@ -400,7 +398,6 @@
         row.append(view, restore); list.append(row);
       }
     }
-    $("archives-label").textContent = count ? `已归档 · ${count}` : "已归档";
     if (!count) list.textContent = "没有归档对话。归档后可在这里查看和恢复。";
   }
 
