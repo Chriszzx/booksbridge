@@ -75,6 +75,7 @@
     noBookOpen: ["图书 App 里没有打开的书", "打开一本书后会自动出现"],
     transientError: ["暂时读不到阅读位置", "稍后会自动重试"],
     waiting: ["等待检测…", "正在读取图书 App 状态"],
+    ambiguousBook: ["需要确认当前书籍", "无法可靠区分当前窗口的来源文件，请确认书籍后继续"],
     ok: ["", ""],
   };
 
@@ -243,6 +244,7 @@
 
   function renderNowReading() {
     const d = state.detected;
+    $("identify-book-btn").hidden = state.detectionState !== "ambiguousBook";
 
     if (!d) {
       const [title, hint] =
@@ -399,6 +401,74 @@
 
   let librarySignature = "";
   let draggingBook = null;
+  let pendingManagement = null, sourceDialogState = null, managementSequence = 0;
+  function manage(kind, book, conversation = null) {
+    closeMenus();
+    const deleting = kind === "deleteBook" || kind === "deleteConversation";
+    const title = conversation?.title ?? book.title;
+    pendingManagement = {type:kind === "deleteBook" ? "removeBook" : kind,
+      assetID:book.assetID, ...(conversation ? {conversationID:conversation.id} : {}), requestID:`management-${Date.now()}-${++managementSequence}`};
+    $("management-title").textContent = `${deleting ? "删除" : "重命名"}${conversation ? "对话" : "书籍"}`;
+    $("management-description").textContent = deleting
+      ? (conversation ? `确定删除「${title}」？\n将永久删除本对话的消息、思考内容、阅读快照和摘要。书籍与其他对话保留，此操作不可撤销。`
+        : `确定删除《${title}》？\n将永久删除 BooksBridge 中该书的资料、章节地图、摘要文档与缓存，以及全部下属对话（包括已归档）、消息和思考内容。\nApple Books 中的原书文件保留。此操作不可撤销。`)
+      : (conversation ? "留空可恢复按阅读位置和时间自动命名。" : `原书名：${book.originalTitle ?? book.title}\n仅修改 BooksBridge 中的显示名称；留空可恢复原名。`);
+    $("management-name-field").hidden = deleting;
+    $("management-name").value = title;
+    $("management-confirm").textContent = deleting ? "删除" : "保存";
+    $("management-confirm").classList.toggle("danger", deleting);
+    $("management-confirm").disabled = false; $("management-confirm").hidden = false;
+    $("management-cancel").disabled = false; $("management-cancel").textContent = "取消";
+    $("management-error").hidden = true;
+    $("management-dialog").showModal();
+    if (deleting) $("management-cancel").focus(); else { $("management-name").focus(); $("management-name").select(); }
+  }
+  $("management-form").addEventListener("submit", event => {
+    event.preventDefault();
+    if (!pendingManagement || $("management-confirm").disabled) return;
+    $("management-confirm").disabled = true; $("management-cancel").disabled = true;
+    const {type,...payload} = pendingManagement;
+    invoke(type, {...payload, title:$("management-name").value.trim(), confirmed:true});
+  });
+  $("management-cancel").addEventListener("click", () => $("management-dialog").close());
+  $("management-dialog").addEventListener("cancel", event => { if ($("management-confirm").disabled) event.preventDefault(); });
+  $("management-dialog").addEventListener("close", () => { pendingManagement = null; });
+
+  $("identify-book-btn").addEventListener("click", () => invoke("identifyActiveBook"));
+  function showBookSource(kind, data) {
+    sourceDialogState = {kind,...data};
+    const duplicate = kind === "duplicate";
+    $("book-source-title").textContent = duplicate ? "检测到相同的书籍文件" : "确认当前书籍";
+    $("book-source-description").textContent = duplicate
+      ? `《${data.title}》与已有书籍的文件相同。可关联已有记录，沿用其对话与自定义名称；也可独立添加。`
+      : `当前窗口：${data.windowTitle}。请选择正在阅读的原书文件。此确认仅对当前页面有效，页面变化后会重新核对。`;
+    const select = $("book-source-select"); select.replaceChildren();
+    for (const book of data.matches ?? data.books ?? []) {
+      const option = document.createElement("option"); option.value = book.assetID;
+      option.textContent = `${book.title}${book.author ? " · " + book.author : ""}${book.conversationCount !== undefined ? " · " + book.conversationCount + " 个对话" : ""}${book.path ? " · " + book.path.split('/').slice(-2).join('/') : ""}`;
+      select.append(option);
+    }
+    $("book-source-separate").hidden = !duplicate;
+    $("book-source-confirm").textContent = duplicate ? "关联已有书籍" : "确认书籍";
+    $("book-source-confirm").disabled = select.options.length === 0;
+    updateBookSourcePath(); $("book-source-dialog").showModal();
+  }
+  function updateBookSourcePath() {
+    const books = sourceDialogState?.books ?? sourceDialogState?.matches ?? [];
+    $("book-source-path").textContent = books.find(book => book.assetID === $("book-source-select").value)?.path ?? "";
+  }
+  $("book-source-select").addEventListener("change", updateBookSourcePath);
+  function finishBookSource(choice) {
+    if (!sourceDialogState) return;
+    const {kind,requestID} = sourceDialogState;
+    sourceDialogState = null; $("book-source-dialog").close();
+    if (kind === "duplicate") invoke("resolveSourceImport", {requestID,...choice});
+    else if (choice.assetID) invoke("confirmActiveBook", {requestID,assetID:choice.assetID});
+  }
+  $("book-source-cancel").addEventListener("click", () => finishBookSource({cancelled:true}));
+  $("book-source-dialog").addEventListener("cancel", event => { event.preventDefault(); finishBookSource({cancelled:true}); });
+  $("book-source-confirm").addEventListener("click", () => finishBookSource({assetID:$("book-source-select").value}));
+  $("book-source-separate").addEventListener("click", () => finishBookSource({separate:true}));
   function button(text, className, action) {
     const el = document.createElement("button"); el.type = "button";
     el.className = className; el.textContent = text; el.addEventListener("click", action); return el;
@@ -414,6 +484,7 @@
     const menu = $("sidebar-menu"); menu.replaceChildren();
     for (const item of items) {
       const el = button(item.label, "", () => { closeMenus(); item.run(); });
+      el.classList.toggle("danger", !!item.danger);
       el.disabled = !!item.disabled; el.setAttribute("role", "menuitem"); menu.append(el);
     }
     showMenu(menu, anchor); menu.querySelector("button:not(:disabled)")?.focus();
@@ -445,8 +516,10 @@
       const more = button("⋯", "icon-btn row-action", () => sidebarMenu(more, [
         {label:"上移", disabled:index === 0, run:() => moveRelative(book.assetID, -1)},
         {label:"下移", disabled:index === state.library.length - 1, run:() => moveRelative(book.assetID, 1)},
+        {label:"重命名", run:() => manage("renameBook", book)},
+        {label:"删除书籍", danger:true, run:() => manage("deleteBook", book)},
       ]));
-      more.setAttribute("aria-label", `移动《${book.title}》`); more.setAttribute("aria-haspopup", "menu");
+      more.setAttribute("aria-label", `《${book.title}》的操作`); more.setAttribute("aria-haspopup", "menu");
       bookRow.append(disclosure, title, add, more);
       bookRow.addEventListener("dragstart", e => {
         draggingBook = book.assetID; e.dataTransfer.setData("text/plain", book.assetID); e.dataTransfer.effectAllowed = "move";
@@ -480,6 +553,7 @@
         badge.title = conversation.summaryStatus || "";
         const more = button("⋯", "icon-btn row-action", () => sidebarMenu(more, [
           {label:"归档对话", run:() => invoke("archiveConversation", {assetID:book.assetID, conversationID:conversation.id})},
+          {label:"重命名", run:() => manage("renameConversation", book, conversation)},
         ]));
         more.setAttribute("aria-label", `${conversation.title}的操作`); more.setAttribute("aria-haspopup", "menu");
         wrap.append(row, badge, more); convList.append(wrap);
@@ -500,7 +574,10 @@
         const row = document.createElement("div"); row.className = "archive-row";
         const view = button(c.title, "archive-title", () => { invoke("selectConversation", {assetID:book.assetID, conversationID:c.id}); });
         const restore = button("恢复", "btn-plain", () => { invoke("restoreConversation", {assetID:book.assetID, conversationID:c.id}); });
-        row.append(view, restore); list.append(row);
+        const rename = button("重命名", "btn-plain", () => manage("renameConversation", book, c));
+        const remove = button("删除", "btn-plain danger", () => manage("deleteConversation", book, c));
+        remove.dataset.archiveAction = "delete"; rename.dataset.archiveAction = "rename";
+        row.append(view, restore, rename, remove); list.append(row);
       }
     }
     if (!count) list.textContent = "没有归档对话。归档后可在这里查看和恢复。";
@@ -1151,6 +1228,20 @@
   // 按 payload 里出现了哪些字段来决定更新什么。
   window.booksbridge = {
     onState(payload) {
+      if (payload.sourceImport) showBookSource("duplicate", payload.sourceImport);
+      if (payload.bookIdentification) showBookSource("identify", payload.bookIdentification);
+      if (payload.managementResult) {
+        const result = payload.managementResult;
+        if (pendingManagement?.requestID === result.requestID) {
+          if (result.success) $("management-dialog").close();
+          else {
+            $("management-error").textContent = result.message; $("management-error").hidden = false;
+            $("management-confirm").disabled = false; $("management-cancel").disabled = false;
+            if (result.recordRemoved) { $("management-confirm").hidden = true; $("management-cancel").textContent = "关闭"; }
+          }
+        }
+        feedback(result.message);
+      }
       if (payload.sidebarLayout) {
         if (typeof payload.sidebarLayout.collapsed === "boolean") sidebarCollapsed = payload.sidebarLayout.collapsed;
         if (Array.isArray(payload.sidebarLayout.collapsedBooks)) collapsedBooks = new Set(payload.sidebarLayout.collapsedBooks);

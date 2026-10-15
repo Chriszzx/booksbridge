@@ -20,6 +20,7 @@ public final class ReadingAssistant {
     private var answerTask: Task<Void, Never>?
     private var loaded: LoadedBook?
     private let mapDirectory: URL
+    private var sourceGenerations: [String: Int] = [:]
     public private(set) var lastBoundary: ReadingBoundary?
     public private(set) var lastSourceHash: String?
     public var currentBook: Book? { loaded?.book }
@@ -43,14 +44,15 @@ public final class ReadingAssistant {
 
     /// Reparse locally so changed source cannot reuse an old page or summary.
     public func refresh(book: Book, live: ReadingContext?, previous: ReadingSnapshot?) async throws -> ReadingSnapshot {
+        let generation = sourceGenerations[book.assetID, default: 0]
         let cfi = live?.book.assetID == book.assetID ? live?.position?.cfi : nil
         let value = try await Task.detached { try Self.load(book: book, currentCFI: cfi) }.value
         try Task.checkCancellation()
+        guard sourceGenerations[book.assetID, default: 0] == generation else { throw CancellationError() }
         loaded = value
         try FileManager.default.createDirectory(at: mapDirectory, withIntermediateDirectories: true)
         // Hash identifiers so imported names cannot become paths.
-        let filename = BookPreprocessor.contentHash(of: book.assetID).replacingOccurrences(of: ":", with: "-")
-        try JSONEncoder().encode(value.map).write(to: mapDirectory.appendingPathComponent(filename + ".json"), options: .atomic)
+        try JSONEncoder().encode(value.map).write(to: mapDirectory.appendingPathComponent(BookDataRemoval.mapFilename(assetID: book.assetID)), options: .atomic)
         return try ReadingSnapshot.resolve(assetID: book.assetID, map: value.map, chapters: value.chapters, live: live, previous: previous)
     }
     public func reading(snapshot: ReadingSnapshot, scope: KnowledgeScope) throws -> ScopedReading {
@@ -58,6 +60,10 @@ public final class ReadingAssistant {
         return try snapshot.reading(chapters: loaded.chapters, map: loaded.map, scope: scope)
     }
     public func cancelAnswer() { answerTask?.cancel(); answerTask = nil }
+    public func forgetBook(assetID: String) {
+        sourceGenerations[assetID, default: 0] += 1
+        if loaded?.book.assetID == assetID { cancelAnswer(); loaded = nil; lastBoundary = nil; lastSourceHash = nil }
+    }
     private func emit(_ event: Event, to continuation: AsyncStream<Event>.Continuation) { continuation.yield(event) }
 
     nonisolated private static func load(book: Book, currentCFI: String?) throws -> LoadedBook {

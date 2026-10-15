@@ -4,6 +4,94 @@ import WebKit
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
+    func testRenameAndDeletionDialogsTargetIDsAndRequireConfirmation() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        _ = try await view.evaluateJavaScript("""
+        window.managementBooks = [{assetID:'A',title:'同名书',originalTitle:'原书名',conversations:[{id:'C',title:'当前对话'},{id:'ARCH',title:'归档对话',archived:true}]},{assetID:'B',title:'同名书',conversations:[]}];
+        booksbridge.onState({library:managementBooks});
+        window.originalMessageNode = document.querySelector('.msg'); document.getElementById('input').value = '保留草稿';
+        window.bookMenu = label => { document.querySelector('[data-asset-id="A"] .book-row .row-action:last-child').click(); [...document.querySelectorAll('#sidebar-menu button')].find(el => el.textContent === label).click(); };
+        bookMenu('重命名'); document.getElementById('management-name').value = '自定义书名'; document.getElementById('management-form').requestSubmit(); undefined;
+        """)
+        func complete(_ type: String, assetID: String = "A", conversationID: String? = nil) async throws {
+            try await Task.sleep(for:.milliseconds(50))
+            let payload = try XCTUnwrap(calls.calls.last { $0["type"] as? String == type }?["payload"] as? [String:Any])
+            XCTAssertEqual(payload["assetID"] as? String,assetID)
+            if let conversationID { XCTAssertEqual(payload["conversationID"] as? String,conversationID) }
+            let id = try XCTUnwrap(payload["requestID"] as? String)
+            let data = try JSONSerialization.data(withJSONObject:["managementResult":["requestID":id,"success":true,"message":"已完成"]])
+            _ = try await view.evaluateJavaScript("booksbridge.onState(\(String(decoding:data,as:UTF8.self))); undefined;")
+        }
+        try await Task.sleep(for:.milliseconds(30))
+        let renameRequest = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "renameBook" }?["payload"] as? [String:Any])
+        let failureData = try JSONSerialization.data(withJSONObject:["managementResult":["requestID":renameRequest["requestID"] as? String ?? "","success":false,"message":"模拟保存失败"]])
+        _ = try await view.evaluateJavaScript("booksbridge.onState(\(String(decoding:failureData,as:UTF8.self))); undefined;")
+        let retryable = try await view.evaluateJavaScript("document.getElementById('management-dialog').open && !document.getElementById('management-error').hidden && !document.getElementById('management-confirm').disabled") as? Bool
+        XCTAssertEqual(retryable,true)
+        _ = try await view.evaluateJavaScript("document.getElementById('management-form').requestSubmit(); undefined;")
+        try await complete("renameBook")
+        _ = try await view.evaluateJavaScript("""
+        managementBooks[0].title = '自定义书名'; booksbridge.onState({library:managementBooks});
+        document.querySelector('.conversation-row .row-action').click(); [...document.querySelectorAll('#sidebar-menu button')].find(el => el.textContent === '重命名').click();
+        document.getElementById('management-name').value = '我的笔记'; document.getElementById('management-form').requestSubmit(); undefined;
+        """)
+        try await complete("renameConversation",conversationID:"C")
+        let preserved = try await view.evaluateJavaScript("document.querySelector('.msg') === originalMessageNode && document.getElementById('input').value === '保留草稿'") as? Bool
+        XCTAssertEqual(preserved,true)
+        _ = try await view.evaluateJavaScript("""
+        document.getElementById('settings-btn').click(); document.getElementById('archives-btn').click();
+        document.querySelector('[data-archive-action="rename"]').click(); document.getElementById('management-name').value = '归档笔记'; document.getElementById('management-form').requestSubmit(); undefined;
+        """)
+        try await complete("renameConversation",conversationID:"ARCH")
+        _ = try await view.evaluateJavaScript("document.querySelector('[data-archive-action=delete]').click(); document.getElementById('management-cancel').click(); undefined;")
+        try await Task.sleep(for:.milliseconds(30))
+        XCTAssertFalse(calls.calls.contains { $0["type"] as? String == "deleteConversation" })
+        _ = try await view.evaluateJavaScript("document.querySelector('[data-archive-action=delete]').click(); document.getElementById('management-form').requestSubmit(); undefined;")
+        try await complete("deleteConversation",conversationID:"ARCH")
+        let deletion = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "deleteConversation" }?["payload"] as? [String:Any])
+        XCTAssertEqual(deletion["confirmed"] as? Bool,true)
+        let warning = try await view.evaluateJavaScript("""
+        (() => { bookMenu('删除书籍'); const text = document.getElementById('management-description').textContent;
+          const safeFocus = document.activeElement === document.getElementById('management-cancel');
+          document.getElementById('management-cancel').click(); return safeFocus && text.includes('包括已归档') && text.includes('Apple Books 中的原书文件保留'); })()
+        """) as? Bool
+        XCTAssertEqual(warning,true)
+        try await Task.sleep(for:.milliseconds(30))
+        XCTAssertFalse(calls.calls.contains { $0["type"] as? String == "removeBook" })
+        _ = try await view.evaluateJavaScript("bookMenu('删除书籍'); document.getElementById('management-form').requestSubmit(); undefined;")
+        try await complete("removeBook")
+        let bookDeletion = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "removeBook" }?["payload"] as? [String:Any])
+        XCTAssertEqual(bookDeletion["confirmed"] as? Bool,true)
+        XCTAssertFalse(calls.calls.contains { ["ask","retryMessage","testAPI","reprocessBook"].contains($0["type"] as? String ?? "") })
+    }
+
+    func testFileAssociationAndAmbiguousWindowConfirmationStayLocal() async throws {
+        let (view,calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        _ = try await view.evaluateJavaScript("""
+        booksbridge.onState({sourceImport:{requestID:'duplicate',title:'另一名称',matches:[{assetID:'A',title:'原记录'}]}});
+        document.getElementById('book-source-confirm').click();
+        booksbridge.onState({sourceImport:{requestID:'separate',title:'另一名称',matches:[{assetID:'A',title:'原记录'}]}});
+        document.getElementById('book-source-separate').click();
+        booksbridge.onState({detected:null,detectionState:'ambiguousBook'});
+        document.getElementById('identify-book-btn').click();
+        booksbridge.onState({bookIdentification:{requestID:'identify',windowTitle:'同名书',books:[{assetID:'A',title:'同名书',path:'/books/a.epub'},{assetID:'B',title:'同名书',path:'/books/b.epub'}]}});
+        document.getElementById('book-source-select').value = 'B'; document.getElementById('book-source-select').dispatchEvent(new Event('change'));
+        window.correctSourcePath = document.getElementById('book-source-path').textContent === '/books/b.epub';
+        document.getElementById('book-source-confirm').click(); undefined;
+        """)
+        try await Task.sleep(for:.milliseconds(60))
+        let resolved = calls.calls.filter { $0["type"] as? String == "resolveSourceImport" }.compactMap { $0["payload"] as? [String:Any] }
+        XCTAssertEqual(resolved.first?["assetID"] as? String,"A")
+        XCTAssertEqual(resolved.last?["separate"] as? Bool,true)
+        let identified = try XCTUnwrap(calls.calls.first { $0["type"] as? String == "confirmActiveBook" }?["payload"] as? [String:Any])
+        XCTAssertEqual(identified["assetID"] as? String,"B")
+        let correctPath = try await view.evaluateJavaScript("correctSourcePath") as? Bool
+        XCTAssertEqual(correctPath,true)
+        XCTAssertFalse(calls.calls.contains { ["ask","retryMessage","testAPI","reprocessBook"].contains($0["type"] as? String ?? "") })
+    }
+
     func testSidebarResizeCommitCancelAndViewportClamping() async throws {
         let (view, calls) = try await workspaceFixture()
         defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
@@ -383,7 +471,7 @@ extension WebRenderingTests {
         let result = try await view.evaluateJavaScript("""
         (() => {
           const $ = id => document.getElementById(id);
-          document.querySelector('[aria-label="移动《书A》"]').click();
+          document.querySelector('[aria-label="《书A》的操作"]').click();
           [...$('sidebar-menu').children].find(el => el.textContent === '下移').click();
           booksbridge.onState({library:[fixtureBooks[1],fixtureBooks[0]]});
           const moved = document.querySelector('.book-group').dataset.assetId === 'B';

@@ -123,4 +123,33 @@ final class ReadingAssistantTests: XCTestCase {
         XCTAssertFalse(completed)
         XCTAssertEqual(statuses.last, "摘要已取消")
     }
+
+    func testDeletingBookCancelsSummaryAndForgetsLoadedSource() async throws {
+        let root = try fixture(); defer { try? FileManager.default.removeItem(at:root) }
+        let assistant = ReadingAssistant(settings:AppSettings(),apiKey:"",knowledgeDirectory:root.appendingPathComponent("maps"))
+        let snapshot = try await assistant.refresh(book:book(root),live:live(book(root)),previous:nil)
+        let reading = try assistant.reading(snapshot:snapshot,scope:.upToProgress)
+        let store = ConversationStore(fileURL:root.appendingPathComponent("store.json"))
+        store.addBook(assetID:"A",title:"书",author:"")
+        let c = try XCTUnwrap(store.createConversation(assetID:"A"))
+        let jobs = SummaryJobs(), gate = Gate()
+        jobs.onUpdate = { assetID,id,status,summary in
+            store.updateConversation(assetID:assetID,conversationID:id) { $0.summaryStatus = status; if let summary { $0.summary = summary } }
+        }
+        jobs.processOverride = { _,_,progress in
+            await gate.wait(); progress(.chunkDone(index:1,total:1))
+            return BookKnowledge(readme:"删除后到达的摘要",contentHash:"h",model:"test",characterCount:1,chapterCount:1,chunkCount:1,promptTokens:0,completionTokens:0)
+        }
+        jobs.start(book:book(root),conversationID:c.id,snapshot:snapshot,reading:reading,scope:.upToProgress,settings:AppSettings(),apiKey:"")
+        for _ in 0..<200 { if await gate.started { break }; try await Task.sleep(for:.milliseconds(5)) }
+        jobs.cancel(assetID:"A",conversationID:c.id)
+        assistant.forgetBook(assetID:"A")
+        try BookDataRemoval(directory:root).removeBook(assetID:"A",store:store)
+        await gate.release(); try await Task.sleep(for:.milliseconds(50))
+        XCTAssertNil(assistant.currentBook)
+        XCTAssertNil(store.book(assetID:"A"))
+        XCTAssertTrue(ConversationStore(fileURL:root.appendingPathComponent("store.json")).state.books.isEmpty)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(at:root.appendingPathComponent("maps"),includingPropertiesForKeys:nil).isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath:root.appendingPathComponent("one.xhtml").path))
+    }
 }

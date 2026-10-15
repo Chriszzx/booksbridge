@@ -13,8 +13,13 @@ public struct StoredBook: Codable, Sendable, Equatable, Identifiable {
     public var author: String
     public var addedAt: Date
     public var conversations: [Conversation]
+    public var customTitle: String?
+    public var sourceIdentity: BookSourceIdentity?
+    public var sourceAliases: [String]?
 
     public var id: String { assetID }
+    public var displayTitle: String { customTitle ?? title }
+    public var sourceAssetIDs: [String] { [assetID] + (sourceAliases ?? []) }
 
     public init(assetID: String, title: String, author: String, addedAt: Date = Date(), conversations: [Conversation] = []) {
         self.assetID = assetID
@@ -43,6 +48,8 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var summaryStatus: String?
     public var archivedAt: Date?
     public var titleProgress: Double?
+    public var customTitle: String?
+    public var displayTitle: String { customTitle ?? title }
 
     public init(
         id: String = UUID().uuidString,
@@ -153,6 +160,7 @@ public final class ConversationStore {
 
     /// 上一次读取是否遇到损坏文件（供 UI 提示）。
     public private(set) var lastLoadWarning: String?
+    public private(set) var lastWriteError: String?
 
     public init(fileURL: URL = AppPaths.storeFile, fileManager: FileManager = .default) {
         self.fileURL = fileURL
@@ -162,7 +170,7 @@ public final class ConversationStore {
         for bi in state.books.indices {
             for ci in state.books[bi].conversations.indices {
                 var conversation = state.books[bi].conversations[ci]
-                if conversation.title.range(of: "^对话 [0-9]+$", options: .regularExpression) != nil {
+                if conversation.customTitle == nil, conversation.title.range(of: "^对话 [0-9]+$", options: .regularExpression) != nil {
                     conversation.titleProgress = conversation.readingSnapshot?.page == nil ? nil : conversation.readingSnapshot?.progress
                     conversation.title = Conversation.readingTitle(progress: conversation.titleProgress, createdAt: conversation.createdAt)
                     state.books[bi].conversations[ci] = conversation
@@ -200,8 +208,10 @@ public final class ConversationStore {
     // MARK: - 写入
 
     /// 原子写入。临时文件与目标同目录，保证 `replaceItemAt` 是同卷操作。
-    private func persist() {
+    @discardableResult
+    private func persist() -> Bool {
         do {
+            lastWriteError = nil
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
@@ -221,15 +231,66 @@ public final class ConversationStore {
             } else {
                 try fileManager.moveItem(at: temp, to: fileURL)
             }
+            return true
         } catch {
+            lastWriteError = error.localizedDescription
             NSLog("[BooksBridge] 写入 store 失败: \(error.localizedDescription)")
+            return false
         }
+    }
+
+    private func persistOrRollback(_ previous: StoredState) -> Bool {
+        if persist() { return true }
+        state = previous
+        return false
     }
 
     // MARK: - 查询
 
     public func book(assetID: String) -> StoredBook? {
-        state.books.first { $0.assetID == assetID }
+        state.books.first { $0.sourceAssetIDs.contains(assetID) }
+    }
+
+    public func canonicalAssetID(_ assetID: String) -> String { book(assetID: assetID)?.assetID ?? assetID }
+
+    @discardableResult
+    public func renameBook(assetID: String, title: String) -> Bool {
+        guard let index = state.books.firstIndex(where: { $0.assetID == assetID }), title.count <= 120 else { return false }
+        let previous = state
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        state.books[index].customTitle = value.isEmpty ? nil : value
+        return persistOrRollback(previous)
+    }
+
+    @discardableResult
+    public func renameConversation(assetID: String, conversationID: String, title: String) -> Bool {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }), title.count <= 120 else { return false }
+        let previous = state
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        state.books[bi].conversations[ci].customTitle = value.isEmpty ? nil : value
+        return persistOrRollback(previous)
+    }
+
+    @discardableResult
+    public func bindSource(assetID: String, identity: BookSourceIdentity) -> Bool {
+        guard let index = state.books.firstIndex(where: { $0.assetID == assetID }) else { return false }
+        if state.books[index].sourceIdentity == identity { return true }
+        let previous = state
+        state.books[index].sourceIdentity = identity
+        return persistOrRollback(previous)
+    }
+
+    @discardableResult
+    public func linkSource(assetID: String, incomingID: String, identity: BookSourceIdentity) -> Bool {
+        guard book(assetID: incomingID) == nil,
+              let index = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let existing = state.books[index].sourceIdentity,
+              existing.fingerprint == identity.fingerprint || existing.isSameFile(as: identity) else { return false }
+        let previous = state
+        state.books[index].sourceAliases = (state.books[index].sourceAliases ?? []) + [incomingID]
+        state.books[index].sourceIdentity = identity
+        return persistOrRollback(previous)
     }
 
     public func conversation(assetID: String, conversationID: String) -> Conversation? {
@@ -269,7 +330,7 @@ public final class ConversationStore {
     /// 返回该书当前的记录。
     @discardableResult
     public func addBook(assetID: String, title: String, author: String) -> StoredBook {
-        if let index = state.books.firstIndex(where: { $0.assetID == assetID }) {
+        if let index = state.books.firstIndex(where: { $0.sourceAssetIDs.contains(assetID) }) {
             // 书名可能因为图书 App 元数据更新而变化，跟着更新。
             // 取出来改完再写回：直接在嵌套下标上同时读写会触发 Swift 独占性冲突。
             var book = state.books[index]
@@ -301,6 +362,7 @@ public final class ConversationStore {
     @discardableResult
     public func deleteConversation(assetID: String, conversationID: String) -> Bool {
         guard let bookIndex = state.books.firstIndex(where: { $0.assetID == assetID }) else { return false }
+        let previous = state
         var book = state.books[bookIndex]
         let before = book.conversations.count
         book.conversations.removeAll { $0.id == conversationID }
@@ -313,26 +375,25 @@ public final class ConversationStore {
            active.conversationID == conversationID {
             state.lastActive = StoredState.LastActive(
                 assetID: assetID,
-                conversationID: book.conversations.first?.id
+                conversationID: book.conversations.first(where: { $0.archivedAt == nil })?.id
             )
         }
-        persist()
-        return true
+        return persistOrRollback(previous)
     }
 
     /// 把一本书移出书库（连同其对话）。
     @discardableResult
     public func removeBook(assetID: String) -> Bool {
+        let previous = state
         let before = state.books.count
         state.books.removeAll { $0.assetID == assetID }
         guard state.books.count != before else { return false }
         if state.lastActive?.assetID == assetID {
             state.lastActive = state.books.first.map {
-                StoredState.LastActive(assetID: $0.assetID, conversationID: $0.conversations.first?.id)
+                StoredState.LastActive(assetID: $0.assetID, conversationID: $0.conversations.first(where: { $0.archivedAt == nil })?.id)
             }
         }
-        persist()
-        return true
+        return persistOrRollback(previous)
     }
 
     /// 记录用户当前停留位置。

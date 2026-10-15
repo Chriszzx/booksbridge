@@ -2,11 +2,56 @@ import XCTest
 
 @testable import BooksBridgeApp
 import BooksBridgeLLM
+import BooksBridgeCore
 
 /// `ConversationStore` 的持久化行为。
 ///
 /// 全部用临时目录，绝不碰用户真实的 store.json。
 final class ConversationStoreTests: XCTestCase {
+    func testCustomNamesPersistWithoutChangingIdentityOrBeingOverwritten() throws {
+        let store = makeStore()
+        store.addBook(assetID:"A",title:"同名原书",author:"")
+        store.addBook(assetID:"B",title:"同名原书",author:"")
+        let c = try XCTUnwrap(store.createConversation(assetID:"A"))
+        store.appendMessage(assetID:"A",conversationID:c.id,message:.init(role:.assistant,text:"回答",reasoning:"思考",reasoningExpanded:true))
+        XCTAssertTrue(store.renameBook(assetID:"A",title:"我的书名"))
+        XCTAssertTrue(store.renameConversation(assetID:"A",conversationID:c.id,title:"阅读笔记"))
+        store.addBook(assetID:"A",title:"Books 更新后的标题",author:"")
+        store.updateReading(assetID:"A",conversationID:c.id,snapshot:.init(assetID:"A",sourceHash:"h",page:.init(chapter:0,end:10),chapterTitle:"章",progress:0.4))
+        store.setArchived(assetID:"A",conversationID:c.id,archived:true)
+        let reloaded = makeStore()
+        XCTAssertEqual(reloaded.book(assetID:"A")?.displayTitle,"我的书名")
+        XCTAssertEqual(reloaded.book(assetID:"B")?.displayTitle,"同名原书")
+        XCTAssertEqual(reloaded.conversation(assetID:"A",conversationID:c.id)?.displayTitle,"阅读笔记")
+        XCTAssertEqual(reloaded.conversation(assetID:"A",conversationID:c.id)?.messages.first?.reasoning,"思考")
+        XCTAssertFalse(reloaded.renameBook(assetID:"A",title:String(repeating:"长",count:121)))
+        XCTAssertTrue(reloaded.renameConversation(assetID:"A",conversationID:c.id,title:""))
+        XCTAssertTrue(reloaded.conversation(assetID:"A",conversationID:c.id)?.displayTitle.hasPrefix("40%") == true)
+        XCTAssertTrue(reloaded.renameBook(assetID:"A",title:""))
+        XCTAssertEqual(reloaded.book(assetID:"A")?.displayTitle,"Books 更新后的标题")
+    }
+
+    func testExplicitFileAssociationPreservesChatsAndRejectsDifferentFiles() throws {
+        let source = directory.appendingPathComponent("source.epub")
+        try Data("file".utf8).write(to:source)
+        let identity = try BookSourceIdentity.read(at:source)
+        let store = makeStore()
+        store.addBook(assetID:"A",title:"旧名称",author:"")
+        let chat = try XCTUnwrap(store.createConversation(assetID:"A"))
+        store.renameBook(assetID:"A",title:"自定义名称")
+        XCTAssertTrue(store.bindSource(assetID:"A",identity:identity))
+        XCTAssertTrue(store.linkSource(assetID:"A",incomingID:"B",identity:identity))
+        store.addBook(assetID:"B",title:"完全不同的名称",author:"")
+        let reloaded = makeStore()
+        XCTAssertEqual(reloaded.state.books.count,1)
+        XCTAssertEqual(reloaded.canonicalAssetID("B"),"A")
+        XCTAssertEqual(reloaded.book(assetID:"B")?.conversations.first?.id,chat.id)
+        XCTAssertEqual(reloaded.book(assetID:"B")?.displayTitle,"自定义名称")
+        XCTAssertFalse(reloaded.linkSource(assetID:"A",incomingID:"B",identity:identity))
+        let other = directory.appendingPathComponent("other.epub")
+        try Data("other content".utf8).write(to:other)
+        XCTAssertFalse(reloaded.linkSource(assetID:"A",incomingID:"C",identity:try BookSourceIdentity.read(at:other)))
+    }
     private var directory: URL!
     private var fileURL: URL!
 

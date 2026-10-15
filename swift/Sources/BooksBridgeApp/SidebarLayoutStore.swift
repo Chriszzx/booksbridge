@@ -32,6 +32,8 @@ public final class SidebarLayoutStore {
         defaults.set(books.sorted(), forKey: Self.booksKey)
     }
 
+    public func forgetBook(assetID: String) { setBookCollapsed(assetID: assetID, collapsed: false) }
+
     public var payload: [String: Any] {
         ["collapsed": isCollapsed, "collapsedBooks": collapsedBooks.sorted(), "width": width]
     }

@@ -43,6 +43,8 @@ public struct AccessibilityReader: Sendable {
     public struct Snapshot: Sendable {
         /// 窗口标题（阅读时通常是书名）。
         public let windowTitles: [String]
+        public let documentURLs: [URL]
+        public let windowIdentity: String?
         /// 可见正文段落，按 AX 树顺序。
         public let visibleText: [String]
         /// 用户当前划选的文本。
@@ -65,7 +67,9 @@ public struct AccessibilityReader: Sendable {
             selection: String?,
             selectionNodeText: String? = nil,
             selectionRange: NSRange? = nil,
-            selectionFrame: CGRect? = nil
+            selectionFrame: CGRect? = nil,
+            documentURLs: [URL] = [],
+            windowIdentity: String? = nil
         ) {
             self.windowTitles = windowTitles
             self.visibleText = visibleText
@@ -73,6 +77,8 @@ public struct AccessibilityReader: Sendable {
             self.selectionNodeText = selectionNodeText
             self.selectionRange = selectionRange
             self.selectionFrame = selectionFrame
+            self.documentURLs = documentURLs
+            self.windowIdentity = windowIdentity
         }
 
         /// 是否处于阅读视图（而非书库列表）。
@@ -128,6 +134,14 @@ public struct AccessibilityReader: Sendable {
         guard let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID() else { throw ReaderError.noApplicationElement }
         let window = windowRef as! AXUIElement
         let readers = readerElements(window)
+        let documentURLs = ([window] + readers).flatMap { node in
+            ["AXDocument", "AXURL"].compactMap { key -> URL? in
+                var value: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(node, key as CFString, &value) == .success else { return nil }
+                let url = (value as? URL) ?? (value as? String).flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : URL(string: $0) }
+                return url?.isFileURL == true ? url : nil
+            }
+        }
         if let title = string(window, kAXTitleAttribute as String) { titles.append(title) }
         let counter = Counter()
         if let windowFrame = frame(window) {
@@ -147,7 +161,9 @@ public struct AccessibilityReader: Sendable {
             selection: (selection?.isEmpty ?? true) ? nil : selection,
             selectionNodeText: selectionInfo?.nodeText,
             selectionRange: selectionInfo?.range,
-            selectionFrame: selectionInfo?.frame
+            selectionFrame: selectionInfo?.frame,
+            documentURLs: Array(Set(documentURLs)),
+            windowIdentity: "\(app.processIdentifier):\(CFHash(window))"
         )
     }
 

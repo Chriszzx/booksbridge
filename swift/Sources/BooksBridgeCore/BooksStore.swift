@@ -69,6 +69,14 @@ public struct BooksStore: Sendable {
 
     // MARK: - 书籍元数据
 
+    public func allBooks() throws -> [Book] {
+        guard let db = paths.libraryDatabase() else { return [] }
+        return try SQLite.query(path: db.path, """
+            SELECT ZASSETID, ZTITLE, ZAUTHOR, ZREADINGPROGRESS, ZCONTENTTYPE, ZPATH, ZLASTOPENDATE
+            FROM ZBKLIBRARYASSET
+            """).compactMap(Self.makeBook)
+    }
+
     public func book(assetID: String) throws -> Book? {
         guard let db = paths.libraryDatabase() else { return nil }
         let rows = try SQLite.query(

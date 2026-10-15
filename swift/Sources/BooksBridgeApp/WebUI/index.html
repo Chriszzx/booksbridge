@@ -33,6 +33,7 @@
             <span class="rc-track"><i id="rc-bar"></i></span>
             <span class="rc-hint" id="rc-hint"></span>
           </button>
+          <button id="identify-book-btn" class="btn-plain identify-book" type="button" hidden>确认当前书籍</button>
         </section>
 
         <!-- 书库：书名 → 对话 -->
@@ -295,6 +296,20 @@
     </section>
   </dialog>
   <dialog id="prepare-confirm" aria-labelledby="prepare-title"><h3 id="prepare-title">生成当前范围摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
+  <dialog id="management-dialog" aria-labelledby="management-title">
+    <form id="management-form">
+      <h3 id="management-title"></h3><p id="management-description"></p>
+      <label id="management-name-field">名称<input id="management-name" type="text" maxlength="120" autocomplete="off"></label>
+      <p id="management-error" class="management-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button type="button" id="management-cancel" class="btn-plain">取消</button><button type="submit" id="management-confirm" class="btn-primary">保存</button></div>
+    </form>
+  </dialog>
+  <dialog id="book-source-dialog" aria-labelledby="book-source-title">
+    <h3 id="book-source-title"></h3><p id="book-source-description"></p>
+    <label>书籍<select id="book-source-select" aria-label="选择书籍"></select></label>
+    <p id="book-source-path" class="empty-hint"></p>
+    <div class="dialog-actions"><button type="button" id="book-source-cancel" class="btn-plain">取消</button><button type="button" id="book-source-separate" class="btn-plain" hidden>独立添加</button><button type="button" id="book-source-confirm" class="btn-primary">确认</button></div>
+  </dialog>
 <script src="vendor/marked.js"></script>
 <script src="vendor/purify.js"></script>
 <script src="markdown.js"></script>

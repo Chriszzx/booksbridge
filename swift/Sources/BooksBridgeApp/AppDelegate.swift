@@ -36,9 +36,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
     private var selectionCandidate: ConfirmedReference?
+    private var pendingSourceImport: (id: String, book: BooksBridgeCore.Book, source: BookSourceIdentity, matches: [String])?
+    private var pendingBookIdentification: (id: String, snapshot: AccessibilityReader.Snapshot, books: [BooksBridgeCore.Book])?
 
     /// 最近一次采集到的阅读上下文；未检测到时为 nil。
     private var latestContext: ReadingContext?
+    private var latestSourceContext: ReadingContext?
     /// 前端是否已经就绪（就绪前的推送会被丢弃，避免 evaluateJavaScript 打空）。
     private var frontendReady = false
     // 每次启动先离线显示自有数据；受保护的读取仅由用户连接操作开启。
@@ -163,9 +166,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.store.conversation(assetID: active.assetID, conversationID: active.conversationID ?? "")
             }
             return StatusItemController.MenuState(
-                bookTitle: book?.title,
+                bookTitle: book.flatMap { self.store.book(assetID: $0.assetID)?.displayTitle ?? $0.title },
                 bookProgress: book?.progress,
-                conversationTitle: activeConversation?.title,
+                conversationTitle: activeConversation?.displayTitle,
                 isDetecting: self.latestContext != nil,
                 fullDiskAccess: self.dataAccess.isGranted,
                 accessibility: permissions.accessibilityStatus().isGranted,
@@ -295,6 +298,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator?.stop()
         coordinator = nil
         latestContext = nil
+        latestSourceContext = nil
         detectionIssue = nil
         dataAccess = Permissions().fullDiskAccessStatus()
         cachedProbe = Self.permissionProbePayload()
@@ -408,6 +412,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handle(_ invocation: WebBridge.Invocation) {
         switch invocation.type {
+        case "renameBook", "renameConversation":
+            guard let assetID = invocation.payload["assetID"] as? String,
+                  let title = invocation.payload["title"] as? String else { return }
+            let success: Bool
+            if invocation.type == "renameBook" { success = store.renameBook(assetID: assetID, title: title) }
+            else if let id = invocation.payload["conversationID"] as? String { success = store.renameConversation(assetID: assetID, conversationID: id, title: title) }
+            else { return }
+            managementResult(success, message: success ? "名称已保存" : store.lastWriteError ?? "无法重命名，名称最多 120 个字符。", requestID: invocation.payload["requestID"] as? String)
+
+        case "identifyActiveBook": requestBookIdentification()
+        case "confirmActiveBook": confirmBookIdentification(invocation.payload)
+        case "resolveSourceImport": resolveSourceImport(invocation.payload)
+
         case "setSidebarWidth":
             guard let width = invocation.payload["width"] as? Double, width.isFinite else { return }
             sidebarLayout.setWidth(width)
@@ -482,18 +499,40 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case "deleteConversation":
             guard let assetID = invocation.payload["assetID"] as? String,
-                  let conversationID = invocation.payload["conversationID"] as? String else { return }
+                  let conversationID = invocation.payload["conversationID"] as? String,
+                  invocation.payload["confirmed"] as? Bool == true,
+                  store.conversation(assetID: assetID, conversationID: conversationID) != nil else { return }
+            if store.state.lastActive?.assetID == assetID && store.state.lastActive?.conversationID == conversationID { cancelPendingAnswer(); selectionCandidate = nil }
             summaryJobs.cancel(assetID: assetID, conversationID: conversationID)
-            store.deleteConversation(assetID: assetID, conversationID: conversationID)
-            pushState(message: "已删除对话")
+            let success = store.deleteConversation(assetID: assetID, conversationID: conversationID)
+            managementResult(success, message: success ? "对话及其消息、思考、摘要已删除" : store.lastWriteError ?? "删除失败", requestID: invocation.payload["requestID"] as? String)
 
         case "removeBook":
-            guard let assetID = invocation.payload["assetID"] as? String else { return }
-            for conversation in store.book(assetID: assetID)?.conversations ?? [] {
+            guard let assetID = invocation.payload["assetID"] as? String,
+                  invocation.payload["confirmed"] as? Bool == true,
+                  let book = store.book(assetID: assetID), book.assetID == assetID else { return }
+            // Stop local parsing too, even if another chat initiated it before deletion.
+            positionTask?.cancel(); pendingSourceImport = nil
+            if store.state.lastActive?.assetID == assetID { cancelPendingAnswer(); selectionCandidate = nil }
+            for conversation in book.conversations {
                 summaryJobs.cancel(assetID: assetID, conversationID: conversation.id)
             }
-            store.removeBook(assetID: assetID)
-            pushState(message: "已移出书库")
+            assistant.forgetBook(assetID: assetID)
+            do {
+                try BookDataRemoval(directory: AppPaths.supportDirectory).removeBook(assetID: assetID, store: store)
+                sidebarLayout.forgetBook(assetID: assetID)
+                ActiveBookResolver.shared.forget(assetIDs: book.sourceAssetIDs)
+                latestContext = latestSourceContext.map { $0.identified(by: store.canonicalAssetID($0.book.assetID)) }
+                managementResult(true, message: "BooksBridge 书籍资料、缓存和全部下属对话已删除，Apple Books 原书已保留", requestID: invocation.payload["requestID"] as? String)
+            } catch {
+                let removed = store.book(assetID: assetID) == nil
+                if removed {
+                    sidebarLayout.forgetBook(assetID: assetID)
+                    ActiveBookResolver.shared.forget(assetIDs: book.sourceAssetIDs)
+                    latestContext = latestSourceContext.map { $0.identified(by: store.canonicalAssetID($0.book.assetID)) }
+                }
+                managementResult(false, message: error.localizedDescription, requestID: invocation.payload["requestID"] as? String, recordRemoved: removed)
+            }
 
         case "backToLibrary":
             cancelPendingAnswer()
@@ -628,6 +667,61 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   3. 回查图书 App 的书库数据库
     ///   4. 都没有才退化为 assetID
     private func openBook(assetID: String) {
+        if let existing = store.book(assetID: assetID) { enterBook(assetID: existing.assetID); return }
+        cancelPendingAnswer()
+        pendingSourceImport = nil
+        positionTask = Task { @MainActor in
+            do {
+                guard let book = try await Task.detached(operation: { try BooksStore().book(assetID: assetID) }).value else { throw ReadingAssistant.AssistantError.notLoaded }
+                guard let path = book.path else { throw ReadingAssistant.AssistantError.noLocalFile }
+                let source = try await Task.detached { try BookSourceIdentity.read(at: URL(fileURLWithPath: path)) }.value
+                try Task.checkCancellation()
+                // Verify identities at import time without rewriting IDs or conversations.
+                for stored in store.state.books {
+                    let ids = stored.sourceAssetIDs
+                    let identity = try? await Task.detached { () -> BookSourceIdentity? in
+                        for id in ids {
+                            if let original = try BooksStore().book(assetID: id), let path = original.path {
+                                return try BookSourceIdentity.read(at: URL(fileURLWithPath: path))
+                            }
+                        }
+                        return nil
+                    }.value
+                    try Task.checkCancellation()
+                    if let identity { store.bindSource(assetID: stored.assetID, identity: identity) }
+                }
+                let matches = store.state.books.filter { $0.sourceIdentity.map { $0.isSameFile(as: source) || $0.fingerprint == source.fingerprint } == true }
+                if !matches.isEmpty {
+                    let id = UUID().uuidString
+                    pendingSourceImport = (id, book, source, matches.map(\.assetID))
+                    bridge.push(["sourceImport": ["requestID": id, "title": book.title, "matches": matches.map { ["assetID": $0.assetID, "title": $0.displayTitle, "author": $0.author, "path": $0.sourceIdentity?.canonicalPath ?? "", "conversationCount": String($0.conversations.count)] }]])
+                } else {
+                    store.addBook(assetID: assetID, title: book.title, author: book.displayAuthor ?? "")
+                    store.bindSource(assetID: assetID, identity: source)
+                    enterBook(assetID: assetID)
+                }
+            } catch is CancellationError {} catch { managementResult(false, message: "读取书籍文件失败：\(error.localizedDescription)") }
+        }
+    }
+
+    private func resolveSourceImport(_ payload: [String: Any]) {
+        guard let pending = pendingSourceImport, payload["requestID"] as? String == pending.id else { return }
+        pendingSourceImport = nil
+        if payload["cancelled"] as? Bool == true { return }
+        if let target = payload["assetID"] as? String, pending.matches.contains(target) {
+            guard store.linkSource(assetID: target, incomingID: pending.book.assetID, identity: pending.source) else {
+                managementResult(false, message: store.lastWriteError ?? "源文件关联失败，请重新添加。"); return
+            }
+            latestContext = latestSourceContext.map { $0.identified(by: store.canonicalAssetID($0.book.assetID)) }
+            enterBook(assetID: target)
+        } else if payload["separate"] as? Bool == true {
+            store.addBook(assetID: pending.book.assetID, title: pending.book.title, author: pending.book.displayAuthor ?? "")
+            store.bindSource(assetID: pending.book.assetID, identity: pending.source)
+            enterBook(assetID: pending.book.assetID)
+        }
+    }
+
+    private func enterBook(assetID: String) {
         cancelPendingAnswer()
         var title: String?
         var author: String?
@@ -660,6 +754,46 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("[BooksBridge] 进入《\(resolvedTitle)》的 workspace，对话数=\(book?.conversations.count ?? 0)")
         pushState(message: "已进入《\(resolvedTitle)》")
         prepareBook(assetID: assetID)
+    }
+
+    private func managementResult(_ success: Bool, message: String, requestID: String? = nil, recordRemoved: Bool = false) {
+        pushState(message: message)
+        bridge.push(["managementResult": ["success": success, "message": message, "requestID": requestID ?? "", "recordRemoved": recordRemoved]])
+        statusItem.refreshTooltip()
+    }
+
+    private func requestBookIdentification() {
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
+            do {
+                let (snapshot, books) = try await Task.detached { (try AccessibilityReader().snapshot(), try BooksStore().allBooks()) }.value
+                try Task.checkCancellation()
+                guard snapshot.isReaderView else { managementResult(false, message: "请先在 Apple Books 中打开书籍正文。"); return }
+                let id = UUID().uuidString
+                pendingBookIdentification = (id, snapshot, books.filter { $0.path != nil })
+                bridge.push(["bookIdentification": ["requestID": id, "windowTitle": snapshot.windowTitles.first ?? "阅读窗口",
+                    "books": books.filter { $0.path != nil }.map { ["assetID": $0.assetID, "title": $0.title, "author": $0.displayAuthor ?? "", "path": $0.path ?? ""] }]])
+            } catch is CancellationError {} catch { managementResult(false, message: "无法读取当前窗口：\(error.localizedDescription)") }
+        }
+    }
+
+    private func confirmBookIdentification(_ payload: [String: Any]) {
+        guard let pending = pendingBookIdentification, payload["requestID"] as? String == pending.id,
+              let id = payload["assetID"] as? String, pending.books.contains(where: { $0.assetID == id }) else { return }
+        pendingBookIdentification = nil
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
+            do {
+                let snapshot = try await Task.detached { try AccessibilityReader().snapshot() }.value
+                try Task.checkCancellation()
+                guard ActiveBookResolver.shared.token(for: snapshot) == ActiveBookResolver.shared.token(for: pending.snapshot) else {
+                    managementResult(false, message: "阅读页面已变化，请重新确认当前书籍。"); return
+                }
+                ActiveBookResolver.shared.confirm(snapshot: snapshot, assetID: id)
+                coordinator?.refresh()
+                managementResult(true, message: "已确认当前页面对应的书籍；页面变化后会重新核对。")
+            } catch is CancellationError {} catch { managementResult(false, message: error.localizedDescription) }
+        }
     }
 
     /// 保存前端提交的设置。
@@ -718,12 +852,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// A single refresh path for opening, /now, questions and summaries.
     private func refreshConversation(assetID: String, conversationID: String) async throws -> (BooksBridgeCore.Book, ReadingSnapshot, ReadingContext?) {
+        guard let stored = store.book(assetID: assetID), store.conversation(assetID: assetID, conversationID: conversationID) != nil else { throw CancellationError() }
         let previous = store.conversation(assetID: assetID, conversationID: conversationID)?.readingSnapshot
+        let sourceIDs = stored.sourceAssetIDs
         let fresh = try await Task.detached {
-            guard let book = try BooksStore().book(assetID: assetID) else { throw ReadingAssistant.AssistantError.notLoaded }
-            return (book, ReadingCoordinator().makeContext())
+            let live = ReadingCoordinator().makeContext()
+            var book = live.flatMap { sourceIDs.contains($0.book.assetID) ? $0.book : nil }
+            if book == nil { for id in sourceIDs.reversed() { if let candidate = try BooksStore().book(assetID: id), candidate.path != nil { book = candidate; break } } }
+            guard let book, let path = book.path else { throw ReadingAssistant.AssistantError.notLoaded }
+            let source = try BookSourceIdentity.read(at: URL(fileURLWithPath: path))
+            return (book.identified(by: assetID), live.map { sourceIDs.contains($0.book.assetID) ? $0.identified(by: assetID) : $0 }, source)
         }.value
         try Task.checkCancellation()
+        guard store.conversation(assetID: assetID, conversationID: conversationID) != nil else { throw CancellationError() }
+        store.bindSource(assetID: assetID, identity: fresh.2)
         let snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: previous)
         try Task.checkCancellation()
         store.updateReading(assetID: assetID, conversationID: conversationID, snapshot: snapshot)
@@ -733,7 +875,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func prepareBook(assetID: String) {
         guard let id = store.state.lastActive?.conversationID,
-              store.conversation(assetID: assetID, conversationID: id)?.archivedAt == nil else { return }
+              let conversation = store.conversation(assetID: assetID, conversationID: id), conversation.archivedAt == nil else { return }
         positionTask?.cancel()
         positionTask = Task { @MainActor in
             do {
@@ -1018,6 +1160,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !booksRunning { return "booksNotRunning" }
         if let issue, issue.contains("kLastCurrentBookKey") { return "noBookOpen" }
+        if let issue, issue.contains("无法唯一匹配") { return "ambiguousBook" }
         if issue != nil { return "transientError" }
         return "waiting"
     }
@@ -1145,6 +1288,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor [weak self] in
                 guard let self, self.connectionGeneration == generation else { return }
                 self.latestContext = nil
+                self.latestSourceContext = nil
                 self.detectionIssue = message
                 self.statusItem.refreshTooltip()
                 self.pushState(message: "采集受阻")
@@ -1154,7 +1298,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // 回调在 coordinator 的队列上，切回主线程再碰 AppKit / WebView
             Task { @MainActor [weak self] in
                 guard let self, self.connectionGeneration == generation else { return }
-                self.latestContext = context
+                self.latestSourceContext = context
+                self.latestContext = context.identified(by: self.store.canonicalAssetID(context.book.assetID))
                 self.detectionIssue = nil
                 self.refreshStatusLine()
                 self.pushState(message: "阅读位置已更新")
@@ -1231,7 +1376,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let jobs = store.state.books.flatMap { book in book.conversations.compactMap { conversation -> [String: String]? in
             guard let status = conversation.summaryStatus else { return nil }
-            return ["title": book.title + " · " + conversation.title, "status": status]
+            return ["title": book.displayTitle + " · " + conversation.displayTitle, "status": status]
         } }
         var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": jobs, "sidebarLayout": sidebarLayout.payload]
         body["assistant"] = ["preparation": "本地章节地图 · 摘要按需生成", "ready": false]
@@ -1265,7 +1410,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
             var detected: [String: Any] = [
                 "assetID": book.assetID,
-                "title": book.title,
+                "title": store.book(assetID: book.assetID)?.displayTitle ?? book.title,
                 "author": book.displayAuthor ?? "",
                 "progress": book.progress,
                 "kind": book.contentType.label,
@@ -1298,12 +1443,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         body["library"] = store.state.books.map { book -> [String: Any] in
             [
                 "assetID": book.assetID,
-                "title": book.title,
+                "title": book.displayTitle,
+                "originalTitle": book.title,
+                "customTitle": book.customTitle ?? "",
                 "author": book.author,
                 "conversations": book.conversations.map { conversation -> [String: Any] in
                     [
                         "id": conversation.id,
-                        "title": conversation.title,
+                        "title": conversation.displayTitle,
+                        "customTitle": conversation.customTitle ?? "",
                         "messageCount": conversation.messages.count,
                         "archived": conversation.archivedAt != nil,
                         "summaryStatus": conversation.summaryStatus ?? "",

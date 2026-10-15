@@ -124,9 +124,8 @@ public final class ReadingCoordinator: @unchecked Sendable {
 
     /// 采集一次完整快照。返回 nil 表示当前没有可用的阅读上下文。
     public func activeBookID() -> String? {
-        guard let snapshot = try? axReader.snapshot(), let title = snapshot.windowTitles.first else { return nil }
-        let books = (try? store.books(titled: title)) ?? []
-        return Self.matchActiveBook(title: title, books: books)?.assetID
+        guard let snapshot = try? axReader.snapshot() else { return nil }
+        return ActiveBookResolver.shared.resolve(snapshot: snapshot, books: (try? store.allBooks()) ?? [])?.assetID
     }
 
     public static func matchActiveBook(title: String, books: [Book]) -> Book? {
@@ -139,8 +138,8 @@ public final class ReadingCoordinator: @unchecked Sendable {
             onIssue?("缺少完全磁盘访问权限，无法读取图书数据")
             return nil
         }
-        guard let snapshot = try? axReader.snapshot(), let title = snapshot.windowTitles.first,
-              let book = Self.matchActiveBook(title: title, books: (try? store.books(titled: title)) ?? []) else {
+        guard let snapshot = try? axReader.snapshot(),
+              let book = ActiveBookResolver.shared.resolve(snapshot: snapshot, books: (try? store.allBooks()) ?? []) else {
             onIssue?("当前阅读窗口无法唯一匹配书籍，请在 Apple Books 中打开一本书")
             return nil
         }

@@ -56,6 +56,10 @@ Local commands do not require an API key. Generating a summary still requires co
 
 Drag books in the sidebar to reorder them, or use a book's **… → Move up / Move down** menu. The order is saved locally and does not move files in Apple Books. Use a chat's **… → Archive** action to hide it from the regular list. **Settings → Archived** lets you inspect and restore chats, retaining their reading mode, messages, position, and summaries. Running summary jobs continue after a chat is archived.
 
+Book and chat menus include **Rename**. Custom names are saved separately from source titles and automatic chat names; clearing the name restores the default. Archived chats can also be renamed or deleted. Deleting a book requires confirmation and removes its BooksBridge records, cached maps, summary documents, and all chats, including archived chats and saved reasoning. The original book in Apple Books is retained.
+
+Books use stable source identifiers rather than display names. When importing an identical file under another identifier, BooksBridge asks whether to associate it with an existing book or keep it separate. Active-book detection prefers the document's file path; when no path is available, it accepts a unique original-title match. Ambiguous matches require explicit confirmation for the current page.
+
 Chat names use their first verified reading percentage and creation timestamp, for example `42% · 2026-10-15 18:30:00`. They remain stable as you keep reading. A chat without a verified position is labeled with unknown progress until one is available. Existing numbered chats use their saved position and creation time.
 
 Settings save when you switch sections or return to a book/chat in the sidebar. Click the Settings button again to return to the chat. Model-provided reasoning is saved with each reply, including interrupted output, and can be expanded or collapsed manually. The last manual expansion choice is retained; otherwise **Auto-expand reasoning** supplies the default. Reasoning is kept for display and is not included in subsequent model history. Previously unsaved reasoning cannot be recovered.
