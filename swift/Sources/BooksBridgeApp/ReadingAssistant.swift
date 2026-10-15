@@ -40,26 +40,32 @@ public final class ReadingAssistant {
         let epub: EpubDocument
         let chapters: [BookPreprocessor.Chapter]
         let map: BookMap
-        let statistics: BookStatistics
+        var statistics: BookStatistics
         var currentChapterIndex: Int?
     }
 
     /// Reparse locally so changed source cannot reuse an old page or summary.
-    public func refresh(book: Book, live: ReadingContext?, previous: ReadingSnapshot?) async throws -> ReadingSnapshot {
+    public func refresh(book: Book, live: ReadingContext?, previous: ReadingSnapshot?, persistMap: Bool = true) async throws -> ReadingSnapshot {
         let generation = sourceGenerations[book.assetID, default: 0]
         let cfi = live?.book.assetID == book.assetID ? live?.position?.cfi : nil
         let value = try await Task.detached { try Self.load(book: book, currentCFI: cfi) }.value
         try Task.checkCancellation()
         guard sourceGenerations[book.assetID, default: 0] == generation else { throw CancellationError() }
         loaded = value
-        try FileManager.default.createDirectory(at: mapDirectory, withIntermediateDirectories: true)
-        // Hash identifiers so imported names cannot become paths.
-        try JSONEncoder().encode(value.map).write(to: mapDirectory.appendingPathComponent(BookDataRemoval.mapFilename(assetID: book.assetID)), options: .atomic)
+        if persistMap {
+            try FileManager.default.createDirectory(at: mapDirectory, withIntermediateDirectories: true)
+            // Hash identifiers so imported names cannot become paths.
+            try JSONEncoder().encode(value.map).write(to: mapDirectory.appendingPathComponent(BookDataRemoval.mapFilename(assetID: book.assetID)), options: .atomic)
+        }
         return try ReadingSnapshot.resolve(assetID: book.assetID, map: value.map, chapters: value.chapters, live: live, previous: previous)
     }
     public func reading(snapshot: ReadingSnapshot, scope: KnowledgeScope) throws -> ScopedReading {
         guard let loaded, snapshot.assetID == loaded.book.assetID else { throw AssistantError.notLoaded }
-        return try snapshot.reading(chapters: loaded.chapters, map: loaded.map, scope: scope)
+        return try snapshot.reading(chapters: loaded.chapters, map: loaded.map, scope: scope, statistics: loaded.statistics)
+    }
+    public func useStatistics(_ statistics: BookStatistics) {
+        guard loaded?.map.sourceHash == statistics.sourceHash else { return }
+        loaded?.statistics = statistics
     }
     public func cancelAnswer() { answerTask?.cancel(); answerTask = nil }
     public func forgetBook(assetID: String) {
@@ -158,7 +164,7 @@ public final class ReadingAssistant {
                 do {
                     if let snapshot {
                         guard snapshot.assetID == book.assetID else { throw ScopedReading.Failure.cannotLocatePage }
-                        allowed = try snapshot.reading(chapters: loaded.chapters, map: loaded.map, scope: scope)
+                        allowed = try snapshot.reading(chapters: loaded.chapters, map: loaded.map, scope: scope, statistics: loaded.statistics)
                     } else {
                         allowed = try ScopedReading.resolve(chapters: loaded.chapters,
                             current: loaded.currentChapterIndex, scope: scope, visible: visibleText)

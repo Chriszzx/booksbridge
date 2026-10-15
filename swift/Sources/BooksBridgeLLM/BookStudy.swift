@@ -10,7 +10,9 @@ public struct BookStatistics: Codable, Sendable, Equatable {
         public let sourceHash: String
         public let characterCount: Int
         public let estimatedTokens: Int
+        public var classifiedKind: String? = nil
         public var kind: String {
+            if let classifiedKind { return classifiedKind }
             let name = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if ["目录", "目次", "contents", "table of contents"].contains(name) { return "目录" }
             if name.hasPrefix("文档区段") || name == "正文前置内容" { return "未分类区段" }
@@ -26,6 +28,10 @@ public struct BookStatistics: Codable, Sendable, Equatable {
     public let documentCount: Int
     public let headingCount: Int
     public let sections: [Section]
+    public var structureVersion: String {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        return BookPreprocessor.contentHash(of: String(decoding: (try? encoder.encode(self)) ?? Data(), as: UTF8.self))
+    }
     public var chapterCount: Int { sections.filter { $0.kind == "章节" }.count }
 
     public static func build(map: BookMap, chapters: [BookPreprocessor.Chapter]) -> Self {
@@ -81,6 +87,10 @@ public struct ChapterDigest: Codable, Sendable, Equatable {
 
 public struct BookStudy: Codable, Sendable, Equatable {
     public var statistics: BookStatistics
+    public var localStatistics: BookStatistics?
+    public var appliedStructure: ChapterStructure?
+    public var proposedStructure: ChapterStructure?
+    public var structureStatus: String?
     public var chapters: [ChapterDigest] = []
     public var whole: ReadingSummary?
     public var wholeModel: String?
@@ -92,9 +102,28 @@ public struct BookStudy: Codable, Sendable, Equatable {
     }
     public mutating func reconcile(_ updated: BookStatistics) {
         guard statistics != updated else { return }
-        chapters = chapters.filter { digest in updated.sections.contains { $0.id == digest.sectionID && $0.sourceHash == digest.sourceHash } }
-        if statistics.sourceHash != updated.sourceHash { whole = nil; wholeModel = nil; status = "原文已变化，保留未变章节摘要，其余待更新" }
+        chapters = chapters.filter { digest in
+            guard let old = statistics.sections.first(where: { $0.id == digest.sectionID }) else { return false }
+            return updated.sections.contains { $0.id == digest.sectionID && $0.sourceHash == digest.sourceHash && $0.start == old.start && $0.end == old.end }
+        }
+        if statistics.structureVersion != updated.structureVersion { whole = nil; wholeModel = nil; status = "原文或章节结构已变化，保留未变章节摘要，其余待更新" }
         statistics = updated
+    }
+    public mutating func refreshLocal(_ updated: BookStatistics) {
+        guard (localStatistics ?? statistics) != updated else { return }
+        appliedStructure = nil; proposedStructure = nil; structureStatus = "本地结构已变化，请重新分析"
+        if localStatistics != nil { self.localStatistics = updated }
+        reconcile(updated)
+    }
+    public mutating func applyStructure(_ proposal: ChapterStructure) -> Bool {
+        guard proposal.sourceHash == statistics.sourceHash, proposal.baseVersion == statistics.structureVersion else { return false }
+        if localStatistics == nil { localStatistics = statistics }
+        reconcile(proposal.statistics); appliedStructure = proposal; proposedStructure = nil
+        structureStatus = "已应用辅助章节结构"; return true
+    }
+    public mutating func restoreLocalStructure() {
+        guard let localStatistics else { return }
+        reconcile(localStatistics); appliedStructure = nil; proposedStructure = nil; structureStatus = "已恢复本地章节结构"
     }
     public func allowedSections(snapshot: ReadingSnapshot, scope: KnowledgeScope) -> [BookStatistics.Section] {
         guard snapshot.sourceHash == statistics.sourceHash else { return [] }

@@ -4,6 +4,37 @@ import WebKit
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
+    func testStructurePreviewConfirmationAndNavigationNeverAutomaticallySends() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let checks = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          const structure = {assetID:'A',conversationID:'first',version:'v1',proposalID:'p1',status:'章节建议待确认',
+            issues:'缺少目录',running:false,applied:false,structureChanged:false,scopeConfirmed:false,oldCount:1,newCount:3,uncertain:1,
+            rows:['1. 第一卷 · 卷引言','2. 范围外标题 · 章节']};
+          booksbridge.onState({active:{assetID:'A',conversationID:'first',scope:'currentChapter',messages:[]},chapterStructure:structure});
+          $('summary-status').click(); $('structure-panel').open = true;
+          const preview = $('structure-preview').textContent.includes('1 个区段 → 建议 3') && $('structure-scope').hidden;
+          $('structure-analyze').click();
+          const disclosure = $('structure-confirm').open && $('structure-confirm-text').textContent.includes('未读内容');
+          $('structure-no').click(); $('structure-apply').click();
+          const invalidation = $('structure-confirm-text').textContent.includes('其余章节及全书摘要');
+          booksbridge.onState({active:{assetID:'A',conversationID:'second',scope:'currentChapter',messages:[]},chapterStructure:{...structure,conversationID:'second',structureChanged:true}});
+          const reset = !$('structure-confirm').open && !$('structure-scope').hidden;
+          $('summary-status').click(); $('structure-scope').click(); $('structure-yes').click();
+          return {preview,disclosure,invalidation,reset};
+        })()
+        """) as! [String: Bool]
+        for (key,value) in checks { XCTAssertTrue(value,key) }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertFalse(calls.calls.contains { ["analyzeStructure", "applyStructure", "ask", "testAPI", "reprocessBook"].contains($0["type"] as? String ?? "") })
+        let confirmed = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "confirmStructureScope" }?["payload"] as? [String: Any])
+        XCTAssertEqual(confirmed["conversationID"] as? String, "second")
+        XCTAssertEqual(confirmed["version"] as? String, "v1")
+        XCTAssertEqual(confirmed["confirmed"] as? Bool, true)
+    }
+
     func testSharedSummaryStatisticsSurviveConversationSwitchAndClearRequiresConfirmation() async throws {
         let (view, calls) = try await workspaceFixture()
         defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }

@@ -1127,3 +1127,7 @@ button:disabled { cursor: default; opacity: .45; }
 #chapter-statistics summary { cursor: pointer; color: var(--muted); }
 #chapter-statistics-list { max-height: 220px; overflow-y: auto; }
 .chapter-stat-row { line-height: 1.6; padding: 7px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+
+#structure-panel { margin-top: 12px; }
+#structure-preview { max-height: 240px; overflow-y: auto; }
+#structure-panel .dialog-actions { flex-wrap: wrap; }

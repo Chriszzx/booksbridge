@@ -1,7 +1,7 @@
 import Foundation
 
 /// One local source, three permissions. Offsets are in normalized Unicode scalars.
-public struct ReadingBoundary: Codable, Sendable, Equatable, Comparable {
+public struct ReadingBoundary: Codable, Sendable, Equatable, Comparable, Hashable {
     public let chapter: Int
     public let end: Int
     public init(chapter: Int, end: Int) { self.chapter = chapter; self.end = end }

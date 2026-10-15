@@ -29,7 +29,8 @@ final class SummaryJobs {
             @MainActor func current() throws -> BookStudy {
                 try Task.checkCancellation()
                 guard generations[key] == generation, let saved = store.book(assetID: key), saved.libraryID == libraryID,
-                      let study = saved.study, study.statistics.sourceHash == snapshot.sourceHash else { throw CancellationError() }
+                      let study = saved.study, study.statistics.sourceHash == snapshot.sourceHash,
+                      study.statistics.structureVersion == original.statistics.structureVersion else { throw CancellationError() }
                 return study
             }
             @MainActor func save(_ study: BookStudy) throws {

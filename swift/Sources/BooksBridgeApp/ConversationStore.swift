@@ -46,6 +46,7 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var scope: KnowledgeScope?
     /// 旧对话没有范围记录，其旧历史保留展示但不送入新的 agent。
     public var scopeHistoryStartIndex: Int?
+    public var confirmedStructureVersion: String?
     public var readingSnapshot: ReadingSnapshot?
     public var summary: ReadingSummary?
     public var summaryStatus: String?
@@ -176,6 +177,9 @@ public final class ConversationStore {
                 state.books[bi].study?.status = "摘要任务已中断；已完成章节保留，可继续生成"
                 migratedTitles = true
             }
+            if state.books[bi].study?.structureStatus?.hasPrefix("正在") == true {
+                state.books[bi].study?.structureStatus = "章节分析已中断，请手动重新分析"; migratedTitles = true
+            }
             for ci in state.books[bi].conversations.indices {
                 var conversation = state.books[bi].conversations[ci]
                 if conversation.customTitle == nil, conversation.title.range(of: "^对话 [0-9]+$", options: .regularExpression) != nil {
@@ -207,7 +211,7 @@ public final class ConversationStore {
     public func updateStatistics(assetID: String, statistics: BookStatistics) -> Bool {
         guard let book = book(assetID: assetID) else { return false }
         var study = book.study ?? BookStudy(statistics: statistics)
-        study.reconcile(statistics)
+        study.refreshLocal(statistics)
         // Legacy full-book summaries are safe to reuse only for the exact same source.
         if book.study == nil, let legacy = book.conversations.compactMap(\.summary)
             .filter({ $0.scope == .wholeBook && $0.sourceHash == statistics.sourceHash })
@@ -223,12 +227,27 @@ public final class ConversationStore {
     public func clearStudy(assetID: String) -> Bool {
         guard let index = state.books.firstIndex(where: { $0.assetID == assetID }), let statistics = state.books[index].study?.statistics else { return false }
         let previous = state
-        state.books[index].study = BookStudy(statistics: statistics)
+        var cleared = state.books[index].study ?? BookStudy(statistics: statistics)
+        cleared.chapters = []; cleared.whole = nil; cleared.wholeModel = nil; cleared.status = "尚未生成章节摘要"
+        state.books[index].study = cleared
         for i in state.books[index].conversations.indices {
             state.books[index].conversations[i].summary = nil
             state.books[index].conversations[i].summaryStatus = nil
         }
         return persistOrRollback(previous)
+    }
+
+    public func confirmStructure(assetID: String, conversationID: String, version: String) -> Bool {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              state.books[bi].study?.statistics.structureVersion == version,
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }) else { return false }
+        let previous = state
+        state.books[bi].conversations[ci].confirmedStructureVersion = version
+        return persistOrRollback(previous)
+    }
+    public func structurePermissionRequired(assetID: String, conversationID: String, scope: KnowledgeScope) -> Bool {
+        guard scope == .currentChapter, let study = book(assetID: assetID)?.study, study.localStatistics != nil else { return false }
+        return conversation(assetID: assetID, conversationID: conversationID)?.confirmedStructureVersion != study.statistics.structureVersion
     }
 
     private static func load(from url: URL, fileManager: FileManager) -> StoredState {

@@ -321,6 +321,39 @@
     menu.style.left = `${Math.max(8, Math.min(r.left, innerWidth - menu.offsetWidth - 8))}px`;
     menu.style.top = `${Math.max(8, Math.min(r.top - menu.offsetHeight - 6, innerHeight - menu.offsetHeight - 8))}px`;
   }
+  let chapterStructure = null;
+  let pendingStructureAction = null;
+  function renderStructure(value) {
+    chapterStructure = value;
+    $("structure-status").textContent = value?.status || "请先读取本地书籍";
+    $("structure-issues").textContent = value?.issues || "未检测到明显结构问题，可按需检查。";
+    $("structure-analyze").disabled = !value || value.running || chatState.streaming;
+    $("structure-cancel").hidden = !value?.running;
+    $("structure-restore").hidden = !value?.applied;
+    $("structure-apply").hidden = !value?.proposalID;
+    $("structure-discard").hidden = !value?.proposalID;
+    $("structure-scope").hidden = !(value?.structureChanged && !value?.scopeConfirmed && (state.active?.scope || chatState.scope) === "currentChapter");
+    $("structure-preview").replaceChildren();
+    if (value?.proposalID) {
+      const counts = document.createElement("p");
+      counts.textContent = `当前 ${value.oldCount} 个区段 → 建议 ${value.newCount} 个区段；${value.uncertain} 个不确定节点，请核对。范围外标题已隐藏。`;
+      $("structure-preview").append(counts);
+      for (const text of value.rows || []) { const row = document.createElement("p"); row.className = "chapter-stat-row"; row.textContent = text; $("structure-preview").append(row); }
+    }
+  }
+  function confirmStructureAction(action) {
+    if (!chapterStructure) return;
+    pendingStructureAction = {action, payload:{assetID:chapterStructure.assetID, conversationID:chapterStructure.conversationID,
+      version:chapterStructure.version, proposalID:chapterStructure.proposalID, confirmed:true}};
+    const text = {
+      analyzeStructure: ["分析全书章节结构？", `将全书候选标题、层级、位置和每个候选附近最多 160 个非空白字符（可能包含未读内容）发送至 ${settingsState.settings?.baseURL || "当前接口"}，使用 ${settingsState.settings?.model || "当前模型"} 分批分析，会产生 API 用量。每批遵守所设上下文预算。结果仅作为结构建议，不进入聊天上下文；不会自动生成摘要或改变阅读权限。`],
+      applyStructure: ["应用这份章节方案？", "书籍下所有对话共享新结构。保留边界和正文未变的章节摘要，其余章节及全书摘要重新生成。运行中的回答和摘要将停止。整章模式的对话需分别确认新的读取范围；读到这里的原文位置不变。"],
+      restoreStructure: ["恢复本地章节结构？", "恢复由原书目录和标题构建的章节地图。会停止正在进行的回答和摘要，清理失效摘要，整章对话需要重新确认范围。Apple Books 原书不变。"],
+      confirmStructureScope: ["确认本对话新的整章范围？", "本对话将按照当前章节统计读取：当前所在章节的完整内容及之前全部章节。这可能比原结构包含更多未读文字。请先核对章节统计；确认仅对本对话及当前结构版本生效。"]
+    }[action];
+    $("structure-confirm-title").textContent = text[0]; $("structure-confirm-text").textContent = text[1];
+    $("structure-confirm").showModal(); $("structure-no").focus();
+  }
   function openPanel(kind) {
     $("reading-panel-title").textContent = kind === "scope" ? "本轮读取范围" : "阅读摘要";
     $("range-panel").hidden = kind !== "scope"; $("summary-panel").hidden = kind === "scope";
@@ -1210,7 +1243,8 @@
     retryBackup = null; renderedMessagesSignature = null;
     renderedConversationKey = key;
     clearSelection(); closeMenus(); hideCommands();
-    for (const id of ["reading-panel", "prepare-confirm"]) if ($(id).open) $(id).close();
+    pendingStructureAction = null;
+    for (const id of ["reading-panel", "prepare-confirm", "structure-confirm"]) if ($(id).open) $(id).close();
     els.input.value = ""; autoGrow();
     $("command-feedback").hidden = true;
     $("summary-status").textContent = "未生成摘要";
@@ -1312,6 +1346,7 @@
           $("chapter-statistics-list").append(row);
         }
       }
+      if (payload.chapterStructure !== undefined) renderStructure(payload.chapterStructure);
       if (payload.summaryMetadata !== undefined) $("summary-metadata").textContent = payload.summaryMetadata;
       if (payload.scopeSummary !== undefined) {
         document.getElementById("scope-summary").hidden = !payload.scopeSummary;
@@ -1523,6 +1558,7 @@
   els.scopePicker.addEventListener("change", () => {
     if (!state.active?.scope) chatState.scope = els.scopePicker.value;
     renderScopePicker();
+    renderStructure(chapterStructure);
   });
   document.querySelectorAll("[data-action]").forEach(el => el.addEventListener("click", () => runAction(el.dataset.action)));
   $("prepare-yes").addEventListener("click", () => {
@@ -1533,6 +1569,16 @@
     openPanel("summary");
   });
   $("prepare-no").addEventListener("click", () => $("prepare-confirm").close());
+  for (const [id, action] of [["analyze","analyzeStructure"],["apply","applyStructure"],["restore","restoreStructure"],["scope","confirmStructureScope"]]) {
+    $("structure-" + id).addEventListener("click", () => confirmStructureAction(action));
+  }
+  $("structure-cancel").addEventListener("click", () => { if (chapterStructure) invoke("cancelStructure", {assetID:chapterStructure.assetID}); });
+  $("structure-discard").addEventListener("click", () => { if (chapterStructure) invoke("discardStructure", {assetID:chapterStructure.assetID, proposalID:chapterStructure.proposalID}); });
+  $("structure-no").addEventListener("click", () => { pendingStructureAction = null; $("structure-confirm").close(); });
+  $("structure-yes").addEventListener("click", () => {
+    if (pendingStructureAction) invoke(pendingStructureAction.action, pendingStructureAction.payload);
+    pendingStructureAction = null; $("structure-confirm").close();
+  });
   let apiRequestID = "";
   const apiResult = document.getElementById("api-test-result");
   const apiTestButton = document.getElementById("api-test");

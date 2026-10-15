@@ -107,11 +107,12 @@ public struct ReadingSnapshot: Codable, Sendable, Equatable {
         return Self(assetID: assetID, sourceHash: map.sourceHash, page: nil, chapterTitle: "尚未定位", progress: 0)
     }
 
-    public func reading(chapters: [BookPreprocessor.Chapter], map: BookMap, scope: KnowledgeScope) throws -> ScopedReading {
+    public func reading(chapters: [BookPreprocessor.Chapter], map: BookMap, scope: KnowledgeScope, statistics: BookStatistics? = nil) throws -> ScopedReading {
         guard map.sourceHash == sourceHash, BookPreprocessor.contentHash(of: chapters) == sourceHash else { throw ScopedReading.Failure.cannotLocatePage }
         if scope == .wholeBook { return try ScopedReading.resolve(chapters: chapters, current: page?.chapter, scope: scope, visible: []) }
         guard let page else { throw ScopedReading.Failure.cannotLocatePage }
-        let statistics = scope == .currentChapter ? BookStatistics.build(map: map, chapters: chapters) : nil
+        let statistics = statistics ?? (scope == .currentChapter ? BookStatistics.build(map: map, chapters: chapters) : nil)
+        if let statistics, statistics.sourceHash != sourceHash { throw ScopedReading.Failure.cannotLocatePage }
         let boundary = scope == .currentChapter ? (statistics?.sections.first { $0.start < page && page <= $0.end }?.end ?? page) : page
         return try ScopedReading.prefix(chapters: chapters, through: boundary, current: page.chapter)
     }

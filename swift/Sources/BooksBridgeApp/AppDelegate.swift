@@ -35,6 +35,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String, reasoning: String, reasoningExpanded: Bool?)?
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
+    private let structureJobs = StructureJobs()
     private var selectionCandidate: ConfirmedReference?
     private var pendingSourceImport: (id: String, book: BooksBridgeCore.Book, source: BookSourceIdentity, matches: [String])?
     private var pendingBookIdentification: (id: String, snapshot: AccessibilityReader.Snapshot, books: [BooksBridgeCore.Book])?
@@ -124,6 +125,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         store = ConversationStore()
         settings = SettingsStore()
         summaryJobs.onUpdate = { [weak self] _ in self?.pushState(message: "书籍摘要状态已更新") }
+        structureJobs.onUpdate = { [weak self] _ in self?.pushState(message: "书籍章节状态已更新") }
         assistant.update(settings: settings.settings, apiKey: settings.apiKey)
         writeReport()
 
@@ -506,6 +508,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // Stop local parsing too, even if another chat initiated it before deletion.
             positionTask?.cancel(); pendingSourceImport = nil
             if store.state.lastActive?.assetID == assetID { cancelPendingAnswer(); selectionCandidate = nil }
+            structureJobs.cancel(assetID, store: store)
             summaryJobs.cancel(assetID: assetID, store: store)
             assistant.forgetBook(assetID: assetID)
             do {
@@ -588,6 +591,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 let cleared = store.clearStudy(assetID: active.assetID)
                 pushState(message: cleared ? "已清除本书共享摘要，章节统计保留" : "清除失败：\(store.lastWriteError ?? "未取得书籍统计")")
             }
+        case "analyzeStructure", "applyStructure", "restoreStructure", "discardStructure", "cancelStructure", "confirmStructureScope":
+            handleStructure(invocation.type, payload: invocation.payload)
         case "testAPI":
             testAPI(invocation.payload)
         case "showPermissions":
@@ -858,7 +863,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         try Task.checkCancellation()
         guard store.conversation(assetID: assetID, conversationID: conversationID) != nil else { throw CancellationError() }
         store.bindSource(assetID: assetID, identity: fresh.2)
-        let snapshot: ReadingSnapshot
+        var snapshot: ReadingSnapshot
         do { snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: previous) }
         catch {
             // Page recognition can fail while the local book statistics remain valid.
@@ -870,6 +875,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let statistics = assistant.currentStatistics {
             guard store.updateStatistics(assetID: assetID, statistics: statistics) else { throw SummaryJobs.JobError.writeFailed }
+        }
+        if let study = store.book(assetID: assetID)?.study {
+            assistant.useStatistics(study.statistics)
+            if let page = snapshot.page, let section = study.statistics.sections.first(where: { $0.start < page && page <= $0.end }) {
+                snapshot = ReadingSnapshot(assetID: snapshot.assetID, sourceHash: snapshot.sourceHash, page: page, chapterTitle: section.title,
+                    progress: snapshot.progress, capturedAt: snapshot.capturedAt, reused: snapshot.reused)
+            }
         }
         try Task.checkCancellation()
         store.updateReading(assetID: assetID, conversationID: conversationID, snapshot: snapshot)
@@ -898,6 +910,64 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func validateStructurePermission(assetID: String, conversationID: String, scope: KnowledgeScope) throws {
+        if store.structurePermissionRequired(assetID: assetID, conversationID: conversationID, scope: scope) {
+            throw NSError(domain: "BooksBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "章节结构已改变。请在摘要面板确认本对话新的整章范围，再发送或生成摘要。"])
+        }
+    }
+
+    private func handleStructure(_ action: String, payload: [String: Any]) {
+        guard let assetID = payload["assetID"] as? String, let stored = store.book(assetID: assetID) else { return }
+        if action == "cancelStructure" { structureJobs.cancel(assetID, store: store); return }
+        if action == "discardStructure" {
+            guard var study = stored.study, study.proposedStructure?.id.uuidString == payload["proposalID"] as? String else { return }
+            study.proposedStructure = nil; study.structureStatus = "已放弃章节建议，原有结构保留"
+            let saved = store.saveStudy(assetID: assetID, study: study)
+            pushState(message: saved ? "章节建议已放弃" : "保存失败，章节建议仍保留"); return
+        }
+        guard payload["confirmed"] as? Bool == true else { return }
+        if action == "confirmStructureScope" {
+            guard let id = payload["conversationID"] as? String, let version = payload["version"] as? String else { return }
+            let ok = store.confirmStructure(assetID: assetID, conversationID: id, version: version)
+            pushState(message: ok ? "已确认本对话新的整章范围" : "结构已变化，请重新确认"); return
+        }
+        guard connectionRequested, dataAccess.isGranted, let path = stored.sourceIdentity?.canonicalPath else {
+            pushState(message: "请先连接并读取本地书籍，再整理章节"); return
+        }
+        let book = BooksBridgeCore.Book(assetID: assetID, title: stored.title, author: stored.author, progress: 0, contentType: .epub, path: path, lastOpened: nil)
+        if action == "analyzeStructure" {
+            guard assistant.isConfigured else { pushState(message: "请先配置模型接口"); return }
+            structureJobs.start(book: book, settings: settings.settings, apiKey: settings.apiKey, store: store); return
+        }
+        guard action == "applyStructure" || action == "restoreStructure" else { return }
+        // Re-read the source without asking Apple Books to navigate or change anything.
+        Task { @MainActor in
+            do {
+                let loader = ReadingAssistant(settings: settings.settings, apiKey: "")
+                _ = try await loader.refresh(book: book, live: nil, previous: nil, persistMap: false)
+                guard store.book(assetID: assetID)?.libraryID == stored.libraryID, let local = loader.currentStatistics,
+                      store.updateStatistics(assetID: assetID, statistics: local), var study = store.book(assetID: assetID)?.study,
+                      study.statistics.structureVersion == payload["version"] as? String else { throw ChapterStructure.Failure.invalid }
+                if action == "applyStructure" {
+                    guard let proposal = study.proposedStructure, proposal.id.uuidString == payload["proposalID"] as? String,
+                          study.applyStructure(proposal) else { throw ChapterStructure.Failure.invalid }
+                } else { study.restoreLocalStructure() }
+                cancelPendingAnswer(); positionTask?.cancel()
+                summaryJobs.cancel(assetID: assetID, store: store); structureJobs.cancel(assetID, store: store)
+                guard store.saveStudy(assetID: assetID, study: study) else { throw SummaryJobs.JobError.writeFailed }
+                if assistant.currentBook?.assetID == assetID { assistant.useStatistics(study.statistics) }
+                for conversation in store.book(assetID: assetID)?.conversations ?? [] {
+                    guard let old = conversation.readingSnapshot, old.sourceHash == study.statistics.sourceHash, let page = old.page,
+                          let section = study.statistics.sections.first(where: { $0.start < page && page <= $0.end }) else { continue }
+                    store.updateReading(assetID: assetID, conversationID: conversation.id,
+                        snapshot: ReadingSnapshot(assetID: assetID, sourceHash: old.sourceHash, page: page, chapterTitle: section.title,
+                            progress: old.progress, capturedAt: old.capturedAt, reused: old.reused))
+                }
+                pushState(message: "章节结构已更新；整章模式需在各对话确认新的读取范围")
+            } catch { pushState(message: "章节结构未应用：\(error.localizedDescription)") }
+        }
+    }
+
     private func generateSummary(_ payload: [String: Any]) {
         guard let active = store.state.lastActive, let id = active.conversationID,
               store.conversation(assetID: active.assetID, conversationID: id)?.archivedAt == nil else { return }
@@ -907,6 +977,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         positionTask = Task { @MainActor in
             do {
                 let (book, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
+                try validateStructurePermission(assetID: active.assetID, conversationID: id, scope: scope)
                 _ = try assistant.reading(snapshot: snapshot, scope: scope)
                 summaryJobs.start(book: book, snapshot: snapshot, chapters: assistant.currentChapters,
                     scope: scope, settings: settings.settings, apiKey: settings.apiKey, store: store)
@@ -977,6 +1048,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 let (_, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
                 let scope = store.conversation(assetID: active.assetID, conversationID: id)?.scope
                     ?? (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
+                try validateStructurePermission(assetID: active.assetID, conversationID: id, scope: scope)
                 let reading = try assistant.reading(snapshot: snapshot, scope: scope)
                 guard store.state.lastActive?.assetID == active.assetID, store.state.lastActive?.conversationID == id else { return }
                 bridge.push(["readingCheck": "\(snapshot.label) · 可读取 \(reading.chapters.reduce(0) { $0 + $1.text.count }) 字 · 本地检查，未调用 API"])
@@ -1057,6 +1129,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     bridge.push(["positionCard": snapshot.label])
                 }
+                try validateStructurePermission(assetID: assetID, conversationID: conversationID, scope: scope)
                 let allowed = try assistant.reading(snapshot: snapshot, scope: scope)
                 if retryID != nil, !ConfirmedReference.canReplay(question: question, reading: allowed) { throw SelectionError.invalid }
                 var prompt = request
@@ -1391,16 +1464,34 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         body["scopeSummary"] = ""
         body["summaryMetadata"] = "尚未生成摘要"
         body["bookStatistics"] = NSNull()
+        body["chapterStructure"] = NSNull()
         if let active = store.state.lastActive, let id = active.conversationID,
            let conversation = store.conversation(assetID: active.assetID, conversationID: id) {
             body["readingPosition"] = conversation.readingSnapshot?.label ?? "尚未取得有效阅读位置"
             if let study = store.book(assetID: active.assetID)?.study {
                 let scope = conversation.scope ?? settings.settings.defaultScope
-                let safe = conversation.readingSnapshot.flatMap { study.summary(snapshot: $0, scope: scope) }
+                let proposal = study.proposedStructure
+                let page = conversation.readingSnapshot?.sourceHash == study.statistics.sourceHash ? conversation.readingSnapshot?.page : nil
+                body["chapterStructure"] = ["assetID": active.assetID, "conversationID": id,
+                    "version": study.statistics.structureVersion, "proposalID": proposal?.id.uuidString ?? "",
+                    "status": structureJobs.failure(active.assetID) ?? study.structureStatus ?? "尚未使用辅助章节整理",
+                    "issues": ChapterStructure.issues(study.localStatistics ?? study.statistics).joined(separator: "；"),
+                    "running": structureJobs.isRunning(active.assetID), "applied": study.appliedStructure != nil,
+                    "structureChanged": study.localStatistics != nil, "scopeConfirmed": conversation.confirmedStructureVersion == study.statistics.structureVersion,
+                    "needsConfirmation": store.structurePermissionRequired(assetID: active.assetID, conversationID: id, scope: scope),
+                    "oldCount": study.statistics.sections.count, "newCount": proposal?.statistics.sections.count ?? 0,
+                    "uncertain": proposal?.uncertainCount ?? 0,
+                    "rows": proposal?.nodes.enumerated().map { index, node -> String in
+                        let title = scope == .wholeBook || page.map { node.start < $0 } == true ? node.title : "范围外标题"
+                        let level = node.parentID == nil ? "" : "↳ "
+                        return "\(index + 1). \(level)\(title) · \(ChapterStructure.label(node.kind)) · 文档 \(node.start.chapter + 1):\(node.start.end) · \(node.startsSection ? "独立区段" : "合入前章")\(node.confidence < 0.75 || node.kind == "unknown" ? " · 待核对" : "")"
+                    } ?? []] as [String: Any]
+                let needsScopeConfirmation = store.structurePermissionRequired(assetID: active.assetID, conversationID: id, scope: scope)
+                let safe = needsScopeConfirmation ? nil : conversation.readingSnapshot.flatMap { study.summary(snapshot: $0, scope: scope) }
                 body["scopeSummary"] = safe?.text ?? ""
                 body["summaryMetadata"] = (safe?.coverageLabel ?? "当前范围暂无可用摘要") + (study.whole != nil && scope != .wholeBook ? " · 全书摘要已生成，当前权限不读取" : "")
                 body["assistant"] = ["preparation": summaryJobs.failureStatus(assetID: active.assetID) ?? study.status, "ready": safe != nil, "hasSharedSummary": study.completedCount > 0 || study.whole != nil]
-                let allowed = conversation.readingSnapshot.map { study.allowedSections(snapshot: $0, scope: scope).map(\.id) } ?? []
+                let allowed = conversation.readingSnapshot.map { study.allowedSections(snapshot: $0, scope: needsScopeConfirmation ? .upToProgress : scope).map(\.id) } ?? []
                 body["bookStatistics"] = ["characters": study.statistics.characterCount, "estimatedTokens": study.statistics.estimatedTokens,
                     "documents": study.statistics.documentCount, "headings": study.statistics.headingCount, "chapterCount": study.statistics.chapterCount,
                     "completed": study.completedCount, "wholeComplete": study.whole != nil,

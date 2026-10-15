@@ -295,12 +295,20 @@
     <section id="summary-panel">
       <p id="book-statistics" class="empty-hint">正在读取本地书籍统计…</p>
       <details id="chapter-statistics"><summary>章节统计与生成情况</summary><div id="chapter-statistics-list"></div></details>
+      <details id="structure-panel"><summary>辅助整理章节</summary>
+        <p id="structure-status" role="status"></p><p id="structure-issues" class="empty-hint"></p>
+        <p class="empty-hint">确认后发送全书候选标题和边界附近的少量文字。建议先预览再应用；不修改 Apple Books 原书。</p>
+        <div id="structure-preview"></div>
+        <div class="dialog-actions"><button id="structure-analyze" class="btn-plain">分析章节结构</button><button id="structure-cancel" class="btn-plain" hidden>取消分析</button><button id="structure-restore" class="btn-plain" hidden>恢复本地结构</button></div>
+        <div class="dialog-actions"><button id="structure-discard" class="btn-plain" hidden>放弃建议</button><button id="structure-apply" class="btn-primary" hidden>应用章节建议</button><button id="structure-scope" class="btn-primary" hidden>确认本对话整章范围</button></div>
+      </details>
       <div id="prep-bar" class="prep-bar"><span class="prep-dot"></span><span id="prep-text"></span></div>
       <p id="summary-metadata" class="empty-hint"></p>
       <div id="scope-summary" hidden><div id="scope-summary-text" class="msg-body"></div></div>
       <div class="dialog-actions"><button id="prep-clear" data-action="clearSummary" class="btn-plain" hidden>清除摘要</button><button id="prep-cancel" data-action="cancelSummary" class="btn-plain" hidden>取消生成</button><button id="prep-retry" data-action="generate" class="btn-primary">生成阅读摘要</button></div>
     </section>
   </dialog>
+  <dialog id="structure-confirm"><h3 id="structure-confirm-title"></h3><p id="structure-confirm-text"></p><div class="dialog-actions"><button id="structure-no" class="btn-plain">取消</button><button id="structure-yes" class="btn-primary">确认</button></div></dialog>
   <dialog id="prepare-confirm" aria-labelledby="prepare-title"><h3 id="prepare-title">生成当前范围摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
   <dialog id="management-dialog" aria-labelledby="management-title">
     <form id="management-form">
