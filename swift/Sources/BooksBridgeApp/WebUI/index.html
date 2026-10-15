@@ -67,10 +67,6 @@
             <span id="crumb-book"></span>
             <span id="crumb-conv"></span>
           </div>
-          <div class="reading-status" aria-live="polite">
-            <button id="reading-position" data-action="scope" class="header-status">尚未取得有效阅读位置</button>
-            <button id="summary-status" data-action="summary" class="header-status">未生成摘要</button>
-          </div>
           <div class="topbar-right">
             <span id="ctx-chip" class="chip" hidden></span>
             <button id="return-btn" class="btn-primary" title="返回图书 App">← 返回图书</button>
@@ -79,6 +75,30 @@
 
         <div id="archive-banner" hidden>此对话已归档，内容保留。<button id="restore-active" class="btn-plain">恢复对话</button></div>
 
+
+        <section id="summary-document" hidden aria-label="全书摘要">
+          <header class="topbar summary-topbar"><button id="summary-back" class="btn-plain">← 返回对话</button><span>全书摘要</span><span class="spacer"></span><button id="summary-more" class="icon-btn" aria-label="全书摘要操作" aria-haspopup="menu">⋯</button></header>
+    <section id="summary-panel" class="summary-body">
+      <div class="summary-model-row"><button id="summary-model" class="btn-plain">选择摘要模型</button><span id="summary-model-used" class="field-hint"></span></div>
+      <h2 id="summary-book-title"></h2>
+      <p id="book-statistics" class="empty-hint">正在读取本地书籍统计…</p>
+      <div id="prep-bar" class="prep-bar"><span id="prep-text" role="status"></span></div>
+      <progress id="summary-progress" hidden></progress>
+      <p id="summary-metadata" class="empty-hint"></p>
+      <div id="scope-summary" hidden><div id="scope-summary-text" class="msg-body"></div></div>
+      <div class="summary-controls"><button id="prep-cancel" data-action="cancelSummary" class="btn-plain" hidden>停止</button><button id="prep-retry" data-action="generate" class="btn-primary">生成全书摘要</button></div>
+      <details class="summary-tools"><summary>章节与结构</summary>
+      <details id="chapter-statistics"><summary>章节统计与生成情况</summary><div id="chapter-statistics-list"></div></details>
+      <details id="structure-panel"><summary>辅助整理章节</summary>
+        <p id="structure-status" role="status"></p><p id="structure-issues" class="empty-hint"></p>
+        <p class="empty-hint">确认后发送全书候选标题和边界附近的少量文字。建议先预览再应用；不修改 Apple Books 原书。</p>
+        <div id="structure-preview"></div>
+        <div class="dialog-actions"><button id="structure-analyze" class="btn-plain">分析章节结构</button><button id="structure-cancel" class="btn-plain" hidden>取消分析</button><button id="structure-restore" class="btn-plain" hidden>恢复本地结构</button></div>
+        <div class="dialog-actions"><button id="structure-discard" class="btn-plain" hidden>放弃建议</button><button id="structure-apply" class="btn-primary" hidden>应用章节建议</button><button id="structure-scope" class="btn-primary" hidden>确认本对话整章范围</button></div>
+      </details>
+      </details>
+    </section>
+        </section>
         <!-- 会话流 -->
         <div id="thread" class="thread">
           <div id="thread-empty" class="thread-empty">
@@ -106,7 +126,7 @@
             <!-- 知识范围：三档剧透边界 -->
             <button id="actions-btn" class="icon-btn composer-plus" aria-label="阅读操作" title="阅读操作 · 输入 / 使用命令" aria-haspopup="menu" aria-expanded="false" type="button">＋</button>
             <select class="scope-picker" id="scope-picker" aria-label="读取权限"></select>
-            <span id="composer-model" class="composer-model"></span>
+            <button id="composer-model" class="composer-model" type="button" title="选择对话模型">选择模型</button>
             <span class="spacer"></span>
             <span id="usage-chip" class="chip chip-tiny" hidden></span>
             <button id="cancel-btn" class="btn-send" aria-label="停止生成" title="停止生成（Esc, Esc）" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="3" fill="currentColor"/></svg></button>
@@ -120,14 +140,15 @@
       <section id="view-settings" class="view" hidden>
         <header class="topbar">
           <div class="crumb"><span class="crumb-strong">设置</span></div>
-          <span class="settings-save-hint">切换时自动保存</span>
+          <span class="settings-save-hint">配置与偏好</span>
         </header>
 
         <div class="settings-body">
           <!-- 设置导航 -->
           <nav class="settings-nav" id="settings-nav">
             <button class="nav-item active" data-section="general">通用</button>
-            <button class="nav-item" data-section="model">模型与 API</button>
+            <button class="nav-item" data-section="model">模型服务</button>
+            <button class="nav-item" data-section="defaults">默认模型</button>
             <button class="nav-item" data-section="permissions">权限</button>
             <button id="archives-btn" class="nav-item" data-section="archives"><span id="archives-label">已归档</span></button>
           </nav>
@@ -160,59 +181,21 @@
               </div>
             </section>
 
-            <!-- 模型与 API -->
             <section class="pane" data-pane="model" hidden>
-              <h2>模型与 API</h2>
-              <div class="field"><button id="api-test" class="btn-plain">测试连接</button>
-              <p id="api-test-result" class="field-hint" role="status">未检测 · 测试会产生少量 API 用量</p></div>
-              <div class="field"><label for="set-summary-context">摘要模型上下文上限（token）</label>
-                <input id="set-summary-context" type="number" min="4096" max="2000000" step="1024" value="32768">
-                <p class="field-hint">按所选模型填写；更换模型后请核对。摘要同时遵守请求字符预算，并预留提示词与输出空间。使用 UTF-8 字节数保守估算 token，不自动探测接口。</p>
+              <h2>模型服务</h2>
+              <p class="field-hint">支持 OpenAI 兼容接口。获取列表和测试连接仅在点击时发起请求。</p>
+              <div class="service-workspace">
+                <aside><button id="service-add" class="btn-plain">＋ 添加服务商</button><div id="service-list"></div></aside>
+                <div id="service-detail"></div>
               </div>
+              <p id="model-result" class="field-hint" role="status"></p>
 
-              <div class="field">
-                <label for="set-provider">服务商</label>
-                <select id="set-provider"></select>
-              </div>
-
-              <div class="field">
-                <label for="set-apikey">API Key</label>
-                <div class="input-row">
-                  <input id="set-apikey" type="password" placeholder="未配置" autocomplete="off">
-                  <button id="set-apikey-toggle" class="btn-plain" type="button">显示</button>
-                </div>
-                <p class="field-hint" id="apikey-hint">以 0600 权限保存在本机，不会上传。</p>
-              </div>
-
-              <div class="field">
-                <label for="set-baseurl">接口地址</label>
-                <input id="set-baseurl" type="text" spellcheck="false">
-              </div>
-
-              <div class="field">
-                <label for="set-model">模型</label>
-                <input id="set-model" type="text" list="model-suggestions" spellcheck="false">
-                <datalist id="model-suggestions"></datalist>
-              </div>
-
-              <div class="field">
-                <label for="set-thinking">思考模式</label>
-                <select id="set-thinking"></select>
-                <p class="field-hint" id="set-thinking-hint"></p>
-              </div>
-
-              <div class="field">
-                <label for="set-temp">温度 <span class="value" id="set-temp-value">0.3</span></label>
-                <input id="set-temp" type="range" min="0" max="2" step="0.1">
-              </div>
-
-              <div class="pane-note">
-                <strong>关于联网</strong>
-                <p>
-                  提问时会把书籍说明与相关原文片段发送到上面配置的接口。
-                  若在意隐私，可把接口地址指向本机的 Ollama。
-                </p>
-              </div>
+            </section>
+            <section class="pane" data-pane="defaults" hidden>
+              <h2>默认模型</h2>
+              <div class="field"><label for="default-chat-model">新对话</label><select id="default-chat-model"></select></div>
+              <div class="field"><label for="default-summary-model">全文摘要与章节整理</label><select id="default-summary-model"></select></div>
+              <p class="field-hint">分别选择服务商和模型。已有对话及书籍已选择的模型保持不变，可在对应页面修改。</p>
             </section>
 
             <!-- 权限 -->
@@ -280,36 +263,18 @@
     <button id="reading-check" data-action="scope" role="menuitem">查看读取范围 <kbd>/scope</kbd></button>
     <div class="menu-label">引用</div>
     <button id="capture-selection" data-action="select" role="menuitem">读取 Books 划选 <kbd>/select</kbd></button>
-    <div class="menu-label">阅读摘要</div>
-    <button data-action="summary" role="menuitem">查看与管理摘要 <kbd>/summary</kbd></button>
-    <button data-action="generate" role="menuitem">生成阅读摘要</button>
-    <button data-action="cancelSummary" role="menuitem" hidden>取消摘要生成</button>
-    <button data-action="clearSummary" role="menuitem" hidden>清除摘要</button>
+    <button data-action="summary" role="menuitem">全书摘要 <span id="summary-status"></span><kbd>/summary</kbd></button>
     <div class="menu-label">对话</div>
     <button data-action="new" role="menuitem">新建对话 <kbd>/new</kbd></button>
   </div>
   <div id="sidebar-menu" class="floating-menu" role="menu" aria-label="侧栏操作" hidden></div>
   <dialog id="reading-panel" class="reading-panel" aria-labelledby="reading-panel-title">
-    <div class="panel-head"><h3 id="reading-panel-title">阅读摘要</h3><button class="icon-btn" data-close="reading-panel" aria-label="关闭阅读面板">×</button></div>
+    <div class="panel-head"><h3 id="reading-panel-title">本轮读取范围</h3><button class="icon-btn" data-close="reading-panel" aria-label="关闭阅读面板">×</button></div>
     <section id="range-panel" hidden><p id="range-position"></p><p id="range-mode"></p><p id="reading-check-result" role="status"></p></section>
-    <section id="summary-panel">
-      <p id="book-statistics" class="empty-hint">正在读取本地书籍统计…</p>
-      <details id="chapter-statistics"><summary>章节统计与生成情况</summary><div id="chapter-statistics-list"></div></details>
-      <details id="structure-panel"><summary>辅助整理章节</summary>
-        <p id="structure-status" role="status"></p><p id="structure-issues" class="empty-hint"></p>
-        <p class="empty-hint">确认后发送全书候选标题和边界附近的少量文字。建议先预览再应用；不修改 Apple Books 原书。</p>
-        <div id="structure-preview"></div>
-        <div class="dialog-actions"><button id="structure-analyze" class="btn-plain">分析章节结构</button><button id="structure-cancel" class="btn-plain" hidden>取消分析</button><button id="structure-restore" class="btn-plain" hidden>恢复本地结构</button></div>
-        <div class="dialog-actions"><button id="structure-discard" class="btn-plain" hidden>放弃建议</button><button id="structure-apply" class="btn-primary" hidden>应用章节建议</button><button id="structure-scope" class="btn-primary" hidden>确认本对话整章范围</button></div>
-      </details>
-      <div id="prep-bar" class="prep-bar"><span class="prep-dot"></span><span id="prep-text"></span></div>
-      <p id="summary-metadata" class="empty-hint"></p>
-      <div id="scope-summary" hidden><div id="scope-summary-text" class="msg-body"></div></div>
-      <div class="dialog-actions"><button id="prep-clear" data-action="clearSummary" class="btn-plain" hidden>清除摘要</button><button id="prep-cancel" data-action="cancelSummary" class="btn-plain" hidden>取消生成</button><button id="prep-retry" data-action="generate" class="btn-primary">生成阅读摘要</button></div>
-    </section>
+
   </dialog>
   <dialog id="structure-confirm"><h3 id="structure-confirm-title"></h3><p id="structure-confirm-text"></p><div class="dialog-actions"><button id="structure-no" class="btn-plain">取消</button><button id="structure-yes" class="btn-primary">确认</button></div></dialog>
-  <dialog id="prepare-confirm" aria-labelledby="prepare-title"><h3 id="prepare-title">生成当前范围摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
+  <dialog id="prepare-confirm" aria-labelledby="prepare-title"><h3 id="prepare-title">清除全书摘要？</h3><p id="prepare-destination"></p><div class="dialog-actions"><button id="prepare-no" class="btn-plain">暂不生成</button><button id="prepare-yes" class="btn-primary">确认生成</button></div></dialog>
   <dialog id="management-dialog" aria-labelledby="management-title">
     <form id="management-form">
       <h3 id="management-title"></h3><p id="management-description"></p>
@@ -324,9 +289,31 @@
     <p id="book-source-path" class="empty-hint"></p>
     <div class="dialog-actions"><button type="button" id="book-source-cancel" class="btn-plain">取消</button><button type="button" id="book-source-separate" class="btn-plain" hidden>独立添加</button><button type="button" id="book-source-confirm" class="btn-primary">确认</button></div>
   </dialog>
+<dialog id="model-picker"><h2 id="model-picker-title">选择模型</h2><input id="model-search" type="search" placeholder="搜索服务商或模型"><div id="model-picker-options"></div><button id="model-picker-close" class="btn-plain">关闭</button></dialog>
+<dialog id="model-library" aria-labelledby="model-library-title">
+  <header class="library-header"><div><h2 id="model-library-title">添加模型</h2><p id="model-library-provider" class="field-hint"></p></div><button id="model-library-close" class="btn-plain" aria-label="关闭模型列表">✕</button></header>
+  <div class="library-tools">
+    <div class="library-search-row"><input id="model-library-search" type="search" aria-label="搜索模型名称或 ID" placeholder="搜索模型名称或 ID" autocomplete="off"><button id="model-library-refresh" class="btn-plain">获取列表</button></div>
+    <div class="library-filter-row"><label><input id="model-library-all" type="checkbox">全选当前结果</label><label><input id="model-library-new" type="checkbox">只看未添加</label><span id="model-library-count" class="field-hint"></span></div>
+    <p id="model-library-status" class="field-hint" role="status" aria-live="polite"></p>
+  </div>
+  <div id="model-library-rows" tabindex="0" aria-label="可添加的模型"></div>
+  <footer class="library-footer"><div><span id="model-library-selected"></span><button id="model-library-clear" class="btn-plain">清空选择</button></div><div><button id="model-library-cancel" class="btn-plain">取消</button><button id="model-library-add" class="btn-primary">添加所选（0）</button></div></footer>
+</dialog>
+<dialog id="model-editor"><form id="model-form"><h2>模型配置</h2>
+<div class="field"><label for="model-name">显示名称</label><input id="model-name" required></div>
+<div class="field"><label for="model-remote">模型 ID</label><input id="model-remote" required spellcheck="false"></div>
+<div class="model-grid"><div class="field"><label for="model-context">上下文上限（token）</label><input id="model-context" type="number" min="8192" max="2000000" required></div><div class="field"><label for="model-output">输出上限（token）</label><input id="model-output" type="number" min="256" max="131072" required></div></div>
+<p class="field-hint">请按模型实际能力填写；输入使用 UTF-8 字节数保守估算，并预留输出空间。</p>
+<div class="field"><label><input id="model-send-temp" type="checkbox">发送温度参数</label><input id="model-temperature" type="number" min="0" max="2" step="0.1"></div>
+<div class="field"><label><input id="model-send-thinking" type="checkbox">发送 thinking 参数（仅用于支持该扩展的接口）</label><select id="model-thinking"><option value="off">关闭</option><option value="low">低</option><option value="high">高</option><option value="max">最高</option></select></div>
+<p id="model-form-error" role="status"></p><div class="model-actions"><button type="button" id="model-edit-cancel" class="btn-plain">取消</button><button type="submit" class="btn-primary">保存模型</button></div>
+</form></dialog>
+<dialog id="model-delete-dialog"><h2>确认删除</h2><p id="model-delete-text"></p><div class="model-actions"><button id="model-delete-cancel" class="btn-plain">取消</button><button id="model-delete-confirm" class="btn-plain danger">删除</button></div></dialog>
 <script src="vendor/marked.js"></script>
 <script src="vendor/purify.js"></script>
 <script src="markdown.js"></script>
+<script src="models.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

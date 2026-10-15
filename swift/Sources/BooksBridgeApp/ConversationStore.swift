@@ -19,6 +19,8 @@ public struct StoredBook: Codable, Sendable, Equatable, Identifiable {
     public var libraryID: UUID?
     public var study: BookStudy?
     public var verifiedPosition: ReadingSnapshot?
+    public var summaryModelID: String?
+    public var summaryModelStamp: ModelStamp?
 
     public var id: String { assetID }
     public var displayTitle: String { customTitle ?? title }
@@ -54,6 +56,7 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
     public var archivedAt: Date?
     public var titleProgress: Double?
     public var customTitle: String?
+    public var modelID: String?
     public var displayTitle: String { customTitle ?? title }
 
     public init(
@@ -108,8 +111,10 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         public var inReplyTo: String?
         public var reasoning: String?
         public var reasoningExpanded: Bool?
+        public var model: ModelStamp?
 
-        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false, reasoning: String? = nil, reasoningExpanded: Bool? = nil) {
+        public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false, reasoning: String? = nil, reasoningExpanded: Bool? = nil, model: ModelStamp? = nil) {
+            self.model = model
             self.id = id
             self.reasoning = reasoning
             self.reasoningExpanded = reasoningExpanded
@@ -205,6 +210,24 @@ public final class ConversationStore {
         guard let index = state.books.firstIndex(where: { $0.assetID == assetID }) else { return false }
         let previous = state
         state.books[index].study = study
+        return persistOrRollback(previous)
+    }
+
+    @discardableResult
+    public func setSummaryModel(assetID: String, modelID: String, stamp: ModelStamp? = nil) -> Bool {
+        guard let index = state.books.firstIndex(where: { $0.assetID == assetID }) else { return false }
+        let previous = state
+        state.books[index].summaryModelID = modelID
+        if let stamp { state.books[index].summaryModelStamp = stamp }
+        return persistOrRollback(previous)
+    }
+
+    @discardableResult
+    public func setChatModel(assetID: String, conversationID: String, modelID: String) -> Bool {
+        guard let bi = state.books.firstIndex(where: { $0.assetID == assetID }),
+              let ci = state.books[bi].conversations.firstIndex(where: { $0.id == conversationID }) else { return false }
+        let previous = state
+        state.books[bi].conversations[ci].modelID = modelID
         return persistOrRollback(previous)
     }
 
@@ -570,6 +593,27 @@ public final class ConversationStore {
         state.books[bi].conversations[ci].messages[mi].boundary = boundary
         state.books[bi].conversations[ci].messages[mi].sourceHash = sourceHash
         persist()
+    }
+
+    /// Position markers are timeline metadata, excluded from model history.
+    @discardableResult
+    public func recordPosition(assetID: String, conversationID: String, snapshot: ReadingSnapshot,
+                               before messageID: String? = nil, force: Bool = false) -> Bool {
+        guard snapshot.assetID == assetID, let conversation = conversation(assetID: assetID, conversationID: conversationID) else { return false }
+        let insertion = messageID.flatMap { id in conversation.messages.firstIndex { $0.id == id } } ?? conversation.messages.count
+        let preceding = Array(conversation.messages.prefix(insertion))
+        let lastPosition = preceding.last { $0.isPositionCard == true && $0.role == .assistant }
+        let marker = Conversation.Message(role: .assistant, text: snapshot.compactLabel,
+            boundary: snapshot.page, sourceHash: snapshot.sourceHash, isPositionCard: true)
+        let adjacent = preceding.last?.isPositionCard == true
+        let same = lastPosition?.boundary == marker.boundary && lastPosition?.sourceHash == marker.sourceHash
+            && lastPosition?.text.replacingOccurrences(of: " · 沿用上次位置", with: "") == marker.text.replacingOccurrences(of: " · 沿用上次位置", with: "")
+        if !force && !adjacent && same { return false }
+        updateConversation(assetID: assetID, conversationID: conversationID) { value in
+            if adjacent { value.messages[insertion - 1] = marker }
+            else { value.messages.insert(marker, at: insertion) }
+        }
+        return true
     }
 
     /// 追加一条消息（骨架期不会被调用，接入 LLM 后使用）。

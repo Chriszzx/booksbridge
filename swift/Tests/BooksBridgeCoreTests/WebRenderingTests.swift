@@ -4,6 +4,34 @@ import WebKit
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
+    func testPositionTimelineHasNoAssistantBubbleAndNowNeverStartsChat() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          const history = [{id:'p1',role:'assistant',text:'第一章 · 5.0% · 已刷新 · 12:00:00',isPositionCard:true},
+            {id:'cmd',role:'user',text:'/now',isPositionCard:true},
+            {id:'p2',role:'assistant',text:'第一章 · 5.0% · 已刷新 · 12:01:00',isPositionCard:true},
+            {id:'q1',role:'user',text:'问题'},{id:'a1',role:'assistant',text:'回答'}];
+          booksbridge.onState({active:{assetID:'A',conversationID:'timeline',messages:history}});
+          const legacy = document.querySelectorAll('.position-marker').length === 1 && document.querySelectorAll('.msg').length === 2
+            && !document.querySelector('.position-marker').textContent.includes('12:01') && !document.querySelector('.position-marker button');
+          $('input').value='/now'; $('input').dispatchEvent(new Event('input')); $('send-btn').click();
+          const local = document.querySelectorAll('.msg').length === 2 && !document.querySelector('.messages').textContent.includes('正在思考');
+          booksbridge.onState({positionRefreshFinished:true});
+          booksbridge.onState({active:{assetID:'A',conversationID:'timeline',messages:[...history,{id:'p3',role:'assistant',text:'第二章 · 20.0%',isPositionCard:true}]}});
+          const restored = document.querySelector('.messages').lastElementChild.className === 'position-marker'
+            && document.querySelector('.messages').lastElementChild.textContent === '第二章 · 20.0%';
+          return {legacy,local,restored};
+        })()
+        """) as! [String: Bool]
+        for (key,value) in result { XCTAssertTrue(value,key) }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(calls.calls.filter { $0["type"] as? String == "refreshPosition" }.count, 1)
+        XCTAssertFalse(calls.calls.contains { ["ask", "testAPI", "reprocessBook"].contains($0["type"] as? String ?? "") })
+    }
+
     func testStructurePreviewConfirmationAndNavigationNeverAutomaticallySends() async throws {
         let (view, calls) = try await workspaceFixture()
         defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
@@ -14,7 +42,7 @@ final class WebRenderingTests: XCTestCase {
             issues:'缺少目录',running:false,applied:false,structureChanged:false,scopeConfirmed:false,oldCount:1,newCount:3,uncertain:1,
             rows:['1. 第一卷 · 卷引言','2. 范围外标题 · 章节']};
           booksbridge.onState({active:{assetID:'A',conversationID:'first',scope:'currentChapter',messages:[]},chapterStructure:structure});
-          $('summary-status').click(); $('structure-panel').open = true;
+          document.querySelector('[data-action=summary]').click(); $('structure-panel').open = true;
           const preview = $('structure-preview').textContent.includes('1 个区段 → 建议 3') && $('structure-scope').hidden;
           $('structure-analyze').click();
           const disclosure = $('structure-confirm').open && $('structure-confirm-text').textContent.includes('未读内容');
@@ -22,7 +50,7 @@ final class WebRenderingTests: XCTestCase {
           const invalidation = $('structure-confirm-text').textContent.includes('其余章节及全书摘要');
           booksbridge.onState({active:{assetID:'A',conversationID:'second',scope:'currentChapter',messages:[]},chapterStructure:{...structure,conversationID:'second',structureChanged:true}});
           const reset = !$('structure-confirm').open && !$('structure-scope').hidden;
-          $('summary-status').click(); $('structure-scope').click(); $('structure-yes').click();
+          document.querySelector('[data-action=summary]').click(); $('structure-scope').click(); $('structure-yes').click();
           return {preview,disclosure,invalidation,reset};
         })()
         """) as! [String: Bool]
@@ -41,7 +69,7 @@ final class WebRenderingTests: XCTestCase {
         let checks = try await view.evaluateJavaScript("""
         (() => {
           const $ = id => document.getElementById(id);
-          const shared = {assistant:{preparation:'正在生成第 2/3 章 · 已完成 1 章',ready:true,hasSharedSummary:true},
+          const shared = {assistant:{preparation:'正在生成',ready:false,running:true,hasSharedSummary:true},
             scopeSummary:'第一章安全摘要',summaryMetadata:'全书摘要尚未生成',
             bookStatistics:{characters:12000,estimatedTokens:36000,documents:5,headings:6,completed:1,wholeComplete:false,
               chapters:[{number:1,title:'第一章',characters:4000,estimatedTokens:12000,complete:true,allowed:true},
@@ -49,13 +77,13 @@ final class WebRenderingTests: XCTestCase {
           booksbridge.onState({...shared,active:{assetID:'A',conversationID:'first',scope:'upToProgress',messages:[]}});
           const before = $('summary-status').textContent;
           booksbridge.onState({...shared,active:{assetID:'A',conversationID:'second',scope:'upToProgress',messages:[]}});
-          $('summary-status').click();
-          const same = $('summary-status').textContent === before && $('prep-text').textContent === before;
+          document.querySelector('[data-action=summary]').click();
+          const same = $('summary-status').textContent === before && $('prep-text').textContent.includes('1 / 2');
           const statistics = $('book-statistics').textContent.includes('12,000') && $('chapter-statistics-list').children.length === 2;
-          const isolated = $('chapter-statistics-list').textContent.includes('当前权限不读取') && !$('scope-summary-text').textContent.includes('未读秘密');
-          $('reading-panel').close();
+          const isolated = $('summary-document').getClientRects().length > 0 && !document.querySelector('.messages #scope-summary') && !$('scope-summary-text').textContent.includes('未读秘密');
+          $('summary-back').click();
           booksbridge.onState({assistant:{preparation:'章节摘要 3/3 · 全书摘要已完成',ready:false,hasSharedSummary:true},scopeSummary:''});
-          $('summary-status').click(); $('prep-clear').click();
+          document.querySelector('[data-action=summary]').click(); $('summary-more').click(); [...document.querySelectorAll('#sidebar-menu button')].find(b => b.textContent === '清除摘要').click();
           const confirmation = $('prepare-confirm').open && $('prepare-destination').textContent.includes('所有对话');
           $('prepare-no').click();
           return {same,statistics,isolated,confirmation,hidden:$('scope-summary').hidden};
@@ -64,7 +92,7 @@ final class WebRenderingTests: XCTestCase {
         for value in checks.values { XCTAssertTrue(value) }
         try await Task.sleep(for: .milliseconds(40))
         XCTAssertFalse(calls.calls.contains { ["clearKnowledge", "reprocessBook", "ask", "testAPI"].contains($0["type"] as? String ?? "") })
-        _ = try await view.evaluateJavaScript("document.getElementById('prep-clear').click(); document.getElementById('prepare-yes').click(); undefined;")
+        _ = try await view.evaluateJavaScript("document.getElementById('summary-more').click(); [...document.querySelectorAll('#sidebar-menu button')].find(b => b.textContent === '清除摘要').click(); document.getElementById('prepare-yes').click(); undefined;")
         try await Task.sleep(for: .milliseconds(40))
         XCTAssertEqual((calls.calls.last { $0["type"] as? String == "clearKnowledge" }?["payload"] as? [String: Any])?["confirmed"] as? Bool, true)
     }
@@ -230,15 +258,15 @@ final class WebRenderingTests: XCTestCase {
         let initial = try latestRegions()
         XCTAssertEqual((initial["draggable"] as? [[String: Double]])?.count, 2)
         let controls = try XCTUnwrap(initial["interactive"] as? [[String: Double]])
-        XCTAssertEqual(controls.count, 5)
+        XCTAssertEqual(controls.count, 3)
         for rect in controls {
             XCTAssertGreaterThanOrEqual(rect["y"] ?? -1, 0)
             XCTAssertLessThanOrEqual((rect["y"] ?? 0) + (rect["height"] ?? 0), 40)
         }
-        _ = try await view.evaluateJavaScript("document.getElementById('summary-status').click(); undefined;")
+        _ = try await view.evaluateJavaScript("document.querySelector('[data-action=summary]').click(); undefined;")
         try await Task.sleep(for: .milliseconds(50))
-        XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 0)
-        _ = try await view.evaluateJavaScript("document.getElementById('reading-panel').close(); document.getElementById('settings-btn').click(); undefined;")
+        XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 2)
+        _ = try await view.evaluateJavaScript("document.getElementById('summary-back').click(); document.getElementById('settings-btn').click(); undefined;")
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 2)
         XCTAssertEqual((try latestRegions()["interactive"] as? [[String: Double]])?.count, 2)
@@ -322,18 +350,15 @@ extension WebRenderingTests {
             markdown,options:document.getElementById('scope-picker').options.length};
         })()
         """) as! [String: Any]
-        XCTAssertEqual(result["confirmation"] as? Bool, true)
+        XCTAssertEqual(result["confirmation"] as? Bool, false)
         XCTAssertEqual(result["clear"] as? Bool, true)
         XCTAssertEqual(result["locked"] as? Bool, true)
         XCTAssertEqual(result["emptyHidden"] as? Bool, true)
-        XCTAssertEqual(result["model"] as? String, "test-model")
+        XCTAssertEqual(result["model"] as? String, "选择模型")
         XCTAssertEqual(result["markdown"] as? Bool, true)
         XCTAssertEqual(result["options"] as? Int, 3)
-        XCTAssertFalse(calls.calls.contains { $0["type"] as? String == "reprocessBook" }, "取消确认不应上传全书")
-        _ = try await view.evaluateJavaScript("document.getElementById('api-test').click(); undefined")
-        try await Task.sleep(for: .milliseconds(100))
-        let call = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "testAPI" })
-        XCTAssertEqual((call["payload"] as? [String: Any])?["model"] as? String, "test-model")
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertTrue(calls.calls.contains { $0["type"] as? String == "reprocessBook" }, "Explicit generation starts without a second dialog; bridge is mocked")
         let live = try await view.evaluateJavaScript("""
         (() => {
           const input = document.getElementById('input');
@@ -375,8 +400,8 @@ extension WebRenderingTests {
           input.value = '/now'; input.dispatchEvent(new Event('input'));
           const commandEnabled = !document.getElementById('send-btn').disabled && !input.disabled;
           document.getElementById('send-btn').click();
-          booksbridge.onState({chatEvent:{kind:'finished',text:'真实章节 · 20%'}});
-          return {blocked,paragraph,cleared,hiddenSummary,commandEnabled,position:document.getElementById('reading-position').textContent};
+          booksbridge.onState({positionRefreshFinished:true,active:{assetID:'A',conversationID:'C',messages:[{id:'pos',role:'assistant',isPositionCard:true,text:'真实章节 · 20% · 沿用上次位置'}]}});
+          return {blocked,paragraph,cleared,hiddenSummary,commandEnabled,position:document.querySelector('.position-marker').textContent};
         })()
         """) as! [String: Any]
         for key in ["blocked", "paragraph", "cleared", "hiddenSummary", "commandEnabled"] { XCTAssertEqual(core[key] as? Bool, true, key) }
@@ -462,6 +487,226 @@ extension WebRenderingTests {
         }
     }
 
+    func testProviderPresetsFillEditableDraftsClearKeysAndNeverSend() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let checks = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          booksbridge.onState({modelCatalog:{services:[],defaultChat:'',defaultSummary:''}});
+          $('settings-btn').click(); document.querySelector('[data-section=model]').click(); $('service-add').click();
+          const expected = [
+            ['openai','OpenAI','https://api.openai.com/v1',true],
+            ['anthropic','Anthropic','https://api.anthropic.com/v1',true],
+            ['deepseek','DeepSeek','https://api.deepseek.com/v1',true],
+            ['openrouter','OpenRouter','https://openrouter.ai/api/v1',true],
+            ['local','本地','http://localhost:11434/v1',false]];
+          const filled = expected.every(([id,name,url,key]) => {
+            $('service-key').value='test-only-draft'; $('service-preset').value=id; $('service-preset').dispatchEvent(new Event('change'));
+            return $('service-name').value===name && $('service-url').value===url && $('service-requires-key').checked===key && $('service-key').value==='';
+          });
+          $('service-url').value='http://localhost:4321/v1'; $('service-url').dispatchEvent(new Event('input'));
+          booksbridge.onState({modelCatalog:{services:[],defaultChat:'',defaultSummary:''}});
+          const retained = $('service-url').value==='http://localhost:4321/v1';
+          $('service-detail').querySelector('form').requestSubmit();
+          return {filled,retained,custom:[...$('service-preset').options].some(o=>o.value==='custom')};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in checks { XCTAssertTrue(value,key) }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertFalse(calls.calls.contains { ["ask","testModel","listModels","reprocessBook"].contains($0["type"] as? String ?? "") })
+        let saved = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "saveService" }?["payload"] as? [String:Any])
+        XCTAssertEqual(saved["name"] as? String,"本地")
+        XCTAssertEqual(saved["baseURL"] as? String,"http://localhost:4321/v1")
+        XCTAssertEqual(saved["requiresKey"] as? Bool,false); XCTAssertNil(saved["key"]); XCTAssertNil(saved["id"])
+    }
+
+    func testModelManagementDoesNotSendUntilExplicitActionAndDraftSurvivesPush() async throws {
+        let (view,calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          window.catalogFixture = {services:[{id:'P',name:'Provider',baseURL:'https://example.test/v1',enabled:true,requiresKey:true,hasKey:true,revision:'p1',
+            models:[{id:'CHAT',name:'Chat model',remoteID:'chat-id',contextTokens:32768,outputTokens:2048,revision:'m1'}]},
+            {id:'LOCAL',name:'Local',baseURL:'http://localhost:1234/v1',enabled:true,requiresKey:false,hasKey:false,revision:'p2',
+            models:[{id:'SUMMARY',name:'Summary model',remoteID:'summary-id',contextTokens:65536,outputTokens:2048,revision:'m2'}]}],defaultChat:'CHAT',defaultSummary:'SUMMARY'};
+          booksbridge.onState({modelCatalog:catalogFixture,modelSelection:{chat:'CHAT',summary:'SUMMARY',chatReady:true,summaryReady:true}});
+          $('settings-btn').click(); document.querySelector('[data-section=model]').click();
+          const keyHidden = $('service-key').value === '' && $('service-key').placeholder.includes('已保存');
+          $('service-name').value = 'Unsaved name'; $('service-name').dispatchEvent(new Event('input'));
+          booksbridge.onState({modelCatalog:catalogFixture});
+          const draft = $('service-name').value === 'Unsaved name';
+          [...document.querySelectorAll('#service-detail button')].find(b => b.textContent === '放弃修改').click();
+          document.querySelector('[data-section=defaults]').click();
+          const defaults = $('default-chat-model').value === 'CHAT' && $('default-summary-model').value === 'SUMMARY';
+          $('default-summary-model').value = 'CHAT'; $('default-summary-model').dispatchEvent(new Event('change'));
+          document.querySelector('[data-section=model]').click();
+          [...document.querySelectorAll('#service-detail button')].find(b => b.textContent === '测试连接').click();
+          return {keyHidden,draft,defaults};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in result { XCTAssertTrue(value,key) }
+        try await Task.sleep(for:.milliseconds(40))
+        XCTAssertFalse(calls.calls.contains { ["ask","listModels","reprocessBook","testAPI","analyzeStructure"].contains($0["type"] as? String ?? "") })
+        let tests = calls.calls.filter { $0["type"] as? String == "testModel" }
+        XCTAssertEqual(tests.count,1)
+        let payload = try XCTUnwrap(tests.first?["payload"] as? [String:Any]); XCTAssertEqual(payload["id"] as? String,"CHAT"); XCTAssertNil(payload["apiKey"])
+        let defaults = try XCTUnwrap(calls.calls.last { $0["type"] as? String == "setDefaultModel" }?["payload"] as? [String:Any])
+        XCTAssertEqual(defaults["purpose"] as? String,"summary"); XCTAssertEqual(defaults["id"] as? String,"CHAT")
+    }
+
+    func testModelPickersAreIndependentSearchableAndHistoryKeepsAttribution() async throws {
+        let (view,calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          const catalog = {services:[{id:'P',name:'Provider',enabled:true,requiresKey:false,models:[{id:'CHAT',name:'Chat model',remoteID:'chat',contextTokens:32768},{id:'SUMMARY',name:'Summary model',remoteID:'summary',contextTokens:32768}]}],defaultChat:'CHAT',defaultSummary:'SUMMARY'};
+          const active = {assetID:'A',conversationID:'C',scope:'upToProgress',messages:[{id:'answer',role:'assistant',text:'回答',modelName:'Original provider / Original model'}]};
+          booksbridge.onState({modelCatalog:catalog,modelSelection:{chat:'CHAT',summary:'SUMMARY',chatReady:true,summaryReady:true},active});
+          $('composer-model').click(); $('model-search').value = 'Summary'; $('model-search').dispatchEvent(new Event('input'));
+          const search = document.querySelectorAll('.model-picker-option').length === 1;
+          document.querySelector('.model-picker-option').click(); $('model-picker-close').click();
+          booksbridge.onState({modelSelection:{chat:'SUMMARY',summary:'SUMMARY',chatReady:true,summaryReady:true},active});
+          const history = document.querySelector('.msg.assistant .msg-role').textContent === 'Original provider / Original model';
+          document.querySelector('[data-action=summary]').click(); $('summary-model').click();
+          [...document.querySelectorAll('.model-picker-option')].find(b => b.textContent === 'Chat model').click(); $('model-picker-close').click(); $('summary-back').click();
+          $('input').value='question'; $('input').dispatchEvent(new Event('input')); $('send-btn').click();
+          const locked = $('composer-model').disabled; $('cancel-btn').click();
+          booksbridge.onState({modelSelection:{chat:'DELETED',summary:'SUMMARY',chatReady:false,summaryReady:true}});
+          $('input').value='question'; $('input').dispatchEvent(new Event('input'));
+          const unavailable = $('send-btn').disabled && $('composer-model').textContent.includes('不可用') && !$('summary-model').disabled;
+          return {search,history,locked,unavailable};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in result { XCTAssertTrue(value,key) }
+        try await Task.sleep(for:.milliseconds(40))
+        let selected = calls.calls.filter { $0["type"] as? String == "selectModel" }.compactMap { $0["payload"] as? [String:Any] }
+        XCTAssertEqual(selected.count,2)
+        XCTAssertEqual(selected[0]["purpose"] as? String,"chat"); XCTAssertEqual(selected[0]["id"] as? String,"SUMMARY")
+        XCTAssertEqual(selected[1]["purpose"] as? String,"summary"); XCTAssertEqual(selected[1]["id"] as? String,"CHAT")
+        XCTAssertEqual(selected[0]["assetID"] as? String,"A"); XCTAssertEqual(selected[0]["conversationID"] as? String,"C")
+    }
+
+    private func modelLibraryFixture() async throws -> (WKWebView, UIInvocations) {
+        let (view, calls) = try await workspaceFixture()
+        _ = try await view.evaluateJavaScript("""
+        window.modelCalls = [];
+        ModelManager.init({invoke:(action,payload)=>modelCalls.push({action,...payload}),feedback:()=>{},context:()=>({})});
+        window.libraryFixture = {services:[{id:'P',name:'Provider',baseURL:'https://example.test/v1',enabled:true,requiresKey:false,revision:'r1',
+          models:[{id:'old',name:'Existing model',remoteID:'existing',contextTokens:32768,revision:'m1'}]},
+          {id:'Q',name:'Second',baseURL:'https://second.example.test/v1',enabled:true,requiresKey:false,revision:'r2',models:[]}],defaultChat:'',defaultSummary:''};
+        booksbridge.onState({modelCatalog:libraryFixture});
+        document.getElementById('settings-btn').click(); document.querySelector('[data-section=model]').click();
+        window.replyModels = (models, success=true) => booksbridge.onState({modelResult:{requestID:modelCalls.at(-1).requestID,success,models,message:success?'成功':'模拟网络错误'}});
+        document.getElementById('service-models-add').click(); undefined;
+        """)
+        return (view,calls)
+    }
+
+    func testModelLibrarySurvivesBackgroundPushCloseSearchAndProviderSwitch() async throws {
+        let (view,calls) = try await modelLibraryFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        let checks = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id), row = id => [...document.querySelectorAll('[data-remote-id]')].find(el=>el.dataset.remoteId===id);
+          const noAutomaticFetch = modelCalls.length===0;
+          $('model-library-refresh').click(); replyModels(['existing','vendor/alpha','vendor/beta',...Array.from({length:60},(_,i)=>'model-'+i)]);
+          row('vendor/alpha').click(); $('model-library-rows').scrollTop=180;
+          const first = row('vendor/alpha'), scroll = $('model-library-rows').scrollTop;
+          function reorder(value) { return Array.isArray(value) ? value.map(reorder) : value && typeof value==='object' ? Object.fromEntries(Object.keys(value).reverse().map(k=>[k,reorder(value[k])])) : value; }
+          for(let i=0;i<12;i++) booksbridge.onState({modelCatalog:reorder(libraryFixture),readingPosition:'位置 '+i});
+          const stable = $('model-library').open && row('vendor/alpha')===first && first.checked && $('model-library-rows').scrollTop===scroll;
+          $('model-library-search').value='beta'; $('model-library-search').dispatchEvent(new Event('input')); row('vendor/beta').click();
+          $('model-library-close').click(); document.querySelectorAll('.service-item')[1].click(); $('service-models-add').click();
+          const isolated = $('model-library-search').value==='' && $('model-library-selected').textContent==='已选择 0 个';
+          $('model-library-close').click(); document.querySelectorAll('.service-item')[0].click(); $('service-models-add').click();
+          const restored = $('model-library-search').value==='beta' && row('vendor/beta').checked && $('model-library-selected').textContent==='已选择 2 个';
+          libraryFixture.defaultSummary='old'; booksbridge.onState({modelCatalog:libraryFixture});
+          const realChange = $('model-library').open && row('vendor/beta').checked && $('model-library-search').value==='beta';
+          $('model-library-close').click(); document.querySelector('[data-section=general]').click(); document.querySelector('[data-section=model]').click(); $('service-models-add').click();
+          return {noAutomaticFetch,stable,isolated,restored,realChange,oneFetch:modelCalls.length===1,afterNavigation:row('vendor/beta').checked};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in checks { XCTAssertTrue(value,key) }
+        XCTAssertFalse(calls.calls.contains { ["listModels","testModel","ask"].contains($0["type"] as? String ?? "") })
+    }
+
+    func testModelLibraryFilteredBulkSelectionAndFailureRetry() async throws {
+        let (view,_) = try await modelLibraryFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        let checks = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id), row = id => [...document.querySelectorAll('[data-remote-id]')].find(el=>el.dataset.remoteId===id);
+          $('model-library-refresh').click(); replyModels(['existing','family/a','family/b','other']);
+          const addedDisabled = row('existing').checked && row('existing').disabled;
+          row('other').click(); $('model-library-search').value='family'; $('model-library-search').dispatchEvent(new Event('input'));
+          $('model-library-all').click();
+          const allFiltered = $('model-library-selected').textContent==='已选择 3 个';
+          $('model-library-all').click(); const deselectFiltered = $('model-library-selected').textContent==='已选择 1 个';
+          $('model-library-all').click(); $('model-library-refresh').click(); replyModels([],false);
+          const failurePreserved = row('family/a').checked && $('model-library-selected').textContent==='已选择 3 个' && $('model-library-status').textContent.includes('已保留');
+          $('model-library-add').click(); const request = modelCalls.at(-1);
+          const batch = request.action==='addModels' && request.serviceID==='P' && request.revision==='r1' && request.remoteIDs.length===3 && !request.remoteIDs.includes('existing');
+          $('model-library-add').click(); const doubleClickBlocked = modelCalls.at(-1)===request;
+          replyModels([],false);
+          const addFailurePreserved = $('model-library').open && row('family/a').checked && !$('model-library-add').disabled;
+          $('model-library-add').click(); replyModels([]);
+          const successClosed = !$('model-library').open;
+          libraryFixture.services[0].models.push(...['family/a','family/b','other'].map(id=>({id,name:id,remoteID:id,contextTokens:32768})));
+          booksbridge.onState({modelCatalog:libraryFixture}); $('service-models-add').click();
+          const saved = row('family/a').checked && row('family/a').disabled && $('model-library-selected').textContent==='已选择 0 个';
+          $('model-library-new').click(); const hiddenAdded = !row('family/a');
+          return {addedDisabled,allFiltered,deselectFiltered,failurePreserved,batch,doubleClickBlocked,addFailurePreserved,successClosed,saved,hiddenAdded};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in checks { XCTAssertTrue(value,key) }
+    }
+
+    func testModelLibraryLateResponsesRevisionChangesAndMissingSelections() async throws {
+        let (view,_) = try await modelLibraryFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        let checks = try await view.evaluateJavaScript("""
+        (() => {
+          const $=id=>document.getElementById(id), row=id=>[...document.querySelectorAll('[data-remote-id]')].find(el=>el.dataset.remoteId===id);
+          $('model-library-refresh').click(); $('model-library-close').click();
+          document.querySelectorAll('.service-item')[1].click(); $('service-models-add').click(); replyModels(['a','b']);
+          const noCrossProvider = !row('a');
+          $('model-library-close').click(); document.querySelectorAll('.service-item')[0].click(); $('service-models-add').click();
+          const lateCached = !!row('a'); row('a').click(); row('b').click();
+          $('model-library-refresh').click(); replyModels(['a','c']);
+          const missingKept = row('b').checked && $('model-library-selected').textContent.includes('1 个已不可用') && $('model-library-add').textContent==='添加所选（1）';
+          $('model-library-refresh').click(); libraryFixture.services[0].revision='new'; booksbridge.onState({modelCatalog:libraryFixture}); replyModels(['wrong']);
+          const staleRejected = !row('wrong') && row('a').checked && $('model-library-add').disabled;
+          $('model-library-refresh').click(); replyModels(['a','b']);
+          const recovered = row('b').checked && !$('model-library-add').disabled;
+          libraryFixture.services.shift(); booksbridge.onState({modelCatalog:libraryFixture});
+          return {noCrossProvider,lateCached,missingKept,staleRejected,recovered,deletedCloses:!$('model-library').open};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in checks { XCTAssertTrue(value,key) }
+    }
+
+    func testModelLibraryFitsMinimumWindowWithFooterVisible() async throws {
+        let (view,_) = try await modelLibraryFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName:"booksbridge") }
+        view.frame = CGRect(x:0,y:0,width:720,height:460)
+        try await Task.sleep(for:.milliseconds(60))
+        let checks = try await view.evaluateJavaScript("""
+        (()=>{
+          const $=id=>document.getElementById(id);
+          $('model-library-refresh').click(); replyModels(Array.from({length:100},(_,i)=>'provider/very-long-model-name-'+i));
+          const dialog=$('model-library').getBoundingClientRect(), footer=document.querySelector('.library-footer').getBoundingClientRect(), rows=$('model-library-rows');
+          return {fits:dialog.left>=0 && dialog.right<=innerWidth && dialog.top>=0 && dialog.bottom<=innerHeight,
+            footerVisible:footer.bottom<=dialog.bottom && footer.top>dialog.top,
+            rowsScroll:rows.clientHeight>60 && rows.scrollHeight>rows.clientHeight,
+            noHorizontalOverflow:$('model-library').scrollWidth<=$('model-library').clientWidth};
+        })()
+        """) as! [String:Bool]
+        for (key,value) in checks { XCTAssertTrue(value,key) }
+    }
+
     private func workspaceFixture() async throws -> (WKWebView, UIInvocations) {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/BooksBridgeApp/WebUI")
@@ -501,17 +746,17 @@ extension WebRenderingTests {
           const unknown = !$('command-feedback').hidden && input.value === '/bogus';
           type('/'); key('Escape'); const escaped = $('command-list').hidden;
           type('/summary'); $('send-btn').click();
-          const summary = $('reading-panel').open && !$('summary-panel').hidden;
-          $('prep-retry').click(); const confirmed = $('prepare-confirm').open;
-          $('prepare-no').click(); $('reading-panel').close();
+          const summary = !$('summary-document').hidden && !$('reading-panel').open;
+          $('prep-retry').click(); const confirmed = !$('prepare-confirm').open;
+          $('summary-back').click();
           type('/scope'); $('send-btn').click();
           const scope = $('reading-panel').open && !$('range-panel').hidden;
           $('reading-panel').close();
           type('/new'); $('send-btn').click();
           booksbridge.onState({settings:{isConfigured:false}});
-          type('/summary'); const noKey = !$('send-btn').disabled; $('send-btn').click(); $('reading-panel').close();
+          type('/summary'); const noKey = !$('send-btn').disabled; $('send-btn').click(); $('summary-back').click();
           type('/now'); $('send-btn').click();
-          booksbridge.onState({chatEvent:{kind:'finished',text:'第一章 · 20%',roleLabel:'阅读位置'}});
+          booksbridge.onState({positionRefreshFinished:true});
           booksbridge.onState({settings:{isConfigured:true}});
           type('/now 解释当前段落'); $('send-btn').click();
           const thinking = document.querySelector('.msg:last-child').textContent.includes('正在思考');
@@ -525,9 +770,9 @@ extension WebRenderingTests {
         let types = calls.calls.compactMap { $0["type"] as? String }
         XCTAssertEqual(types.filter { $0 == "captureSelection" }.count, 2)
         XCTAssertTrue(types.contains("checkReading")); XCTAssertTrue(types.contains("newConversation"))
-        XCTAssertFalse(types.contains("returnToReader")); XCTAssertFalse(types.contains("reprocessBook"))
+        XCTAssertFalse(types.contains("returnToReader")); XCTAssertTrue(types.contains("reprocessBook")); XCTAssertTrue(types.contains("refreshPosition"))
         let questions = calls.calls.filter { $0["type"] as? String == "ask" }.compactMap { ($0["payload"] as? [String: Any])?["question"] as? String }
-        XCTAssertEqual(questions, ["/now", "/now 解释当前段落"])
+        XCTAssertEqual(questions, ["/now 解释当前段落"])
     }
 
     func testBookMovementArchiveAndRestoreControls() async throws {
@@ -580,21 +825,21 @@ extension WebRenderingTests {
         for size in [CGSize(width:720,height:460), CGSize(width:1440,height:900)] {
             view.frame.size = size
             _ = try await view.evaluateJavaScript("""
-            booksbridge.onState({assistant:{preparation:'正在生成摘要 2/5',ready:false},summaryMetadata:'读到这为止 · 今天',selectionCandidate:{token:'T',text:'这是需要确认的引用内容。'.repeat(50),exact:false}}); undefined;
+            booksbridge.onState({assistant:{preparation:'正在生成摘要',ready:false,running:true},bookStatistics:{characters:10000,completed:2,chapters:Array.from({length:5},(_,i)=>({number:i+1,title:'章节',complete:i<2}))},summaryMetadata:'读到这为止 · 今天',selectionCandidate:{token:'T',text:'这是需要确认的引用内容。'.repeat(50),exact:false}}); undefined;
             """)
             try await Task.sleep(for: .milliseconds(40))
             let result = try await view.evaluateJavaScript("""
             (() => {
               const $ = id => document.getElementById(id);
-              const r = document.querySelector('.composer').getBoundingClientRect(), status = document.querySelector('.reading-status').getBoundingClientRect();
-              const within = r.left >= 0 && r.right <= innerWidth && r.top >= 0 && status.bottom <= innerHeight;
+              const r = document.querySelector('.composer').getBoundingClientRect();
+              const within = r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight;
               $('selection-confirmed').checked = true; $('selection-confirmed').dispatchEvent(new Event('change'));
               const compact = !$('selection-details').open;
               document.querySelector('[data-action="summary"]').click();
-              const progress = $('prep-text').textContent.includes('2/5') && $('summary-status').textContent.includes('2/5');
+              const progress = $('prep-text').textContent.includes('2 / 5') && $('summary-status').textContent.includes('2/5') && $('prep-retry').hidden && !$('prep-cancel').hidden;
               booksbridge.onState({assistant:{preparation:'摘要已完成',ready:true},scopeSummary:'**摘要结果**',summaryMetadata:'读到这为止 · 今天'});
-              const result = !!$('scope-summary-text').querySelector('strong') && !$('scope-summary').hidden;
-              $('reading-panel').close();
+              const result = !!$('scope-summary-text').querySelector('strong') && !$('scope-summary').hidden && $('prep-retry').hidden && $('prep-cancel').hidden;
+              $('summary-back').click();
               return {within,compact,progress,result};
             })()
             """) as! [String: Any]
@@ -611,12 +856,12 @@ extension WebRenderingTests {
         let result = try await view.evaluateJavaScript("""
         (() => {
           const $ = id => document.getElementById(id);
-          const messages = [{id:'q',role:'user',text:'原问题'},{id:'a',role:'assistant',text:'**原回答**',canRetry:true}];
+          const messages = [{id:'q',role:'user',text:'原问题'},{id:'a',role:'assistant',text:'**原回答**',canRetry:true,modelName:'Original model'}];
           const active = {assetID:'A',conversationID:'C',scope:'upToProgress',messages};
           booksbridge.onState({active});
           const action = name => document.querySelector(`[data-message-action="${name}"]`);
           booksbridge.onState({settings:{model:'updated-model',isConfigured:true}});
-          const model = document.querySelector('.msg.assistant .msg-role').textContent === 'updated-model';
+          const model = document.querySelector('.msg.assistant .msg-role').textContent === 'Original model';
           const controls = document.querySelectorAll('.message-action').length === 5;
           const size = action('copy').getBoundingClientRect().width === 28 && action('copy').querySelector('svg').getBoundingClientRect().width === 16;
           action('copy').click(); action('edit').click();
@@ -693,20 +938,19 @@ extension WebRenderingTests {
             (() => {
               const $ = id => document.getElementById(id);
               $('settings-btn').click();
-              document.querySelector('[data-section="model"]').click();
-              $('set-model').value = 'new-model'; $('set-model').dispatchEvent(new Event('input'));
+              document.querySelector('[data-section="general"]').click();
+              $('set-maxtokens').value = '16000'; $('set-maxtokens').dispatchEvent(new Event('input'));
               document.querySelector('.conv-row').click();
               const switched = !$('view-chat').hidden && $('view-settings').hidden;
               $('settings-btn').click(); $('archives-btn').click();
               const archives = !$('view-settings').hidden && !document.querySelector('[data-pane="archives"]').hidden && !$('archives-btn').closest('.side-foot');
               $('settings-btn').click();
               const toggle = !$('view-chat').hidden && !document.querySelector('#settings-close');
-              const header = $('reading-position').closest('.topbar');
-              const status = document.querySelector('.reading-status').getBoundingClientRect();
+              const header = document.querySelector('#view-chat > .topbar');
               const crumb = document.querySelector('#view-chat .crumb').getBoundingClientRect();
               const back = $('return-btn').getBoundingClientRect();
-              const layout = !!header && $('summary-status').closest('.topbar') === header && status.left >= crumb.right && status.right <= back.left && status.bottom <= header.getBoundingClientRect().bottom;
-              $('summary-status').click(); const summary = $('reading-panel').open && !$('summary-panel').hidden; $('reading-panel').close();
+              const layout = !!header && !$('reading-position') && !header.contains($('summary-status')) && crumb.right <= back.left;
+              document.querySelector('[data-action=summary]').click(); const summary = !$('summary-document').hidden && !$('reading-panel').open; $('summary-back').click();
               return {switched,archives,toggle,layout,summary};
             })()
             """) as! [String: Any]
@@ -715,7 +959,7 @@ extension WebRenderingTests {
         try await Task.sleep(for: .milliseconds(100))
         let saves = calls.calls.filter { $0["type"] as? String == "saveSettings" }
         XCTAssertEqual(saves.count, 2)
-        XCTAssertEqual((saves.first?["payload"] as? [String: Any])?["model"] as? String, "new-model")
+        XCTAssertEqual((saves.first?["payload"] as? [String: Any])?["maxContextCharacters"] as? Int, 16000)
     }
 
     func testSavedReasoningReloadsAndCanBeManuallyToggled() async throws {

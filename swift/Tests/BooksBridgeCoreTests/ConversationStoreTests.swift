@@ -8,6 +8,26 @@ import BooksBridgeCore
 ///
 /// 全部用临时目录，绝不碰用户真实的 store.json。
 final class ConversationStoreTests: XCTestCase {
+    func testPositionMarkersAreOrderedDeduplicatedAndPersistedAsMetadata() throws {
+        let store = makeStore(); store.addBook(assetID: "A", title: "书", author: "")
+        let chat = try XCTUnwrap(store.createConversation(assetID: "A"))
+        var position = ReadingSnapshot(assetID: "A", sourceHash: "h", page: .init(chapter: 0, end: 10), chapterTitle: "第一章", progress: 0.1)
+        store.recordPosition(assetID: "A", conversationID: chat.id, snapshot: position)
+        store.recordPosition(assetID: "A", conversationID: chat.id, snapshot: position, force: true)
+        let q = Conversation.Message(role: .user, text: "问题")
+        store.appendMessage(assetID: "A", conversationID: chat.id, message: q)
+        position.reused = true
+        XCTAssertTrue(store.recordPosition(assetID: "A", conversationID: chat.id, snapshot: position, before: q.id))
+        let next = ReadingSnapshot(assetID: "A", sourceHash: "h", page: .init(chapter: 0, end: 20), chapterTitle: "第一章", progress: 0.2)
+        store.recordPosition(assetID: "A", conversationID: chat.id, snapshot: next, before: q.id)
+        let messages = try XCTUnwrap(makeStore().conversation(assetID: "A", conversationID: chat.id)?.messages)
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages[0].text, "第一章 · 20.0%")
+        XCTAssertEqual(messages[1].id, q.id)
+        XCTAssertEqual(messages.filter { $0.isPositionCard != true }.map(\.text), ["问题"])
+        XCTAssertNil(store.conversation(assetID: "A", conversationID: chat.id)?.scope)
+    }
+
     func testCustomNamesPersistWithoutChangingIdentityOrBeingOverwritten() throws {
         let store = makeStore()
         store.addBook(assetID:"A",title:"同名原书",author:"")

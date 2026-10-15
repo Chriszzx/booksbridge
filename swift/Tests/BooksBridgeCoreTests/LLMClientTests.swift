@@ -87,9 +87,9 @@ final class ChatClientRequestTests: XCTestCase {
         ChatClient(baseURL: base, apiKey: "sk-test")
     }
 
-    func testAppendsV1WhenMissing() throws {
-        let url = try client("https://api.deepseek.com").endpointURL()
-        XCTAssertEqual(url.absoluteString, "https://api.deepseek.com/v1/chat/completions")
+    func testPreservesExplicitBasePathWithoutGuessingVersion() throws {
+        let url = try client("https://example.test/gateway").endpointURL()
+        XCTAssertEqual(url.absoluteString, "https://example.test/gateway/chat/completions")
     }
 
     func testKeepsExistingVersionSegment() throws {

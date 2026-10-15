@@ -15,7 +15,7 @@ public final class ReadingAssistant {
 
     private var settings: AppSettings
     private var apiKey: String
-    private var client: ChatClient { ChatClient(baseURL: settings.baseURL, apiKey: apiKey) }
+    private var client: ChatClient { ChatClient(baseURL: settings.baseURL, apiKey: apiKey, requiresAPIKey: settings.requiresAPIKey, sendsThinking: settings.sendsThinking) }
     private let promptBuilder = PromptBuilder()
     private var answerTask: Task<Void, Never>?
     private var loaded: LoadedBook?
@@ -28,7 +28,7 @@ public final class ReadingAssistant {
     public var currentMap: BookMap? { loaded?.map }
     public var currentStatistics: BookStatistics? { loaded?.statistics }
     var currentChapterIndex: Int? { loaded?.currentChapterIndex }
-    public var isConfigured: Bool { !apiKey.isEmpty && !settings.baseURL.isEmpty && !settings.model.isEmpty }
+    public var isConfigured: Bool { (!settings.requiresAPIKey || !apiKey.isEmpty) && !settings.baseURL.isEmpty && !settings.model.isEmpty }
 
     public init(settings: AppSettings, apiKey: String, knowledgeDirectory: URL? = nil) {
         self.settings = settings; self.apiKey = apiKey
@@ -140,6 +140,7 @@ public final class ReadingAssistant {
     ) -> AsyncStream<Event> {
         answerTask?.cancel()
 
+        let requestSettings = settings, requestClient = client, configured = isConfigured
         return AsyncStream { continuation in
             let task = Task { @MainActor in
                 do {
@@ -154,7 +155,7 @@ public final class ReadingAssistant {
                     return
                 }
                 guard let loaded = self.loaded else { continuation.finish(); return }
-                guard self.isConfigured else {
+                guard configured else {
                     self.emit(.failed("未配置 API Key，请先在设置里填写"), to: continuation)
                     continuation.finish()
                     return
@@ -182,57 +183,59 @@ public final class ReadingAssistant {
                           historySourceHashes.indices.contains(i), historySourceHashes[i] == loaded.map.sourceHash else { return nil }
                     return message
                 }
-                // Reserve room for system instructions, history, question and the response.
-                let totalBudget = max(4000, min(self.settings.maxContextCharacters, 200000))
-                let historyBudget = min(6000, totalBudget / 4)
-                let boundedHistory = PromptBuilder.trimHistory(safeHistory, characters: historyBudget)
-                let materialBudget = max(500, totalBudget - 2200 - question.count - boundedHistory.reduce(0) { $0 + $1.content.count })
+                // Fit both the user character limit and this model's input window. Rebuild
+                // retrieval with a smaller budget rather than chopping the final prompt or question.
+                let totalBudget = max(4000, min(requestSettings.maxContextCharacters, 200000))
+                let inputBytes = requestSettings.summaryContextTokens - requestSettings.outputTokens - 256
                 let guide = snapshot.flatMap { snapshot in study.flatMap { study in
                     study.summary(snapshot: snapshot, scope: scope) == nil ? nil : study.readingMaterial(snapshot: snapshot, scope: scope, source: loaded.chapters)
                 } } ?? ""
-                let guideBudget = max(0, materialBudget * 2 / 3 - 150)
-                let boundedGuide = guide.isEmpty ? "" : (guide.count <= guideBudget ? guide : String(guide.prefix(guideBudget)) + "\n[阅读材料超出预算，后续已省略；不能视为完整覆盖]")
-                let context = ContextBuilder(maxCharacters: max(300, materialBudget - boundedGuide.count - 100), maxExcerpts: 12, excerptCharacters: 1400).build(
-                    knowledge: "",
-                    chapters: allowed.chapters,
-                    currentChapterIndex: allowed.currentChapter,
-                    scope: scope,
-                    question: Self.retrievalQuestion(question, history: boundedHistory),
-                    visibleText: visibleText, preScoped: true
-                )
-
-                self.emit(.contextPrepared(boundedGuide.isEmpty
-                    ? "正在思考 · 已读取\(context.isComplete ? "完整原文" : "原文选段") \(context.characterCount) 字"
-                    : "正在思考 · 已读取权限内章节摘要与原文 \(boundedGuide.count + context.characterCount) 字"), to: continuation)
-                var messages = self.promptBuilder.build(
-                    book: loaded.book,
-                    question: question,
-                    context: context,
-                    visibleText: [],
-                    progress: snapshot?.progress ?? loaded.book.progress,
-                    history: boundedHistory
-                )
-                if !boundedGuide.isEmpty { messages.append(.user("本轮阅读材料（章节摘要可能省略细节，原文选段用于核对）：\n" + boundedGuide)) }
+                var historyLimit = min(6000, totalBudget / 4)
+                var materialLimit = max(300, totalBudget - 2200 - question.count)
+                var messages: [ChatMessage] = []
+                var prepared = "", scopeDescription = ""
+                for _ in 0..<12 {
+                    let boundedHistory = PromptBuilder.trimHistory(safeHistory, characters: historyLimit)
+                    let materialBudget = max(300, materialLimit - boundedHistory.reduce(0) { $0 + $1.content.count })
+                    let guideBudget = max(0, materialBudget * 2 / 3 - 150)
+                    let boundedGuide = guide.isEmpty || guideBudget == 0 ? "" : (guide.count <= guideBudget ? guide : String(guide.prefix(guideBudget)) + "\n[阅读材料超出预算，后续已省略；不能视为完整覆盖]")
+                    let context = ContextBuilder(maxCharacters: max(300, materialBudget - boundedGuide.count - 100), maxExcerpts: 12, excerptCharacters: 1400).build(
+                        knowledge: "", chapters: allowed.chapters, currentChapterIndex: allowed.currentChapter,
+                        scope: scope, question: Self.retrievalQuestion(question, history: boundedHistory), visibleText: visibleText, preScoped: true)
+                    messages = self.promptBuilder.build(book: loaded.book, question: question, context: context,
+                        visibleText: [], progress: snapshot?.progress ?? loaded.book.progress, history: boundedHistory)
+                    if !boundedGuide.isEmpty { messages.append(.user("本轮阅读材料（章节摘要可能省略细节，原文选段用于核对）：\n" + boundedGuide)) }
+                    scopeDescription = context.scopeDescription + " · " + (context.isComplete ? "完整原文" : "选段，存在省略") + " \(context.characterCount) 字"
+                    prepared = boundedGuide.isEmpty
+                        ? "正在思考 · 已读取\(context.isComplete ? "完整原文" : "原文选段") \(context.characterCount) 字"
+                        : "正在思考 · 已读取权限内章节摘要与原文 \(boundedGuide.count + context.characterCount) 字"
+                    if messages.reduce(0, { $0 + $1.content.count }) <= totalBudget,
+                       messages.reduce(0, { $0 + $1.content.utf8.count + 64 }) <= inputBytes { break }
+                    materialLimit = max(300, materialLimit * 2 / 3)
+                    historyLimit = historyLimit * 2 / 3
+                }
+                self.emit(.contextPrepared(prepared), to: continuation)
 
                 var answer = ""
                 var usage: TokenUsage?
                 var outputLimited = false
                 do {
-                    if boundedGuide.isEmpty, let snapshot, let summary, summary.isAllowed(snapshot: snapshot, reading: allowed) {
+                    if guide.isEmpty, let snapshot, let summary, summary.isAllowed(snapshot: snapshot, reading: allowed) {
                         let remaining = max(0, totalBudget - messages.reduce(0) { $0 + $1.content.count } - 100)
                         if remaining > summary.text.count {
                             messages.append(.user("权限内的已生成摘要（原文优先，摘要可能有省略）：\n" + summary.text))
                         }
                     }
-                    guard messages.reduce(0, { $0 + $1.content.count }) <= totalBudget else {
-                        self.emit(.failed("组装后的请求超过字符预算，本次未发送；请增大请求预算。"), to: continuation)
+                    guard messages.reduce(0, { $0 + $1.content.count }) <= totalBudget,
+                          messages.reduce(0, { $0 + $1.content.utf8.count + 64 }) + requestSettings.outputTokens + 256 <= requestSettings.summaryContextTokens else {
+                        self.emit(.failed("本次问题与阅读材料超过模型上下文或请求预算，尚未发送。请缩短问题、开启新对话或选择更大上下文的模型。"), to: continuation)
                         continuation.finish(); return
                     }
-                    let stream = self.client.stream(
-                        model: self.settings.model,
+                    let stream = requestClient.stream(
+                        model: requestSettings.model,
                         messages: messages,
-                        thinking: self.settings.thinkingLevel.thinkingMode,
-                        temperature: self.settings.temperature, maxTokens: 8192
+                        thinking: requestSettings.thinkingLevel.thinkingMode,
+                        temperature: requestSettings.sendsTemperature ? requestSettings.temperature : nil, maxTokens: requestSettings.outputTokens
                     )
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -255,7 +258,7 @@ public final class ReadingAssistant {
                     if outputLimited { answer += "\n\n> 本次回答达到输出上限，内容尚未完成。" }
                     self.emit(.finished(
                         answer: answer,
-                        scopeDescription: context.scopeDescription + " · " + (context.isComplete ? "完整原文" : "选段，存在省略") + " \(context.characterCount) 字",
+                        scopeDescription: scopeDescription,
                         usage: usage
                     ), to: continuation)
                     continuation.finish()

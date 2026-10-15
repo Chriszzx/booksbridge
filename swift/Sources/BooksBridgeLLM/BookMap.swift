@@ -114,6 +114,10 @@ public struct ReadingSnapshot: Codable, Sendable, Equatable {
         self.chapterTitle = chapterTitle; self.progress = progress; self.capturedAt = capturedAt; self.reused = reused
         self.positionEvidence = positionEvidence; self.reportedProgress = reportedProgress
     }
+    public var compactLabel: String {
+        guard page != nil else { return "当前位置未定位" }
+        return "\(chapterTitle) · \(String(format: "%.1f%%", progress * 100))" + (reused ? " · 沿用上次位置" : "")
+    }
     public var label: String {
         guard page != nil else {
             if let reportedProgress { return "已识别本书 · 书库进度 \(String(format: "%.1f%%", reportedProgress * 100)) · 页末尚未定位，请将 Books 阅读窗口置于前台片刻" }

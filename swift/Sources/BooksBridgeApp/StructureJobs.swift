@@ -43,8 +43,8 @@ final class StructureJobs {
                 try valid()
                 let classifier = ChapterClassifier(contextTokens: settings.summaryContextTokens, characterBudget: settings.maxContextCharacters) { messages, output in
                     if let completion { return try await completion(messages, output) }
-                    return try await ChatClient(baseURL: settings.baseURL, apiKey: apiKey).complete(model: settings.model, messages: messages,
-                        thinking: .disabled, temperature: 0, maxTokens: output, requireComplete: true).0
+                    return try await ChatClient(baseURL: settings.baseURL, apiKey: apiKey, requiresAPIKey: settings.requiresAPIKey, sendsThinking: settings.sendsThinking).complete(model: settings.model, messages: messages,
+                        thinking: settings.thinkingLevel.thinkingMode, temperature: settings.sendsTemperature ? settings.temperature : nil, maxTokens: min(output, settings.outputTokens), requireComplete: true).0
                 }
                 let proposal = try await classifier.classify(candidates: candidates, chapters: source, base: base, model: settings.model) { @MainActor [weak self] done,total in
                     try self?.progress(key: key, libraryID: libraryID, generation: generation, version: base.structureVersion,

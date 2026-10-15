@@ -38,6 +38,8 @@ codex*.jsonl
 .env.*
 !.env.example
 secret.json
+model-secrets.json
+models.json
 store.json
 knowledge/
 *.p12

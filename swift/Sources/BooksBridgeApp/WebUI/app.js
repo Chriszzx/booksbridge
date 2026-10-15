@@ -18,7 +18,7 @@
   function invoke(type, payload) {
     if (["openBook", "selectConversation", "newConversation", "restoreConversation"].includes(type)) {
       if (payload?.assetID && collapsedBooks.has(payload.assetID)) setBookCollapsed(payload.assetID, false);
-      showView("chat");
+      closeSummary(); showView("chat");
     }
     const handler = window.webkit?.messageHandlers?.booksbridge;
     if (!handler) {
@@ -280,35 +280,36 @@
     {id:"now", command:"now", label:"刷新当前进度", hint:"本地刷新；/now 问题可刷新后提问"},
     {id:"select", command:"select", label:"读取 Books 划选", hint:"预览并确认本次引用"},
     {id:"scope", command:"scope", label:"查看读取范围", hint:"章节、位置和允许读取的字数"},
-    {id:"summary", command:"summary", label:"查看与管理摘要", hint:"查看进度、结果，或手动生成"},
+    {id:"summary", command:"summary", label:"全书摘要", hint:"查看进度、结果，或手动生成"},
     {id:"new", command:"new", label:"新建对话", hint:"为当前书籍开始新的对话"},
-    {id:"generate", label:"生成阅读摘要"},
+    {id:"generate", label:"生成全书摘要"},
     {id:"cancelSummary", label:"取消摘要生成"},
     {id:"clearSummary", label:"清除摘要"},
+    {id:"regenerate", label:"重新生成"},
   ];
   let commandMatches = [], commandIndex = 0;
   let menuAnchor = null;
   function feedback(text) { $("command-feedback").textContent = text; $("command-feedback").hidden = false; }
   function actionDisabled(id) {
     if (id === "new") return !state.active?.assetID || chatState.streaming;
-    if (!hasConversation()) return true;
-    if (id === "summary") return false;
+    if (["summary", "generate", "cancelSummary", "clearSummary", "regenerate"].includes(id)) {
+      if (!state.active?.assetID) return true;
+      if (id === "summary") return false;
+      if (id === "cancelSummary") return !chatState.summaryRunning;
+      if (id === "clearSummary") return !chatState.hasSharedSummary && !chatState.summaryRunning;
+      return chatState.summaryRunning || !(window.ModelManager?.summaryReady ?? settingsState.settings?.isConfigured);
+    }
+    if (!hasConversation() || chatState.refreshingPosition) return true;
     if (state.active?.archived) return true;
-    if (id === "cancelSummary") return !chatState.preparation.startsWith("正在");
     if (chatState.streaming) return true;
-    if (id === "generate") return chatState.preparation.startsWith("正在") || !settingsState.settings?.isConfigured;
-    if (id === "clearSummary") return !(chatState.hasSharedSummary || chatState.preparationReady);
     return false;
   }
   function renderActionAvailability() {
     $("actions-btn").disabled = !state.active?.assetID;
     for (const el of document.querySelectorAll("[data-action]")) {
       const id = el.dataset.action; el.disabled = actionDisabled(id);
-      if (id === "cancelSummary") el.hidden = !chatState.preparation.startsWith("正在");
-      if (id === "clearSummary") el.hidden = !(chatState.hasSharedSummary || chatState.preparationReady);
-      if (id === "generate") el.hidden = chatState.preparation.startsWith("正在");
     }
-    $("range-mode").textContent = `读取模式：${settingsState.knowledgeScopes.find(s => s.id === (state.active?.scope || chatState.scope))?.label ?? "尚未选择"}${state.active?.scope ? " · 本对话已固定" : " · 首次提问或生成摘要后固定"}`;
+    $("range-mode").textContent = `读取模式：${settingsState.knowledgeScopes.find(s => s.id === (state.active?.scope || chatState.scope))?.label ?? "尚未选择"}${state.active?.scope ? " · 本对话已固定" : " · 首次提问后固定"}`;
   }
   function closeMenus(restoreFocus = false) {
     $("actions-menu").hidden = true; $("sidebar-menu").hidden = true;
@@ -346,7 +347,7 @@
     pendingStructureAction = {action, payload:{assetID:chapterStructure.assetID, conversationID:chapterStructure.conversationID,
       version:chapterStructure.version, proposalID:chapterStructure.proposalID, confirmed:true}};
     const text = {
-      analyzeStructure: ["分析全书章节结构？", `将全书候选标题、层级、位置和每个候选附近最多 160 个非空白字符（可能包含未读内容）发送至 ${settingsState.settings?.baseURL || "当前接口"}，使用 ${settingsState.settings?.model || "当前模型"} 分批分析，会产生 API 用量。每批遵守所设上下文预算。结果仅作为结构建议，不进入聊天上下文；不会自动生成摘要或改变阅读权限。`],
+      analyzeStructure: ["分析全书章节结构？", `将全书候选标题、层级、位置和每个候选附近最多 160 个非空白字符（可能包含未读内容）发送至 ${window.ModelManager?.summaryName || "所选摘要模型"} 对应的接口 分批分析，会产生 API 用量。每批遵守所设上下文预算。结果仅作为结构建议，不进入聊天上下文；不会自动生成摘要或改变阅读权限。`],
       applyStructure: ["应用这份章节方案？", "书籍下所有对话共享新结构。保留边界和正文未变的章节摘要，其余章节及全书摘要重新生成。运行中的回答和摘要将停止。整章模式的对话需分别确认新的读取范围；读到这里的原文位置不变。"],
       restoreStructure: ["恢复本地章节结构？", "恢复由原书目录和标题构建的章节地图。会停止正在进行的回答和摘要，清理失效摘要，整章对话需要重新确认范围。Apple Books 原书不变。"],
       confirmStructureScope: ["确认本对话新的整章范围？", "本对话将按照当前章节统计读取：当前所在章节的完整内容及之前全部章节。这可能比原结构包含更多未读文字。请先核对章节统计；确认仅对本对话及当前结构版本生效。"]
@@ -354,38 +355,41 @@
     $("structure-confirm-title").textContent = text[0]; $("structure-confirm-text").textContent = text[1];
     $("structure-confirm").showModal(); $("structure-no").focus();
   }
+  let summaryTarget = null;
   function openPanel(kind) {
-    $("reading-panel-title").textContent = kind === "scope" ? "本轮读取范围" : "阅读摘要";
-    $("range-panel").hidden = kind !== "scope"; $("summary-panel").hidden = kind === "scope";
+    if (kind === "summary") {
+      showView("chat");
+      $("summary-document").hidden = false; els.viewChat.classList.add("show-summary");
+      $("summary-book-title").textContent = state.library.find(b => b.assetID === state.active?.assetID)?.title || "";
+      renderPreparation(); return;
+    }
+    $("range-panel").hidden = false;
     if (!$("reading-panel").open) $("reading-panel").showModal();
   }
+  function closeSummary() { $("summary-document").hidden = true; els.viewChat.classList.remove("show-summary"); }
   function runAction(id) {
     if (actionDisabled(id)) { feedback("当前状态下无法执行此操作。"); return; }
     closeMenus(); hideCommands(); $("command-feedback").hidden = true;
     switch (id) {
       case "now":
-        appendMessage("user", "/now", {roleLabel:"我"}); startStreaming();
-        startAssistantMessage(); chatState.streamNode.textContent = "正在刷新阅读位置…";
-        invoke("ask", {question:"/now", scope:chatState.scope}); break;
+        chatState.refreshingPosition = true;
+        showPosition("正在刷新阅读位置…"); renderComposerState();
+        invoke("refreshPosition"); break;
       case "select":
         feedback("正在读取 Books 中的划选…"); invoke("captureSelection"); break;
       case "scope":
         $("reading-check-result").textContent = "正在检查本地正文与当前页…";
         openPanel("scope"); invoke("checkReading", {scope:state.active?.scope || chatState.scope}); break;
       case "summary": openPanel("summary"); break;
-      case "generate": {
-        $("prepare-confirm").dataset.action = "generate";
-        $("prepare-title").textContent = "按章节生成当前范围摘要？";
-        $("prepare-yes").textContent = "确认生成";
-        const scope = settingsState.knowledgeScopes.find(s => s.id === (state.active?.scope || chatState.scope))?.label ?? "当前范围";
-        $("prepare-destination").textContent = `读取范围：${scope}。将该范围内的正文发送至 ${settingsState.settings?.baseURL ?? "当前接口"}，使用 ${settingsState.settings?.model ?? "当前模型"} 生成摘要，会产生 API 用量。确认后刷新本书进度，按刷新后的边界生成。首次生成会固定本对话模式。只生成权限内完整章节；读到这里的当前章使用已读原文。已完成章节会复用，选择整本书时最后汇总全书。同一本书下所有对话共享进度和结果。`;
-        if (!$("prepare-confirm").open) $("prepare-confirm").showModal(); break;
-      }
+      case "generate":
+      case "regenerate":
+        invoke("reprocessBook", {confirmed:true, restart:id === "regenerate"});
+        openPanel("summary"); break;
       case "cancelSummary": invoke("cancelPreparation"); break;
       case "clearSummary":
-        $("prepare-confirm").dataset.action = "clear"; $("prepare-title").textContent = "清除本书共享摘要？";
+        $("prepare-confirm").dataset.action = "clear"; $("prepare-title").textContent = "清除全书摘要？";
         $("prepare-destination").textContent = "将取消本书摘要任务，清除全部章节摘要和全书摘要，影响本书所有对话。章节统计和 Apple Books 原书保留。";
-        $("prepare-yes").textContent = "清除共享摘要"; $("prepare-confirm").showModal(); $("prepare-no").focus(); break;
+        $("prepare-yes").textContent = "清除摘要"; $("prepare-confirm").showModal(); $("prepare-no").focus(); break;
       case "new": invoke("newConversation", {assetID:state.active.assetID}); break;
     }
   }
@@ -555,6 +559,7 @@
       const more = button("⋯", "icon-btn row-action", () => sidebarMenu(more, [
         {label:"上移", disabled:index === 0, run:() => moveRelative(book.assetID, -1)},
         {label:"下移", disabled:index === state.library.length - 1, run:() => moveRelative(book.assetID, 1)},
+        {label:"全书摘要", run:() => { summaryTarget = book.assetID; invoke("openBook", {assetID:book.assetID}); if (state.active?.assetID === book.assetID) { openPanel("summary"); summaryTarget = null; } }},
         {label:"重命名", run:() => manage("renameBook", book)},
         {label:"删除书籍", danger:true, run:() => manage("deleteBook", book)},
       ]));
@@ -595,7 +600,7 @@
           {label:"重命名", run:() => manage("renameConversation", book, conversation)},
         ]));
         more.setAttribute("aria-label", `${conversation.title}的操作`); more.setAttribute("aria-haspopup", "menu");
-        wrap.append(row, badge, more); convList.append(wrap);
+        wrap.append(row, more); convList.append(wrap);
       }
       group.append(bookRow, convList); list.append(group);
     }
@@ -705,7 +710,7 @@
 
     const roleLabel = document.createElement("div");
     roleLabel.className = "msg-role";
-    roleLabel.textContent = options.roleLabel ?? (role === "user" ? "我" : settingsState.settings?.model ?? "助手");
+    roleLabel.textContent = options.roleLabel ?? (role === "user" ? "我" : window.ModelManager?.chatName ?? "助手");
     wrap.append(roleLabel);
 
     if (options.reasoning) {
@@ -836,23 +841,53 @@
     if (original.querySelector('.msg-reasoning')) delete original.querySelector('.msg-reasoning').dataset.bound;
     attachMessageActions(original,message); retryBackup = null;
   }
+  function compactPosition(text) {
+    if (/未定位|未取得有效/.test(text)) return "当前位置未定位";
+    return text.replace(/ · 已刷新/g, "").replace(/ · \d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?/g, "");
+  }
+  function positionNode(text, id) {
+    const node = document.createElement("div"); node.className = "position-marker";
+    node.textContent = compactPosition(text); node.dataset.rawText = text;
+    if (id) node.dataset.messageId = id;
+    return node;
+  }
+  function showPosition(text, beforeUser = false) {
+    const user = beforeUser ? chatState.streamNode?.closest('.msg')?.previousElementSibling : null;
+    const adjacent = user?.classList.contains('user') ? user.previousElementSibling : els.messages.lastElementChild;
+    const node = positionNode(text);
+    if (adjacent?.classList.contains('position-marker')) adjacent.replaceWith(node);
+    else if (user?.classList.contains('user')) els.messages.insertBefore(node, user);
+    else els.messages.append(node);
+    scrollToBottom();
+  }
   function syncMessages() {
     if (chatState.streaming) return;
     const messages = state.active?.messages ?? [];
     const signature = JSON.stringify(messages);
     if (signature === renderedMessagesSignature) return;
     renderedMessagesSignature = signature;
-    const existing = [...els.messages.querySelectorAll('.msg')];
+    const existing = [...els.messages.querySelectorAll('.msg, .position-marker')];
     for (const message of messages) {
+      if (message.isPositionCard) {
+        if (message.role === 'user') continue; // Legacy /now commands are not chat messages.
+        const old = existing.find(el => el.dataset.messageId === message.id);
+        if (old) existing.splice(existing.indexOf(old), 1);
+        const node = positionNode(message.text, message.id);
+        old?.remove(); els.messages.append(node); continue;
+      }
       let wrap = existing.find(el => message.id && el.dataset.messageId === message.id);
       if (!wrap) wrap = existing.find(el => !el.dataset.messageId && el.classList.contains(message.role) && (el.dataset.rawText ?? el.querySelector('.msg-body')?.textContent) === message.text);
       if (!wrap || (wrap.dataset.rawText !== undefined && wrap.dataset.rawText !== message.text)) {
-        wrap = appendMessage(message.role, message.text, {roleLabel: message.isPositionCard ? '阅读位置' : undefined, reasoning:message.reasoning, reasoningExpanded:message.reasoningExpanded}).closest('.msg');
+        wrap = appendMessage(message.role, message.text, {roleLabel: message.role === 'user' ? '我' : message.modelName ?? '助手', reasoning:message.reasoning, reasoningExpanded:message.reasoningExpanded}).closest('.msg');
       }
       const index = existing.indexOf(wrap); if (index >= 0) existing.splice(index,1);
+      wrap.querySelector('.msg-role').textContent = message.role === 'user' ? '我' : message.modelName ?? '助手';
       attachMessageActions(wrap,message); els.messages.append(wrap);
     }
     existing.forEach(el => el.remove());
+    for (const marker of [...els.messages.querySelectorAll('.position-marker')]) {
+      if (marker.nextElementSibling?.classList.contains('position-marker')) marker.remove();
+    }
   }
 
   function appendError(text) {
@@ -874,25 +909,25 @@
 
   // ---------- 渲染：预处理状态 ----------
 
+  let summaryStatistics = null;
   function renderPreparation() {
-    const text = hasConversation() ? (chatState.preparation || "直接读取本地原文 · 未生成摘要") : "";
-    if (!text) {
-      els.prepBar.hidden = true;
-      return;
-    }
-    els.prepBar.hidden = false;
-    els.prepText.textContent = text;
-    $("summary-status").textContent = text.replace("本地章节地图 · ", "").replace("未生成范围摘要", "未生成摘要");
-    $("summary-status").title = text;
-    els.prepBar.classList.toggle("ready", chatState.preparationReady);
-    els.prepBar.classList.toggle("failed", chatState.preparationFailed);
-    els.prepRetry.hidden = !hasConversation();
-    const processing = /正在/.test(text);
-    document.getElementById("prep-cancel").hidden = !processing;
-    document.getElementById("prep-clear").hidden = !(chatState.hasSharedSummary || chatState.preparationReady);
-    els.prepRetry.hidden = processing || !hasConversation();
-    els.prepRetry.disabled = chatState.streaming || !(settingsState.settings?.isConfigured ?? false);
-    els.prepRetry.textContent = "生成 / 继续当前范围摘要";
+    const stats = summaryStatistics;
+    const complete = chatState.preparationReady;
+    const running = chatState.summaryRunning;
+    const completed = stats?.completed || 0, total = stats?.chapters?.length || 0;
+    const failed = chatState.preparationFailed;
+    const status = complete ? "已完成" : running ? (total && completed === total ? "正在汇总全书" : total ? `正在生成 · 已完成 ${completed} / ${total}` : "正在读取书籍…")
+      : failed ? "生成失败 · 已完成章节保留" : completed ? `未完成 · ${completed} / ${total}` : "尚未生成";
+    els.prepBar.hidden = false; els.prepText.textContent = status;
+    $("summary-status").textContent = complete ? "已完成" : running ? (total ? `生成中 ${completed}/${total}` : "准备中") : completed ? "未完成" : "";
+    $("summary-progress").hidden = !running;
+    $("summary-progress").max = Math.max(1, total + 1); $("summary-progress").value = completed;
+    els.prepRetry.hidden = running || complete;
+    els.prepRetry.disabled = actionDisabled("generate");
+    els.prepRetry.textContent = completed ? "继续生成" : "生成全书摘要";
+    $("prep-cancel").hidden = !running;
+    $("summary-metadata").textContent = failed ? chatState.preparation : complete ? "" : "概括全书内容，包含结局与后续情节。";
+    $("summary-book-title").textContent = state.library.find(b => b.assetID === state.active?.assetID)?.title || "";
   }
 
   // ---------- 渲染：知识范围选择器 ----------
@@ -915,16 +950,16 @@
     els.scopePicker.value = chatState.scope;
     els.scopePicker.disabled = !!state.active?.scope || chatState.streaming;
     els.scopePicker.title = state.active?.scope ? "本对话权限已固定；更换权限请新建对话" : "选择本对话的读取权限";
-    document.getElementById("composer-model").textContent = settingsState.settings?.model ?? "未配置模型";
+    window.ModelManager?.renderSelection(chatState.streaming, chatState.summaryRunning);
     renderPreparation();
   }
 
   // ---------- 渲染：发送状态 ----------
 
   function renderComposerState() {
-    const configured = settingsState.settings?.isConfigured ?? false;
+    const configured = (window.ModelManager?.chatReady ?? settingsState.settings?.isConfigured ?? false);
     const localCommand = /^\/(now|select|scope|summary|new)\s*$/.test(els.input.value.trim());
-    const canSend = (configured || localCommand) && hasConversation() && !chatState.streaming
+    const canSend = (configured || localCommand) && hasConversation() && !chatState.streaming && !chatState.refreshingPosition
       && !state.active?.archived && els.input.value.trim().length > 0 && (localCommand || !selectedQuote || $("selection-confirmed").checked);
 
     els.sendBtn.disabled = !canSend;
@@ -936,7 +971,7 @@
     renderMessageActions();
 
     if (!configured) {
-      els.input.placeholder = "输入 / 使用阅读命令；提问前请配置 API Key";
+      els.input.placeholder = "输入 / 使用阅读命令；提问前请选择可用模型";
     } else if (!hasConversation()) {
       els.input.placeholder = "先在左侧选择一本书";
     } else {
@@ -1078,17 +1113,6 @@
     const s = settingsState.settings;
     if (!s) return;
 
-    // 服务商下拉
-    if (els.setProvider.options.length !== settingsState.providers.length) {
-      els.setProvider.textContent = "";
-      for (const provider of settingsState.providers) {
-        const option = document.createElement("option");
-        option.value = provider.id;
-        option.textContent = provider.label;
-        els.setProvider.append(option);
-      }
-    }
-
     // 默认知识范围下拉
     if (els.setScope.options.length !== settingsState.knowledgeScopes.length) {
       els.setScope.textContent = "";
@@ -1100,53 +1124,13 @@
       }
     }
 
-    // 思考模式下拉
-    if (els.setThinking.options.length !== settingsState.thinkingLevels.length) {
-      els.setThinking.textContent = "";
-      for (const level of settingsState.thinkingLevels) {
-        const option = document.createElement("option");
-        option.value = level.id;
-        option.textContent = level.label;
-        els.setThinking.append(option);
-      }
-    }
-
-    // 避免覆盖用户正在输入的内容
     if (!settingsState.dirty) {
-      els.setProvider.value = s.provider;
-      els.setBaseURL.value = s.baseURL;
-      els.setModel.value = s.model;
       els.setScope.value = s.defaultScope;
-      els.setThinking.value = s.thinkingLevel;
-      document.getElementById("set-auto-expand-reasoning").checked = s.autoExpandReasoning === true;
+      $("set-auto-expand-reasoning").checked = s.autoExpandReasoning === true;
       els.setMaxTokens.value = String(s.maxContextCharacters);
-      $("set-summary-context").value = String(s.summaryContextTokens || 32768);
-      els.setTemp.value = String(s.temperature);
-      els.setTempValue.textContent = Number(s.temperature).toFixed(1);
-      els.setApiKey.value = s.hasAPIKey ? "••••••••••••" : "";
-      els.setApiKey.placeholder = s.hasAPIKey ? "已配置（留空则不修改）" : "未配置";
     }
-
-    // 思考模式说明
-    els.setThinkingHint.textContent =
-      settingsState.thinkingLevels.find((x) => x.id === s.thinkingLevel)?.explanation ?? "";
-    // 范围说明
-    const scopeInfo = settingsState.knowledgeScopes.find((x) => x.id === s.defaultScope);
-    if (scopeInfo) {
-      document.getElementById("set-scope-hint").textContent = scopeInfo.explanation;
-    }
-
-    // 模型建议
-    const provider = settingsState.providers.find((p) => p.id === s.provider);
-    els.modelSuggestions.textContent = "";
-    for (const model of provider?.models ?? []) {
-      const option = document.createElement("option");
-      option.value = model;
-      els.modelSuggestions.append(option);
-    }
-    // Ollama 不需要 Key，禁用输入框
-    els.setApiKey.disabled = provider ? !provider.requiresAPIKey : false;
-
+    const scopeInfo = settingsState.knowledgeScopes.find(x => x.id === s.defaultScope);
+    if (scopeInfo) $("set-scope-hint").textContent = scopeInfo.explanation;
     renderPermissionRows();
     renderProbe();
     renderSettingsBadge();
@@ -1247,7 +1231,7 @@
     for (const id of ["reading-panel", "prepare-confirm", "structure-confirm"]) if ($(id).open) $(id).close();
     els.input.value = ""; autoGrow();
     $("command-feedback").hidden = true;
-    $("summary-status").textContent = "未生成摘要";
+    closeSummary(); summaryStatistics = null; chatState.refreshingPosition = false;
     chatState.streaming = false;
     document.getElementById("reading-check-result").textContent = "";
     chatState.preparation = ""; chatState.preparationReady = false; chatState.preparationFailed = false; chatState.hasSharedSummary = false;
@@ -1269,6 +1253,7 @@
   // 按 payload 里出现了哪些字段来决定更新什么。
   window.booksbridge = {
     onState(payload) {
+      window.ModelManager?.receive(payload);
       if (payload.sourceImport) showBookSource("duplicate", payload.sourceImport);
       if (payload.bookIdentification) showBookSource("identify", payload.bookIdentification);
       if (payload.managementResult) {
@@ -1305,18 +1290,12 @@
             details.open = payload.settings.autoExpandReasoning === true;
           }
         }
-        for (const wrap of document.querySelectorAll('.msg.assistant')) {
-          if (wrap.dataset.positionCard !== 'true') wrap.querySelector('.msg-role').textContent = payload.settings.model ?? '助手';
-        }
       }
       if (Array.isArray(payload.providers)) settingsState.providers = payload.providers;
       if (Array.isArray(payload.knowledgeScopes)) settingsState.knowledgeScopes = payload.knowledgeScopes;
       if (Array.isArray(payload.thinkingLevels)) settingsState.thinkingLevels = payload.thinkingLevels;
       if (payload.permissionProbe) settingsState.permissionProbe = payload.permissionProbe;
 
-      if (payload.apiTest && payload.apiTest.requestID === apiRequestID) {
-        apiResult.textContent = payload.apiTest.text; apiTestButton.disabled = false;
-      }
       if (payload.openSettings) showView("settings");
 
       // 会话历史：仅在切换会话时整段重绘，避免与流式渲染互相打架
@@ -1327,22 +1306,21 @@
       if (payload.messageActionError) appendError(payload.messageActionError);
 
       if (payload.readingPosition !== undefined) {
-        $("reading-position").textContent = (chatState.streaming ? "本轮读取 · " : "") + payload.readingPosition;
-        $("reading-position").title = $("reading-position").textContent;
         $("range-position").textContent = payload.readingPosition;
       }
-      if (payload.positionCard) {
-        const card = appendMessage("assistant", payload.positionCard, {roleLabel:"阅读位置"});
-        if (chatState.streamNode) els.messages.insertBefore(card.closest(".msg"), chatState.streamNode.closest(".msg"));
+      if (payload.positionDivider) showPosition(payload.positionDivider, true);
+      if (payload.positionRefreshFinished || (chatState.refreshingPosition && payload.chatEvent?.kind === "error")) {
+        chatState.refreshingPosition = false; renderedMessagesSignature = null;
+        if (payload.positionRefreshError) { showPosition("当前位置未定位"); feedback(payload.positionRefreshError); }
       }
       if (payload.assistant) chatState.hasSharedSummary = payload.assistant.hasSharedSummary === true;
       if (payload.bookStatistics !== undefined) {
-        const stats = payload.bookStatistics;
-        $("book-statistics").textContent = stats ? `全书 ${stats.characters.toLocaleString()} 字符 · ${stats.chapterCount ?? stats.chapters.length} 个可识别章节、${stats.chapters.length - (stats.chapterCount ?? stats.chapters.length)} 个其他区段 · ${stats.documents} 个正文文档 · ${stats.headings} 个目录/标题节点 · token 保守估计 ${stats.estimatedTokens.toLocaleString()}。摘要 ${stats.completed}/${stats.chapters.length}，全书摘要${stats.wholeComplete ? "已完成" : "待汇总"}。` : "尚未取得本地书籍统计";
+        const stats = payload.bookStatistics; summaryStatistics = stats;
+        $("book-statistics").textContent = stats ? `约 ${stats.characters.toLocaleString()} 字 · ${stats.chapterCount ?? stats.chapters.length} 章` : "正在读取本地书籍…";
         $("chapter-statistics-list").replaceChildren();
         for (const chapter of stats?.chapters || []) {
           const row = document.createElement("p"); row.className = "chapter-stat-row";
-          row.textContent = `${chapter.number}. ${chapter.title} · ${chapter.kind || "章节"} · ${chapter.characters.toLocaleString()} 字符 · token 估计 ${chapter.estimatedTokens.toLocaleString()} · ${chapter.complete ? "摘要已完成" : "未生成"}${chapter.partial ? " · 当前章使用已读原文，完整章摘要隔离" : chapter.allowed ? "" : " · 当前权限不读取"}`;
+          row.textContent = `${chapter.number}. ${chapter.title} · ${chapter.complete ? "已完成" : "未生成"}`;
           $("chapter-statistics-list").append(row);
         }
       }
@@ -1372,11 +1350,13 @@
       }
       // 预处理状态
       if (payload.assistant) {
+        chatState.summaryRunning = payload.assistant.running === true;
         chatState.preparation = payload.assistant.preparation ?? "";
         chatState.preparationReady = payload.assistant.ready === true;
         chatState.preparationFailed = /失败/.test(chatState.preparation);
       }
 
+      if (summaryTarget && state.active?.assetID === summaryTarget) { summaryTarget = null; openPanel("summary"); }
       renderSidebar();
       renderChat();
       renderSettings();
@@ -1398,13 +1378,12 @@
       domActiveConv: document.querySelectorAll(".conv-row.active").length,
       domNavItems: document.querySelectorAll(".nav-item").length,
       activePane: [...document.querySelectorAll(".pane")].find((p) => !p.hidden)?.dataset.pane ?? "",
-      providerOptions: els.setProvider.options.length,
+      providerOptions: document.querySelectorAll(".service-item").length,
       scopeOptions: els.setScope.options.length,
-      modelValue: els.setModel.value,
-      baseURLValue: els.setBaseURL.value,
+      modelValue: window.ModelManager?.chatName ?? "",
       scopeValue: els.setScope.value,
       hasAPIKey: settingsState.settings?.hasAPIKey ?? false,
-      isConfigured: settingsState.settings?.isConfigured ?? false,
+      isConfigured: (window.ModelManager?.chatReady ?? settingsState.settings?.isConfigured ?? false),
       settingsBadgeHidden: els.settingsBadge.hidden,
       permFda: els.permFda.textContent,
       permAx: els.permAx.textContent,
@@ -1524,7 +1503,7 @@
 
   function send() {
     const question = els.input.value.trim();
-    if (!question || chatState.streaming || !hasConversation() || state.active?.archived) return;
+    if (!question || chatState.streaming || chatState.refreshingPosition || !hasConversation() || state.active?.archived) return;
     const command = question.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
     if (command && !(command[1] === "now" && command[2]?.trim())) {
       const action = actions.find(a => a.command === command[1]);
@@ -1532,9 +1511,9 @@
       if (actionDisabled(action.id)) { feedback("当前状态下无法执行此操作。"); return; }
       els.input.value = ""; autoGrow(); hideCommands(); renderComposerState(); runAction(action.id); return;
     }
-    if (!(settingsState.settings?.isConfigured ?? false)) { feedback("请先在设置中配置模型接口。"); return; }
+    if (!((window.ModelManager?.chatReady ?? settingsState.settings?.isConfigured ?? false))) { feedback("请先在设置中配置模型接口。"); return; }
     if (selectedQuote && !document.getElementById("selection-confirmed").checked) return;
-    appendMessage("user", question + (selectedQuote ? "\n\n引用：\n" + selectedQuote.text : ""), { roleLabel: "我" });
+    appendMessage("user", question.replace(/^\/now\s+/, "") + (selectedQuote ? "\n\n引用：\n" + selectedQuote.text : ""), { roleLabel: "我" });
     els.input.value = "";
     autoGrow(); hideCommands(); $("command-feedback").hidden = true;
     startStreaming();
@@ -1561,11 +1540,16 @@
     renderStructure(chapterStructure);
   });
   document.querySelectorAll("[data-action]").forEach(el => el.addEventListener("click", () => runAction(el.dataset.action)));
+  $("summary-back").addEventListener("click", closeSummary);
+  $("summary-more").addEventListener("click", () => sidebarMenu($("summary-more"), [
+    {label:"重新生成", disabled:actionDisabled("regenerate"), run:() => runAction("regenerate")},
+    {label:"清除摘要", disabled:actionDisabled("clearSummary"), run:() => runAction("clearSummary")},
+  ]));
   $("prepare-yes").addEventListener("click", () => {
     const action = $("prepare-confirm").dataset.action;
     $("prepare-confirm").close();
     if (action === "clear") invoke("clearKnowledge", {confirmed:true});
-    else invoke("reprocessBook", {confirmed:true, scope:state.active?.scope || chatState.scope});
+    else invoke("reprocessBook", {confirmed:true});
     openPanel("summary");
   });
   $("prepare-no").addEventListener("click", () => $("prepare-confirm").close());
@@ -1579,21 +1563,6 @@
     if (pendingStructureAction) invoke(pendingStructureAction.action, pendingStructureAction.payload);
     pendingStructureAction = null; $("structure-confirm").close();
   });
-  let apiRequestID = "";
-  const apiResult = document.getElementById("api-test-result");
-  const apiTestButton = document.getElementById("api-test");
-  for (const field of [els.setBaseURL, els.setModel, els.setApiKey, els.setProvider].filter(Boolean)) {
-    field.addEventListener("input", () => {
-      apiRequestID = ""; apiTestButton.disabled = false; apiResult.textContent = "配置已改变，请重新检测";
-    });
-  }
-  apiTestButton.addEventListener("click", () => {
-    apiRequestID = String(Date.now()); apiTestButton.disabled = true; apiResult.textContent = "正在检测…";
-    const key = els.setApiKey.value.trim();
-    invoke("testAPI", { requestID: apiRequestID, baseURL: els.setBaseURL.value.trim(), model: els.setModel.value.trim(),
-      ...((key && !/^•+$/.test(key)) ? { apiKey: key } : {}) });
-  });
-
   els.input.addEventListener("input", () => {
     autoGrow();
     renderComposerState();
@@ -1638,57 +1607,21 @@
   });
   $("perm-connect").addEventListener("click", () => invoke("connectBooks"));
 
-  els.setApiKeyToggle.addEventListener("click", () => {
-    const showing = els.setApiKey.type === "text";
-    els.setApiKey.type = showing ? "password" : "text";
-    els.setApiKeyToggle.textContent = showing ? "显示" : "隐藏";
-  });
-
-  els.setTemp.addEventListener("input", () => {
-    els.setTempValue.textContent = Number(els.setTemp.value).toFixed(1);
-    settingsState.dirty = true;
-  });
-
-  // 任何设置控件的改动都标记为 dirty，防止推送覆盖
-  for (const el of [
-    els.setProvider, els.setBaseURL, els.setModel,
-    els.setScope, els.setMaxTokens, $("set-summary-context"), els.setApiKey, els.setThinking, document.getElementById("set-auto-expand-reasoning"),
-  ]) {
+  for (const el of [els.setScope, els.setMaxTokens, $("set-auto-expand-reasoning")]) {
     el.addEventListener("input", () => { settingsState.dirty = true; });
     el.addEventListener("change", () => { settingsState.dirty = true; });
   }
-
-  // 换服务商时把地址与模型换成该服务商的默认值，减少手填
-  els.setProvider.addEventListener("change", () => {
-    const provider = settingsState.providers.find((p) => p.id === els.setProvider.value);
-    if (!provider) return;
-    if (provider.defaultBaseURL) els.setBaseURL.value = provider.defaultBaseURL;
-    if (provider.models?.length) els.setModel.value = provider.models[0];
-    els.setApiKey.disabled = !provider.requiresAPIKey;
-    renderSettings();
-  });
-
-  /** 收集设置并提交给宿主。 */
   function collectAndSave() {
     if (!settingsState.dirty) return;
-    const payload = {
-      provider: els.setProvider.value,
-      baseURL: els.setBaseURL.value.trim(),
-      model: els.setModel.value.trim(),
+    invoke("saveSettings", {
       defaultScope: els.setScope.value,
-      thinkingLevel: els.setThinking.value,
-      autoExpandReasoning: document.getElementById("set-auto-expand-reasoning").checked,
+      autoExpandReasoning: $("set-auto-expand-reasoning").checked,
       maxContextCharacters: Number(els.setMaxTokens.value) || 12000,
-      summaryContextTokens: Number($("set-summary-context").value) || 32768,
-      temperature: Number(els.setTemp.value) || 0,
-    };
-    // 密码框里是掩码占位符时不要提交
-    const key = els.setApiKey.value.trim();
-    if (key && !/^•+$/.test(key)) payload.apiKey = key;
-
-    invoke("saveSettings", payload);
+    });
     settingsState.dirty = false;
   }
+
+  window.ModelManager?.init({ invoke, feedback, context: () => ({ active: state.active, streaming: chatState.streaming, summaryRunning: chatState.summaryRunning }) });
 
   // ---------- 键盘 ----------
 

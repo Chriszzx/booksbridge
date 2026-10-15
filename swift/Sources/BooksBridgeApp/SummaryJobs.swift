@@ -8,11 +8,40 @@ final class SummaryJobs {
     typealias Processor = @Sendable (String, String) async throws -> String
     var processOverride: Processor?
     var onUpdate: ((String) -> Void)?
+    private var loading: [String: Task<Void, Never>] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var generations: [String: UUID] = [:]
     private var failures: [String: String] = [:]
-    func isRunning(assetID: String) -> Bool { tasks[assetID] != nil }
+    func isRunning(assetID: String) -> Bool { tasks[assetID] != nil || loading[assetID] != nil }
     func failureStatus(assetID: String) -> String? { failures[assetID] }
+
+    /// Preparing a book is also a book-owned job, independent of navigation and chat permissions.
+    func startWholeBook(assetID: String, settings: AppSettings, apiKey: String, store: ConversationStore,
+                        loadBook: @escaping @Sendable () async throws -> Book) {
+        guard !isRunning(assetID: assetID), let saved = store.book(assetID: assetID) else { return }
+        let generation = UUID(), libraryID = saved.libraryID
+        generations[assetID] = generation; failures[assetID] = nil
+        loading[assetID] = Task {
+            defer { if generations[assetID] == generation { loading[assetID] = nil; onUpdate?(assetID) } }
+            do {
+                let book = try await loadBook()
+                let reader = ReadingAssistant(settings: settings, apiKey: "")
+                let snapshot = try await reader.refresh(book: book, live: nil, previous: nil, persistMap: false)
+                try Task.checkCancellation()
+                guard generations[assetID] == generation, book.assetID == assetID,
+                      store.book(assetID: assetID)?.libraryID == libraryID,
+                      let statistics = reader.currentStatistics else { throw CancellationError() }
+                guard store.updateStatistics(assetID: assetID, statistics: statistics) else { throw JobError.writeFailed }
+                loading[assetID] = nil
+                start(book: book, snapshot: snapshot, chapters: reader.currentChapters,
+                      scope: .wholeBook, settings: settings, apiKey: apiKey, store: store)
+            } catch is CancellationError {} catch {
+                if generations[assetID] == generation { failures[assetID] = "摘要失败：\(error.localizedDescription)" }
+            }
+            onUpdate?(assetID)
+        }
+        onUpdate?(assetID)
+    }
 
     func start(book: Book, snapshot: ReadingSnapshot, chapters: [BookPreprocessor.Chapter],
                scope: KnowledgeScope, settings: AppSettings, apiKey: String, store: ConversationStore) {
@@ -25,7 +54,7 @@ final class SummaryJobs {
         let sections = original.allowedSections(snapshot: snapshot, scope: scope)
         let processor = processOverride
         tasks[key] = Task {
-            defer { if generations[key] == generation { tasks[key] = nil; generations[key] = nil } }
+            defer { if generations[key] == generation { tasks[key] = nil; generations[key] = nil; onUpdate?(key) } }
             @MainActor func current() throws -> BookStudy {
                 try Task.checkCancellation()
                 guard generations[key] == generation, let saved = store.book(assetID: key), saved.libraryID == libraryID,
@@ -38,9 +67,9 @@ final class SummaryJobs {
                 guard store.saveStudy(assetID: key, study: study) else { throw JobError.writeFailed }
                 onUpdate?(key)
             }
-            let summarizer = ChapterSummarizer(characterBudget: settings.maxContextCharacters, contextTokens: settings.summaryContextTokens) { messages, output in
-                let result = try await ChatClient(baseURL: settings.baseURL, apiKey: apiKey).complete(
-                    model: settings.model, messages: messages, thinking: .disabled, temperature: 0.3, maxTokens: output, requireComplete: true)
+            let summarizer = ChapterSummarizer(characterBudget: settings.maxContextCharacters, contextTokens: settings.summaryContextTokens, outputTokens: min(2048, settings.outputTokens)) { messages, output in
+                let result = try await ChatClient(baseURL: settings.baseURL, apiKey: apiKey, requiresAPIKey: settings.requiresAPIKey, sendsThinking: settings.sendsThinking).complete(
+                    model: settings.model, messages: messages, thinking: settings.thinkingLevel.thinkingMode, temperature: settings.sendsTemperature ? settings.temperature : nil, maxTokens: output, requireComplete: true)
                 return result.0
             }
             @MainActor func generate(_ text: String, title: String) async throws -> String {
@@ -98,6 +127,7 @@ final class SummaryJobs {
     func cancel(assetID: String, store: ConversationStore) {
         generations[assetID] = nil
         failures[assetID] = nil
+        loading.removeValue(forKey: assetID)?.cancel()
         tasks.removeValue(forKey: assetID)?.cancel()
         if var study = store.book(assetID: assetID)?.study {
             study.status = "摘要已取消；已完成章节保留，可继续生成"

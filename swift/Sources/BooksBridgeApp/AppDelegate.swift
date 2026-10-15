@@ -26,13 +26,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let booksStore = BooksStore()
     /// 应用设置（服务商、模型、上下文范围）与 API Key。
     private var settings: SettingsStore!
+    private let models = ModelCatalogStore()
     /// 阅读问答编排：预处理与流式问答。
     private let assistant = ReadingAssistant(settings: AppSettings(), apiKey: "")
     /// 当前问答的流式事件流，用于取消。
     private var apiTestTask: Task<Void, Never>?
     private var apiTestGeneration = 0
     private var answerStream: Task<Void, Never>?
-    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String, reasoning: String, reasoningExpanded: Bool?)?
+    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String, reasoning: String, reasoningExpanded: Bool?, model: ModelStamp?)?
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
     private let structureJobs = StructureJobs()
@@ -137,11 +138,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                    conversation.archivedAt == nil, conversation.readingSnapshot?.page == nil,
                    self.latestContext?.book.assetID == canonical {
                     self.store.updateReading(assetID: canonical, conversationID: id, snapshot: verified)
+                    if conversation.messages.allSatisfy({ $0.isPositionCard == true }) {
+                        self.store.recordPosition(assetID: canonical, conversationID: id, snapshot: verified)
+                    }
                 }
                 self.pushState(message: "本书阅读位置已验证，可供新对话使用")
             }
         }
-        assistant.update(settings: settings.settings, apiKey: settings.apiKey)
+        assistant.update(settings: settings.settings, apiKey: "")
         writeReport()
 
 
@@ -594,6 +598,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 generateSummary(invocation.payload)
             }
 
+        case "refreshPosition":
+            refreshPosition()
         case "checkReading":
             checkReading(invocation.payload)
         case "captureSelection":
@@ -611,8 +617,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case "analyzeStructure", "applyStructure", "restoreStructure", "discardStructure", "cancelStructure", "confirmStructureScope":
             handleStructure(invocation.type, payload: invocation.payload)
-        case "testAPI":
-            testAPI(invocation.payload)
+        case "saveService", "deleteService", "saveModel", "addModels", "deleteModel", "setDefaultModel", "selectModel", "listModels", "testModel":
+            handleModels(invocation.type, payload: invocation.payload)
         case "showPermissions":
             openSettings()
 
@@ -761,7 +767,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 1:N —— 新进入的书默认有一条对话，用户可继续新建
         if book?.conversations.contains(where: { $0.archivedAt == nil }) != true {
-            store.createConversation(assetID: assetID)
+            if let created = store.createConversation(assetID: assetID), let id = models.state.defaultChat {
+                store.setChatModel(assetID: assetID, conversationID: created.id, modelID: id)
+            }
             book = store.book(assetID: assetID)
         }
 
@@ -811,21 +819,104 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func handleModels(_ action: String, payload: [String: Any]) {
+        let requestID = payload["requestID"] as? String ?? ""
+        func result(_ message: String, success: Bool = true, extra: [String:Any] = [:]) {
+            var value = extra; value["requestID"] = requestID; value["message"] = message; value["success"] = success
+            bridge.push(["modelResult": value]); pushSettings(); pushState(message: message)
+        }
+        do {
+            switch action {
+            case "saveService":
+                let id = try models.saveService(id: payload["id"] as? String,
+                    name: payload["name"] as? String ?? "", baseURL: payload["baseURL"] as? String ?? "",
+                    enabled: payload["enabled"] as? Bool ?? true, requiresKey: payload["requiresKey"] as? Bool ?? true,
+                    key: payload["key"] as? String)
+                result("服务商已保存", extra: ["serviceID": id])
+            case "deleteService":
+                guard payload["confirmed"] as? Bool == true, let id = payload["id"] as? String else { return }
+                try models.deleteService(id); result("服务商及其密钥已删除")
+            case "saveModel":
+                guard let provider = payload["serviceID"] as? String else { return }
+                var model = ServiceModel(name: payload["name"] as? String ?? "", remoteID: payload["remoteID"] as? String ?? "")
+                if let id = payload["id"] as? String {
+                    guard let existing = models.service(provider)?.models.first(where: { $0.id == id }) else { throw ModelCatalogStore.Failure.invalid("模型已删除。") }
+                    model.id = existing.id; model.revision = existing.revision
+                }
+                model.contextTokens = payload["contextTokens"] as? Int ?? 32768
+                model.outputTokens = payload["outputTokens"] as? Int ?? 2048
+                model.sendsThinking = payload["sendsThinking"] as? Bool ?? false
+                model.thinking = (payload["thinking"] as? String).flatMap(AppSettings.ThinkingLevel.init(rawValue:)) ?? .off
+                model.sendsTemperature = payload["sendsTemperature"] as? Bool ?? true
+                model.temperature = payload["temperature"] as? Double ?? 0.3
+                try models.saveModel(serviceID: provider, model: model); result("模型已保存", extra: ["serviceID":provider])
+            case "addModels":
+                guard let provider = payload["serviceID"] as? String,
+                      let ids = payload["remoteIDs"] as? [String], let revision = payload["revision"] as? String else {
+                    throw ModelCatalogStore.Failure.invalid("请选择要添加的模型。")
+                }
+                let count = try models.addModels(serviceID: provider, remoteIDs: ids, revision: revision)
+                result("已添加 \(count) 个模型", extra: ["serviceID":provider, "addedCount":count])
+            case "deleteModel":
+                guard payload["confirmed"] as? Bool == true, let provider = payload["serviceID"] as? String, let id = payload["id"] as? String else { return }
+                try models.deleteModel(serviceID: provider, id: id); result("模型已删除；历史回复和摘要保留")
+            case "setDefaultModel":
+                let id = payload["id"] as? String ?? ""
+                try models.setDefault(payload["purpose"] as? String ?? "", id: id.isEmpty ? nil : id); result("默认模型已保存")
+            case "selectModel":
+                guard let assetID = payload["assetID"] as? String, let id = payload["id"] as? String else { return }
+                _ = try models.resolve(id)
+                if payload["purpose"] as? String == "summary" {
+                    guard !summaryJobs.isRunning(assetID: assetID), !structureJobs.isRunning(assetID) else { throw ModelCatalogStore.Failure.invalid("请等待或停止本书任务，再更换模型。") }
+                    guard store.setSummaryModel(assetID: assetID, modelID: id) else { throw SummaryJobs.JobError.writeFailed }
+                } else {
+                    guard pendingReply == nil, let cid = payload["conversationID"] as? String,
+                          store.conversation(assetID: assetID, conversationID: cid)?.archivedAt == nil else { throw ModelCatalogStore.Failure.invalid("当前无法更换对话模型。") }
+                    guard store.setChatModel(assetID: assetID, conversationID: cid, modelID: id) else { throw SummaryJobs.JobError.writeFailed }
+                }
+                result("模型已选择")
+            case "listModels", "testModel":
+                // Only these explicit user actions access a provider. Opening settings never does.
+                let client: ChatClient, selected: ModelConnection?
+                if action == "testModel" {
+                    let connection = try models.resolve(payload["id"] as? String)
+                    selected = connection; client = ChatClient(baseURL: connection.service.baseURL, apiKey: connection.key, timeout: 15, requiresAPIKey: connection.service.requiresKey, sendsThinking: connection.model.sendsThinking)
+                } else {
+                    guard let id = payload["serviceID"] as? String, let service = models.service(id), service.enabled else { throw ModelCatalogStore.Failure.invalid("请先保存并启用服务商。") }
+                    selected = nil
+                    client = ChatClient(baseURL: service.baseURL, apiKey: models.key(for: id), timeout: 15, requiresAPIKey: service.requiresKey, sendsThinking: false)
+                }
+                apiTestTask?.cancel(); apiTestGeneration += 1
+                let generation = apiTestGeneration
+                apiTestTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let start = Date()
+                    do {
+                        var extra: [String:Any] = [:]
+                        if let selected {
+                            let response = try await client.complete(model: selected.model.remoteID, messages: [.user("Reply OK.")],
+                                thinking: selected.model.thinking.thinkingMode, temperature: selected.model.sendsTemperature ? selected.model.temperature : nil,
+                                maxTokens: min(256, selected.model.outputTokens))
+                            guard !response.text.isEmpty else { throw ChatClient.ClientError.decoding("模型未返回内容") }
+                        } else { extra["models"] = try await client.listModels() }
+                        try Task.checkCancellation()
+                        guard generation == self.apiTestGeneration else { return }
+                        extra["requestID"] = requestID; extra["success"] = true
+                        extra["message"] = String(format: "成功 · %.0f ms", Date().timeIntervalSince(start) * 1000)
+                        self.bridge.push(["modelResult": extra])
+                    } catch {
+                        guard !Task.isCancelled, generation == self.apiTestGeneration else { return }
+                        self.bridge.push(["modelResult": ["requestID":requestID, "success":false, "message":"请求失败：\(error.localizedDescription)"]])
+                    }
+                }
+            default: return
+            }
+        } catch { result(error.localizedDescription, success: false) }
+    }
+
     /// 保存前端提交的设置。
     private func saveSettings(_ payload: [String: Any]) {
         settings.update { draft in
-            if let raw = payload["provider"] as? String,
-               let provider = AppSettings.Provider(rawValue: raw) {
-                // 换服务商时，若地址还是旧服务商的默认值，就跟着换成新的默认值
-                let wasDefault = AppSettings.Provider.allCases.contains { $0.defaultBaseURL == draft.baseURL }
-                draft.provider = provider
-                if wasDefault, !provider.defaultBaseURL.isEmpty {
-                    draft.baseURL = provider.defaultBaseURL
-                }
-            }
-            if let value = payload["baseURL"] as? String { draft.baseURL = value }
-            if let value = payload["model"] as? String { draft.model = value }
-            if let value = payload["temperature"] as? Double { draft.temperature = min(max(value, 0), 2) }
             if let raw = payload["defaultScope"] as? String,
                let scope = KnowledgeScope(rawValue: raw) {
                 draft.defaultScope = scope
@@ -840,14 +931,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 draft.thinkingLevel = level
             }
         }
-        // API Key 单独处理：空字符串表示"不改动"，显式 clear 才清空
-        if let key = payload["apiKey"] as? String, !key.isEmpty {
-            settings.setAPIKey(key)
-        } else if payload["clearAPIKey"] as? Bool == true {
-            settings.setAPIKey("")
-        }
-        assistant.update(settings: settings.settings, apiKey: settings.apiKey)
-        NSLog("[BooksBridge] 设置已保存：provider=\(settings.settings.provider.rawValue) model=\(settings.settings.model) 已配置=\(settings.isConfigured)")
         statusItem.refreshTooltip()
     }
 
@@ -859,7 +942,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         assistant.cancelAnswer()
         if let pending = pendingReply, pending.retryID == nil, (!pending.text.isEmpty || !pending.reasoning.isEmpty) {
             store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
-                answer: .init(role: .assistant, text: pending.text.isEmpty ? "已停止" : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning, reasoningExpanded: pending.reasoningExpanded))
+                answer: .init(role: .assistant, text: pending.text.isEmpty ? "已停止" : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning, reasoningExpanded: pending.reasoningExpanded, model: pending.model))
         }
         pendingReply = nil
     }
@@ -922,11 +1005,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         positionTask = Task { @MainActor in
             do {
                 let (_, snapshot, _) = try await refreshConversation(assetID: assetID, conversationID: id)
-                if store.conversation(assetID: assetID, conversationID: id)?.messages.isEmpty == true {
-                    store.appendMessage(assetID: assetID, conversationID: id, message: .init(role: .assistant, text: snapshot.label, isPositionCard: true))
-                    if store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == id {
-                        bridge.push(["positionCard": snapshot.label])
-                    }
+                let messages = store.conversation(assetID: assetID, conversationID: id)?.messages ?? []
+                if messages.isEmpty || messages.allSatisfy({ $0.isPositionCard == true }) {
+                    store.recordPosition(assetID: assetID, conversationID: id, snapshot: snapshot)
+                    pushState(message: "")
                 }
             } catch is CancellationError {} catch {
                 if store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == id {
@@ -962,8 +1044,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let book = BooksBridgeCore.Book(assetID: assetID, title: stored.title, author: stored.author, progress: 0, contentType: .epub, path: path, lastOpened: nil)
         if action == "analyzeStructure" {
-            guard assistant.isConfigured else { pushState(message: "请先配置模型接口"); return }
-            structureJobs.start(book: book, settings: settings.settings, apiKey: settings.apiKey, store: store); return
+            do {
+                let connection = try models.resolve(stored.summaryModelID ?? models.state.defaultSummary)
+                structureJobs.start(book: book, settings: connection.settings(settings.settings), apiKey: connection.key, store: store)
+            } catch { pushState(message: error.localizedDescription) }
+            return
         }
         guard action == "applyStructure" || action == "restoreStructure" else { return }
         // Re-read the source without asking Apple Books to navigate or change anything.
@@ -995,24 +1080,28 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func generateSummary(_ payload: [String: Any]) {
-        guard let active = store.state.lastActive, let id = active.conversationID,
-              store.conversation(assetID: active.assetID, conversationID: id)?.archivedAt == nil else { return }
-        let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
-        guard let scope = store.lockScope(assetID: active.assetID, conversationID: id, requested: requested) else { return }
-        positionTask?.cancel()
-        positionTask = Task { @MainActor in
-            do {
-                let (book, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
-                try validateStructurePermission(assetID: active.assetID, conversationID: id, scope: scope)
-                _ = try assistant.reading(snapshot: snapshot, scope: scope)
-                summaryJobs.start(book: book, snapshot: snapshot, chapters: assistant.currentChapters,
-                    scope: scope, settings: settings.settings, apiKey: settings.apiKey, store: store)
-            } catch is CancellationError {} catch {
-                if var study = store.book(assetID: active.assetID)?.study {
-                    study.status = "摘要失败：\(error)"; _ = store.saveStudy(assetID: active.assetID, study: study)
+        guard let active = store.state.lastActive, let stored = store.book(assetID: active.assetID), !summaryJobs.isRunning(assetID: active.assetID) else { return }
+        let connection: ModelConnection
+        do { connection = try models.resolve(stored.summaryModelID ?? models.state.defaultSummary) }
+        catch { pushState(message: error.localizedDescription); return }
+        if payload["restart"] as? Bool != true, !connection.canResumeSummary(of: stored) {
+            pushState(message: "摘要模型或配置已改变，请选择重新生成全文摘要。已有摘要保留。"); return
+        }
+        let assetID = active.assetID, sourceIDs = stored.sourceAssetIDs
+        if payload["restart"] as? Bool == true {
+            summaryJobs.cancel(assetID: assetID, store: store)
+            guard store.clearStudy(assetID: assetID) else { return }
+        }
+        guard store.setSummaryModel(assetID: assetID, modelID: connection.model.id, stamp: connection.stamp) else {
+            pushState(message: "模型选择保存失败"); return
+        }
+        summaryJobs.startWholeBook(assetID: assetID, settings: connection.settings(settings.settings), apiKey: connection.key, store: store) {
+            try await Task.detached {
+                for id in sourceIDs.reversed() {
+                    if let book = try BooksStore().book(assetID: id), book.path != nil { return book.identified(by: assetID) }
                 }
-                pushState(message: "摘要未发送")
-            }
+                throw ReadingAssistant.AssistantError.notLoaded
+            }.value
         }
     }
 
@@ -1040,27 +1129,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 发起提问。
-    private func testAPI(_ payload: [String: Any]) {
-        apiTestTask?.cancel()
-        apiTestGeneration += 1
-        let generation = apiTestGeneration
-        let requestID = payload["requestID"] as? String ?? ""
-        let base = payload["baseURL"] as? String ?? settings.settings.baseURL
-        let model = payload["model"] as? String ?? settings.settings.model
-        let key = (payload["apiKey"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? settings.apiKey
-        apiTestTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            let start = Date()
+    private func refreshPosition() {
+        guard let active = store.state.lastActive, let id = active.conversationID,
+              store.conversation(assetID: active.assetID, conversationID: id)?.archivedAt == nil else { return }
+        positionTask?.cancel()
+        positionTask = Task { @MainActor in
             do {
-                let result = try await ChatClient(baseURL: base, apiKey: key, timeout: 15).complete(
-                    model: model, messages: [.user("Reply OK.")], maxTokens: 8)
+                guard connectionRequested, dataAccess.isGranted else { throw ReadingAssistant.AssistantError.notLoaded }
+                let (_, snapshot, _) = try await refreshConversation(assetID: active.assetID, conversationID: id)
                 try Task.checkCancellation()
-                guard generation == self.apiTestGeneration else { return }
-                guard !result.text.isEmpty else { throw ChatClient.ClientError.decoding("模型没有返回内容") }
-                self.bridge.push(["apiTest": ["requestID": requestID, "text": String(format: "可用 · %@ · %.0f ms · %@", model, Date().timeIntervalSince(start) * 1000, Date().formatted(date: .omitted, time: .standard))]])
-            } catch {
-                guard !Task.isCancelled, generation == self.apiTestGeneration else { return }
-                self.bridge.push(["apiTest": ["requestID": requestID, "text": "检测失败：\(error)"]])
+                guard store.state.lastActive?.assetID == active.assetID, store.state.lastActive?.conversationID == id else { return }
+                store.recordPosition(assetID: active.assetID, conversationID: id, snapshot: snapshot, force: true)
+                bridge.push(["positionRefreshFinished": true]); pushState(message: "")
+            } catch is CancellationError {} catch {
+                guard !Task.isCancelled, store.state.lastActive?.assetID == active.assetID,
+                      store.state.lastActive?.conversationID == id else { return }
+                bridge.push(["positionRefreshFinished": true, "positionRefreshError": "刷新失败：\(error.localizedDescription)"])
             }
         }
     }
@@ -1130,17 +1214,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         if retryID != nil && request.isEmpty {
             bridge.push(["chatEvent": ["kind": "error", "text": "这条消息只有本地命令，请先修改为问题再重试"]]); return
         }
+        let connection: ModelConnection?
+        do {
+            connection = request.isEmpty ? nil : try models.resolve(store.conversation(assetID: active.assetID, conversationID: conversationID)?.modelID ?? models.state.defaultChat)
+            if let connection {
+                guard store.setChatModel(assetID: active.assetID, conversationID: conversationID, modelID: connection.model.id) else { throw SummaryJobs.JobError.writeFailed }
+            }
+        } catch { bridge.push(["chatEvent": ["kind": "error", "text": error.localizedDescription]]); return }
+        let requestSettings = connection?.settings(settings.settings)
         let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
         let scope = request.isEmpty ? requested : store.lockScope(assetID: active.assetID, conversationID: conversationID, requested: requested) ?? requested
         let conversation = store.conversation(assetID: active.assetID, conversationID: conversationID)!
         let end = questionID.flatMap { id in conversation.messages.firstIndex { $0.id == id } } ?? conversation.messages.count
         let previous = Array(conversation.messages.prefix(end).dropFirst(conversation.scopeHistoryStartIndex ?? 0)).filter { $0.isPositionCard != true }
         let history: [ChatMessage] = previous.map { $0.role == .user ? .user($0.text) : .assistant($0.text) }
-        let userMessage = Conversation.Message(id: questionID ?? UUID().uuidString, role: .user, text: question, isPositionCard: request.isEmpty)
-        if retryID == nil { store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: userMessage) }
+        let userMessage = Conversation.Message(id: questionID ?? UUID().uuidString, role: .user, text: request, isPositionCard: false)
+        if retryID == nil && !request.isEmpty { store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: userMessage) }
         cancelPendingAnswer()
         positionTask?.cancel()
-        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "", "", nil)
+        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "", "", nil, connection?.stamp)
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { if !Task.isCancelled { answerStream = nil; pendingReply = nil } }
@@ -1148,13 +1240,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 let assetID = active.assetID
                 let (book, snapshot, live) = try await refreshConversation(assetID: assetID, conversationID: conversationID)
                 guard !Task.isCancelled, store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == conversationID else { return }
-                if isNow && retryID == nil {
-                    store.appendMessage(assetID: assetID, conversationID: conversationID, message: .init(role: .assistant, text: snapshot.label, isPositionCard: true))
+                if retryID == nil {
+                    let changed = store.recordPosition(assetID: assetID, conversationID: conversationID,
+                        snapshot: snapshot, before: request.isEmpty ? nil : userMessage.id, force: isNow)
                     if request.isEmpty {
-                        bridge.push(["chatEvent": ["kind": "finished", "text": snapshot.label, "roleLabel": "阅读位置（本地）"]])
-                        pushState(message: "位置已刷新，未调用模型"); return
+                        bridge.push(["positionRefreshFinished": true]); pushState(message: ""); return
                     }
-                    bridge.push(["positionCard": snapshot.label])
+                    if changed { bridge.push(["positionDivider": snapshot.compactLabel]) }
                 }
                 try validateStructurePermission(assetID: assetID, conversationID: conversationID, scope: scope)
                 let allowed = try assistant.reading(snapshot: snapshot, scope: scope)
@@ -1168,15 +1260,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     prompt += "\n\n用户确认引用的文字：\n" + selection.text
                     store.updateConversation(assetID: assetID, conversationID: conversationID) {
-                        if let index = $0.messages.lastIndex(where: { $0.role == .user }) { $0.messages[index].text = question + "\n\n引用：\n" + selection.text }
+                        if let index = $0.messages.lastIndex(where: { $0.role == .user }) { $0.messages[index].text = request + "\n\n引用：\n" + selection.text }
                     }
                     selectionCandidate = nil
                 }
                 let visible = live?.book.assetID == assetID ? live?.visibleText ?? [] : []
+                if let connection, let requestSettings { assistant.update(settings: requestSettings, apiKey: connection.key) }
                 let stream = assistant.ask(book: book, currentCFI: live?.book.assetID == assetID ? live?.position?.cfi : nil,
                     question: prompt, scope: scope, visibleText: visible, history: history,
                     historyBoundaries: previous.map(\.boundary), historySourceHashes: previous.map(\.sourceHash),
-                    snapshot: snapshot, summary: store.book(assetID: assetID)?.study?.summary(snapshot: snapshot, scope: scope), study: store.book(assetID: assetID)?.study)
+                    snapshot: snapshot, summary: nil, study: scope == .wholeBook ? nil : store.book(assetID: assetID)?.study)
                 for await event in stream {
                     guard !Task.isCancelled, store.state.lastActive?.assetID == assetID,
                           store.state.lastActive?.conversationID == conversationID else { break }
@@ -1185,7 +1278,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch is CancellationError {} catch {
                 guard !Task.isCancelled, store.state.lastActive?.assetID == active.assetID,
                       store.state.lastActive?.conversationID == conversationID else { return }
-                handleAssistantEvent(.failed(String(describing: error)), questionID: userMessage.id, retryID: retryID)
+                if request.isEmpty { bridge.push(["positionRefreshFinished": true, "positionRefreshError": "刷新失败：\(error.localizedDescription)"]) }
+                else { handleAssistantEvent(.failed(String(describing: error)), questionID: userMessage.id, retryID: retryID) }
             }
         }
     }
@@ -1211,12 +1305,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case .finished(let answer, let scopeDescription, let usage):
             let reasoning = pendingReply?.reasoning
             let reasoningExpanded = pendingReply?.reasoningExpanded
+            let model = pendingReply?.model
             pendingReply = nil
             // 落盘助手回答
             if let active = store.state.lastActive,
                let conversationID = active.conversationID {
                 store.saveAnswer(assetID: active.assetID, conversationID: conversationID, questionID: questionID, replacing: retryID,
-                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: reasoning?.isEmpty == false ? reasoning : nil, reasoningExpanded: reasoningExpanded))
+                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash, reasoning: reasoning?.isEmpty == false ? reasoning : nil, reasoningExpanded: reasoningExpanded, model: model))
             }
             var payload: [String: Any] = [
                 "kind": "finished",
@@ -1237,7 +1332,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             if let pending = pendingReply, pending.retryID == nil, (!pending.text.isEmpty || !pending.reasoning.isEmpty) {
                 store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
                     answer: .init(role: .assistant, text: pending.text.isEmpty ? "生成失败：" + message : pending.text, boundary: pending.text.isEmpty ? nil : assistant.lastBoundary,
-                        sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning, reasoningExpanded: pending.reasoningExpanded))
+                        sourceHash: assistant.lastSourceHash, reasoning: pending.reasoning.isEmpty ? nil : pending.reasoning, reasoningExpanded: pending.reasoningExpanded, model: pending.model))
             }
             pendingReply = nil
             bridge.push(["chatEvent": ["kind": "error", "text": message]])
@@ -1252,6 +1347,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("[BooksBridge] 新建对话失败：书 \(assetID) 不在书库中")
             return
         }
+        if let id = models.state.defaultChat { store.setChatModel(assetID: assetID, conversationID: conversation.id, modelID: id) }
         store.setActive(assetID: assetID, conversationID: conversation.id)
         pushState(message: "已新建 \(conversation.title)")
         prepareBook(assetID: assetID)
@@ -1422,36 +1518,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         guard frontendReady else { return }
         var body: [String: Any] = [
             "settings": [
-                "provider": settings.settings.provider.rawValue,
-                "baseURL": settings.settings.baseURL,
-                "model": settings.settings.model,
-                "temperature": settings.settings.temperature,
                 "defaultScope": settings.settings.defaultScope.rawValue,
                 "maxContextCharacters": settings.settings.maxContextCharacters,
-                "thinkingLevel": settings.settings.thinkingLevel.rawValue,
                 "autoExpandReasoning": settings.settings.autoExpandReasoning,
-                "summaryContextTokens": settings.settings.summaryContextTokens,
                 // 只暴露"是否已填"，不回传明文
-                "hasAPIKey": settings.hasAPIKey,
-                "isConfigured": settings.isConfigured,
+                "isConfigured": (try? models.resolve(models.state.defaultChat)) != nil,
             ],
-            "providers": AppSettings.Provider.allCases.map { provider in
-                [
-                    "id": provider.rawValue,
-                    "label": provider.label,
-                    "defaultBaseURL": provider.defaultBaseURL,
-                    "requiresAPIKey": provider.requiresAPIKey,
-                    "models": provider.suggestedModels,
-                ] as [String: Any]
-            },
-            "thinkingLevels": AppSettings.ThinkingLevel.allCases.map { level in
-                ["id": level.rawValue, "label": level.label, "explanation": level.explanation]
-            },
             "knowledgeScopes": KnowledgeScope.allCases.map { scope in
                 ["id": scope.rawValue, "label": scope.label, "explanation": scope.explanation]
             },
             "permissionProbe": cachedProbe,
         ]
+        body["modelCatalog"] = models.payload
         if open { body["openSettings"] = true }
         bridge.push(body)
     }
@@ -1487,15 +1565,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             return ["title": book.displayTitle, "status": summaryJobs.failureStatus(assetID: book.assetID) ?? study.status]
         }
         var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": jobs, "sidebarLayout": sidebarLayout.payload]
-        body["assistant"] = ["preparation": "本地章节地图 · 摘要按需生成", "ready": false]
+        body["assistant"] = ["preparation": store.state.lastActive.flatMap { summaryJobs.failureStatus(assetID: $0.assetID) } ?? "尚未生成", "ready": false, "running": store.state.lastActive.map { summaryJobs.isRunning(assetID: $0.assetID) } ?? false]
         body["readingPosition"] = "尚未取得有效阅读位置"
         body["scopeSummary"] = ""
-        body["summaryMetadata"] = "尚未生成摘要"
+        body["summaryMetadata"] = "概括全书内容，包含结局与后续情节。"
         body["bookStatistics"] = NSNull()
         body["chapterStructure"] = NSNull()
         if let active = store.state.lastActive, let id = active.conversationID,
            let conversation = store.conversation(assetID: active.assetID, conversationID: id) {
-            body["readingPosition"] = conversation.readingSnapshot?.label ?? "尚未取得有效阅读位置"
+            body["readingPosition"] = conversation.readingSnapshot?.compactLabel ?? "当前位置未定位"
             if let study = store.book(assetID: active.assetID)?.study {
                 let scope = conversation.scope ?? settings.settings.defaultScope
                 let proposal = study.proposedStructure
@@ -1515,10 +1593,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         return "\(index + 1). \(level)\(title) · \(ChapterStructure.label(node.kind)) · 文档 \(node.start.chapter + 1):\(node.start.end) · \(node.startsSection ? "独立区段" : "合入前章")\(node.confidence < 0.75 || node.kind == "unknown" ? " · 待核对" : "")"
                     } ?? []] as [String: Any]
                 let needsScopeConfirmation = store.structurePermissionRequired(assetID: active.assetID, conversationID: id, scope: scope)
-                let safe = needsScopeConfirmation ? nil : conversation.readingSnapshot.flatMap { study.summary(snapshot: $0, scope: scope) }
+                let safe = study.whole
                 body["scopeSummary"] = safe?.text ?? ""
-                body["summaryMetadata"] = (safe?.coverageLabel ?? "当前范围暂无可用摘要") + (study.whole != nil && scope != .wholeBook ? " · 全书摘要已生成，当前权限不读取" : "")
-                body["assistant"] = ["preparation": summaryJobs.failureStatus(assetID: active.assetID) ?? study.status, "ready": safe != nil, "hasSharedSummary": study.completedCount > 0 || study.whole != nil]
+                body["summaryMetadata"] = "概括全书内容，包含结局与后续情节。"
+                body["assistant"] = ["preparation": summaryJobs.failureStatus(assetID: active.assetID) ?? study.status, "ready": safe != nil, "hasSharedSummary": study.completedCount > 0 || study.whole != nil, "running": summaryJobs.isRunning(assetID: active.assetID)]
                 let allowed = conversation.readingSnapshot.map { study.allowedSections(snapshot: $0, scope: needsScopeConfirmation ? .upToProgress : scope).map(\.id) } ?? []
                 body["bookStatistics"] = ["characters": study.statistics.characterCount, "estimatedTokens": study.statistics.estimatedTokens,
                     "documents": study.statistics.documentCount, "headings": study.statistics.headingCount, "chapterCount": study.statistics.chapterCount,
@@ -1527,7 +1605,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                         let partial = scope == .upToProgress && conversation.readingSnapshot.map { snapshot in
                             snapshot.sourceHash == study.statistics.sourceHash && snapshot.page.map { section.start < $0 && $0 < section.end } == true
                         } == true
-                        return ["number": index + 1, "title": allowed.contains(section.id) || partial ? section.title : "区段 \(index + 1)（范围外）",
+                        return ["number": index + 1, "title": section.title,
                          "kind": section.kind, "partial": partial,
                          "characters": section.characterCount, "estimatedTokens": section.estimatedTokens,
                          "complete": study.digest(for: section) != nil, "allowed": allowed.contains(section.id)]
@@ -1610,6 +1688,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let conversation = store.conversation(
                     assetID: active.assetID, conversationID: conversationID
                 ) {
+                    payload["modelID"] = conversation.modelID ?? models.state.defaultChat ?? ""
                     payload["scope"] = conversation.scope?.rawValue ?? NSNull() as Any
                     payload["archived"] = conversation.archivedAt != nil
                     payload["messages"] = conversation.messages.map { message in
@@ -1618,6 +1697,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                             "canRetry": conversation.retryQuestion(for: message.id) != nil,
                             "role": message.role.rawValue,
                             "text": message.text,
+                            "modelName": message.model?.name ?? "助手",
                             "reasoning": message.reasoning ?? NSNull() as Any,
                             "reasoningExpanded": message.reasoningExpanded ?? NSNull() as Any,
                             "createdAt": ISO8601DateFormatter().string(from: message.createdAt),
@@ -1629,6 +1709,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             body["active"] = payload
         }
 
+        let selectedBook = store.state.lastActive.flatMap { store.book(assetID: $0.assetID) }
+        let selectedChat = store.state.lastActive.flatMap { active in active.conversationID.flatMap { store.conversation(assetID: active.assetID, conversationID: $0) } }
+        let chatID = selectedChat?.modelID ?? models.state.defaultChat
+        let summaryID = selectedBook?.summaryModelID ?? models.state.defaultSummary
+        body["modelSelection"] = ["chat": chatID ?? "", "summary": summaryID ?? "",
+            "chatReady": (try? models.resolve(chatID)) != nil, "summaryReady": (try? models.resolve(summaryID)) != nil,
+            "summaryUsed": selectedBook?.summaryModelStamp?.name ?? ""]
+        body["modelCatalog"] = models.payload
         body["permissionLabels"] = ["fullDiskAccess": fda.label, "accessibility": ax.label]
         body["detected"] = body["detected"] ?? NSNull()
         body["permissions"] = [

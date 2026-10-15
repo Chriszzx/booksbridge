@@ -86,6 +86,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
         }
     }
 
+    public var requiresAPIKey = true
+    public var sendsThinking = true
+    public var sendsTemperature = true
+    public var outputTokens = 8192
     public var provider: Provider
     public var baseURL: String
     public var model: String

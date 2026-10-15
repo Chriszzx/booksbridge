@@ -8,7 +8,8 @@ import Foundation
 /// 兼容性：DeepSeek 官方 API 与 OpenAI 的 `/chat/completions` 请求/响应结构一致，
 /// 所以同一个客户端也能指向 OpenAI、Ollama 等兼容端点（Base URL 可配）。
 public struct ChatClient: Sendable {
-    public enum ClientError: Error, CustomStringConvertible {
+    public enum ClientError: Error, CustomStringConvertible, LocalizedError {
+        public var errorDescription: String? { description }
         case invalidBaseURL(String)
         case missingAPIKey
         case http(status: Int, body: String)
@@ -41,35 +42,36 @@ public struct ChatClient: Sendable {
 
     public let baseURL: String
     public let apiKey: String
+    public let requiresAPIKey: Bool
+    public let sendsThinking: Bool
     public let timeout: TimeInterval
 
-    public init(baseURL: String, apiKey: String, timeout: TimeInterval = 120) {
+    public init(baseURL: String, apiKey: String, timeout: TimeInterval = 120, requiresAPIKey: Bool = true, sendsThinking: Bool = true) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.timeout = timeout
+        self.requiresAPIKey = requiresAPIKey; self.sendsThinking = sendsThinking
     }
 
     // MARK: - 请求构造
 
-    /// 把 Base URL 规范化成 chat completions 端点。
-    ///
-    /// 用户可能填 `https://api.deepseek.com`、`https://api.deepseek.com/v1` 或
-    /// 带尾斜杠的形式，这里统一成 `<host>[/v1]/chat/completions`。
-    /// DeepSeek 与 OpenAI 都接受带 `/v1` 的路径，因此缺省时补上。
-    func endpointURL() throws -> URL {
+    /// Base URL is explicit: preserve custom gateway prefixes instead of guessing /v1.
+    public func endpointURL() throws -> URL { try endpoint("chat/completions") }
+    public func endpoint(_ suffix: String) throws -> URL {
         var raw = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { throw ClientError.invalidBaseURL(baseURL) }
         while raw.hasSuffix("/") { raw.removeLast() }
-
-        if raw.hasSuffix("/chat/completions") {
-            guard let url = URL(string: raw) else { throw ClientError.invalidBaseURL(baseURL) }
-            return url
-        }
-        // 已经带了版本段就不再补
-        let hasVersionSegment = raw.range(of: #"/v\d+([/?#]|$)"#, options: .regularExpression) != nil
-        let path = hasVersionSegment ? "/chat/completions" : "/v1/chat/completions"
-        guard let url = URL(string: raw + path) else { throw ClientError.invalidBaseURL(baseURL) }
-        return url
+        guard let parts = URLComponents(string: raw), ["http", "https"].contains(parts.scheme?.lowercased() ?? ""),
+              parts.host?.isEmpty == false, parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil else { throw ClientError.invalidBaseURL(baseURL) }
+        if raw.hasSuffix("/chat/completions") { raw = String(raw.dropLast("/chat/completions".count)) }
+        return URL(string: raw + "/" + suffix)!
+    }
+    public func listModels() async throws -> [String] {
+        guard !requiresAPIKey || !apiKey.isEmpty else { throw ClientError.missingAPIKey }
+        var request = URLRequest(url: try endpoint("models")); request.timeoutInterval = 15
+        if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        let (data,response) = try await send(request); try validate(response,data)
+        struct Listing: Decodable { struct Item: Decodable { let id: String }; let data: [Item] }
+        return Array(Set(try JSONDecoder().decode(Listing.self, from: data).data.map(\.id))).sorted()
     }
 
     struct RequestBody: Encodable {
@@ -102,14 +104,14 @@ public struct ChatClient: Sendable {
         maxTokens: Int?,
         stream: Bool
     ) throws -> URLRequest {
-        guard !apiKey.trimmingCharacters(in: .whitespaces).isEmpty else {
+        guard !requiresAPIKey || !apiKey.trimmingCharacters(in: .whitespaces).isEmpty else {
             throw ClientError.missingAPIKey
         }
         var request = URLRequest(url: try endpointURL())
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        if !apiKey.isEmpty { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
         request.setValue(stream ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
 
         let body = RequestBody(
@@ -118,7 +120,7 @@ public struct ChatClient: Sendable {
             stream: stream,
             temperature: temperature,
             maxTokens: maxTokens,
-            thinking: thinking.payload,
+            thinking: sendsThinking ? thinking.payload : nil,
             streamOptions: stream ? RequestBody.StreamOptions() : nil
         )
         request.httpBody = try JSONEncoder().encode(body)

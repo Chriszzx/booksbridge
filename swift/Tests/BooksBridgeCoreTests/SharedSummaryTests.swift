@@ -42,6 +42,69 @@ final class SharedSummaryTests: XCTestCase {
         for _ in 0..<300 { if !jobs.isRunning(assetID: id) { return }; try await Task.sleep(for: .milliseconds(5)) }
         XCTFail("模拟任务应已完成")
     }
+    func testSummaryResumeRequiresSameProviderAndModelConfiguration() async throws {
+        let (root, _, book, reader, store, _) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try await load(book, reader, store)
+        let catalog = ModelCatalogStore(directory: root.appendingPathComponent("models"))
+        let provider = try catalog.saveService(id: nil, name: "Local", baseURL: "http://localhost:1234/v1", enabled: true, requiresKey: false)
+        var model = ServiceModel(name: "Summary", remoteID: "summary")
+        try catalog.saveModel(serviceID: provider, model: model)
+        let connection = try catalog.resolve(model.id)
+        XCTAssertTrue(connection.canResumeSummary(of: try XCTUnwrap(store.book(assetID: book.assetID))))
+        var study = try XCTUnwrap(store.book(assetID: book.assetID)?.study)
+        study.chapters.append(ChapterDigest(section: study.statistics.sections[0], text: "Saved chapter", model: model.remoteID))
+        XCTAssertTrue(store.saveStudy(assetID: book.assetID, study: study))
+        XCTAssertFalse(connection.canResumeSummary(of: try XCTUnwrap(store.book(assetID: book.assetID))), "Unattributed legacy chapters require regeneration")
+        XCTAssertTrue(store.setSummaryModel(assetID: book.assetID, modelID: model.id, stamp: connection.stamp))
+        XCTAssertTrue(connection.canResumeSummary(of: try XCTUnwrap(store.book(assetID: book.assetID))))
+        model.remoteID = "different-model"; try catalog.saveModel(serviceID: provider, model: model)
+        let changed = try catalog.resolve(model.id)
+        XCTAssertFalse(changed.canResumeSummary(of: try XCTUnwrap(store.book(assetID: book.assetID))))
+        XCTAssertEqual(store.book(assetID: book.assetID)?.study?.chapters.first?.text, "Saved chapter", "Selecting another model must preserve existing summaries")
+        XCTAssertTrue(store.clearStudy(assetID: book.assetID))
+        XCTAssertTrue(changed.canResumeSummary(of: try XCTUnwrap(store.book(assetID: book.assetID))))
+    }
+
+    func testWholeBookPreparationNeedsNoPageAndNeverLocksConversationScope() async throws {
+        let (root, _, book, _, store, _) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+        let free = try XCTUnwrap(store.createConversation(assetID: book.assetID))
+        let limited = try XCTUnwrap(store.createConversation(assetID: book.assetID))
+        _ = store.lockScope(assetID: book.assetID, conversationID: limited.id, requested: .upToProgress)
+        let jobs = SummaryJobs(), recorder = Recorder(); await recorder.setHold(1)
+        jobs.processOverride = { text,title in await recorder.process(text,title) }
+        jobs.startWholeBook(assetID: book.assetID, settings: AppSettings(), apiKey: "", store: store) { book }
+        for _ in 0..<200 { if await recorder.waiting { break }; try await Task.sleep(for: .milliseconds(5)) }
+        store.setActive(assetID: book.assetID, conversationID: free.id)
+        XCTAssertTrue(jobs.isRunning(assetID: book.assetID))
+        await recorder.release(); try await finish(jobs, book.assetID)
+        XCTAssertNotNil(store.book(assetID: book.assetID)?.study?.whole)
+        XCTAssertNil(store.conversation(assetID: book.assetID, conversationID: free.id)?.scope)
+        XCTAssertNil(store.conversation(assetID: book.assetID, conversationID: free.id)?.readingSnapshot)
+        XCTAssertEqual(store.conversation(assetID: book.assetID, conversationID: limited.id)?.scope, .upToProgress)
+        XCTAssertTrue(store.conversation(assetID: book.assetID, conversationID: limited.id)!.messages.isEmpty)
+        let inputs = await recorder.inputs
+        XCTAssertEqual(inputs.count, 3)
+        XCTAssertTrue(inputs[1].0.contains("未读秘密"), "Explicit whole-book job is independent of the active chat's restricted scope")
+    }
+
+    func testCancellingPreparationPreventsLateModelCallsAndWrites() async throws {
+        let (root, _, book, _, store, _) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
+        let jobs = SummaryJobs(), recorder = Recorder(); await recorder.setHold(1)
+        jobs.processOverride = { text,title in await recorder.process(text,title) }
+        jobs.startWholeBook(assetID: book.assetID, settings: AppSettings(), apiKey: "", store: store) {
+            _ = await recorder.process("load", "gate")
+            return book
+        }
+        for _ in 0..<200 { if await recorder.waiting { break }; try await Task.sleep(for: .milliseconds(5)) }
+        jobs.cancel(assetID: book.assetID, store: store)
+        await recorder.release(); try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(jobs.isRunning(assetID: book.assetID))
+        let inputs = await recorder.inputs
+        XCTAssertEqual(inputs.count, 1)
+        XCTAssertNil(store.book(assetID: book.assetID)?.study)
+    }
+
     func testBookSharedJobPersistsAcrossNavigationArchiveDeletionAndRestartWithoutTouchingSource() async throws {
         let (root, source, book, assistant, store, _) = try fixture(); defer { try? FileManager.default.removeItem(at: root) }
         let before = try BookSourceIdentity.read(at: source)
