@@ -19,6 +19,17 @@ final class ReadingRangeTests: XCTestCase {
         XCTAssertEqual(AccessibilityReader.readingViewport(reader: ordinary, window: window), ordinary)
     }
 
+    func testPartiallyTranslatedSpreadDoesNotClipAwaySecondPage() {
+        let window = CGRect(x: 358, y: 106, width: 1024, height: 768)
+        let reader = CGRect(x: -66, y: 190, width: 906, height: 564)
+        let viewport = AccessibilityReader.readingViewport(reader: reader, window: window)
+        XCTAssertEqual(viewport, window)
+        XCTAssertTrue(viewport.contains(CGRect(x: 802, y: 241, width: 414, height: 202)))
+        // Offscreen or cross-page paragraphs still require character-range clipping.
+        XCTAssertFalse(viewport.contains(CGRect(x: 318, y: 239, width: 414, height: 237)))
+        XCTAssertFalse(viewport.contains(CGRect(x: 1300, y: 241, width: 414, height: 202)))
+    }
+
     func testProgressIncludesCurrentChapterPrefixButNeverSuffix() throws {
         let reading = try ScopedReading.resolve(chapters: chapters(), current: 0, scope: .upToProgress, visible: [page])
         XCTAssertEqual(reading.currentChapter, 1, "实时页面优先于旧CFI")

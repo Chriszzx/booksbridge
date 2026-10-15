@@ -73,6 +73,28 @@ public struct BookMap: Codable, Sendable, Equatable {
     }
 }
 
+/// Evidence that an unreadable/background reader still reports the same page.
+/// These values only validate reuse; they never become source offsets.
+public struct ReadingPositionEvidence: Codable, Sendable, Equatable {
+    public let raw: String?
+    public let updated: TimeInterval?
+    public let progress: Double
+    public let pageIdentity: String?
+    public init(_ context: ReadingContext) {
+        raw = context.position?.raw; updated = context.position?.updated?.timeIntervalSince1970
+        progress = context.book.progress; pageIdentity = context.pageIdentity
+    }
+    public func matches(_ context: ReadingContext, capturedAt: Date) -> Bool {
+        let current = ReadingPositionEvidence(context)
+        guard progress.isFinite, current.progress == progress, current.raw == raw,
+              current.updated == updated, current.pageIdentity == pageIdentity else { return false }
+        if let pageIdentity, !pageIdentity.isEmpty { return true }
+        // Without visible page labels, only a recent observation with a database position is usable.
+        let age = context.capturedAt.timeIntervalSince(capturedAt)
+        return raw?.isEmpty == false && updated != nil && age >= 0 && age <= 15
+    }
+}
+
 /// The last verified page of one conversation. No source text is persisted here.
 public struct ReadingSnapshot: Codable, Sendable, Equatable {
     public let assetID: String
@@ -82,29 +104,46 @@ public struct ReadingSnapshot: Codable, Sendable, Equatable {
     public let progress: Double
     public let capturedAt: Date
     public var reused: Bool
+    public var positionEvidence: ReadingPositionEvidence?
+    public var reportedProgress: Double?
 
     public init(assetID: String, sourceHash: String, page: ReadingBoundary?, chapterTitle: String,
-                progress: Double, capturedAt: Date = Date(), reused: Bool = false) {
+                progress: Double, capturedAt: Date = Date(), reused: Bool = false,
+                positionEvidence: ReadingPositionEvidence? = nil, reportedProgress: Double? = nil) {
         self.assetID = assetID; self.sourceHash = sourceHash; self.page = page
         self.chapterTitle = chapterTitle; self.progress = progress; self.capturedAt = capturedAt; self.reused = reused
+        self.positionEvidence = positionEvidence; self.reportedProgress = reportedProgress
     }
     public var label: String {
-        guard page != nil else { return "尚未取得有效阅读位置 · 可选择全书范围，或在 Books 中打开本书" }
+        guard page != nil else {
+            if let reportedProgress { return "已识别本书 · 书库进度 \(String(format: "%.1f%%", reportedProgress * 100)) · 页末尚未定位，请将 Books 阅读窗口置于前台片刻" }
+            return "尚未取得有效阅读位置 · 请在 Books 中打开本书，等待页末定位"
+        }
         return "\(chapterTitle) · \(String(format: "%.1f%%", progress * 100)) · \(reused ? "沿用上次位置" : "已刷新") · \(capturedAt.formatted(date: .omitted, time: .standard))"
     }
 
     public static func resolve(assetID: String, map: BookMap, chapters: [BookPreprocessor.Chapter],
-                               live: ReadingContext?, previous: Self?) throws -> Self {
+                               live: ReadingContext?, previous: Self?, shared: Self? = nil) throws -> Self {
         if let live, live.book.assetID == assetID, !live.visibleText.isEmpty {
             let located = try ScopedReading.resolve(chapters: chapters, current: nil, scope: .upToProgress, visible: live.visibleText)
             return Self(assetID: assetID, sourceHash: map.sourceHash, page: located.boundary,
-                chapterTitle: map.entry(at: located.boundary)?.title ?? "未识别章节", progress: live.book.progress, capturedAt: live.capturedAt)
+                chapterTitle: map.entry(at: located.boundary)?.title ?? "未识别章节", progress: live.book.progress, capturedAt: live.capturedAt, positionEvidence: ReadingPositionEvidence(live))
         }
-        if var previous, previous.assetID == assetID, previous.sourceHash == map.sourceHash {
-            previous.reused = true
-            return previous
+        let candidates = [previous, shared].compactMap { $0 }.filter {
+            guard $0.assetID == assetID, $0.sourceHash == map.sourceHash, let page = $0.page,
+                  page.end != Int.max, (try? ScopedReading.prefix(chapters: chapters, through: page, current: page.chapter)) != nil else { return false }
+            if let live, live.book.assetID == assetID { return $0.positionEvidence?.matches(live, capturedAt: $0.capturedAt) == true }
+            return true
         }
-        return Self(assetID: assetID, sourceHash: map.sourceHash, page: nil, chapterTitle: "尚未定位", progress: 0)
+        // With no active content, preserve this chat's established position. New chats may inherit the book's verified position.
+        let selected = live?.book.assetID == assetID ? candidates.max(by: { $0.capturedAt < $1.capturedAt }) : candidates.first
+        if var selected { selected.reused = true; return selected }
+        let progress = live?.book.assetID == assetID ? live?.book.progress : nil
+        return Self(assetID: assetID, sourceHash: map.sourceHash, page: nil, chapterTitle: "尚未定位", progress: progress ?? 0, reportedProgress: progress)
+    }
+    public func identified(by assetID: String) -> Self {
+        Self(assetID: assetID, sourceHash: sourceHash, page: page, chapterTitle: chapterTitle, progress: progress,
+             capturedAt: capturedAt, reused: reused, positionEvidence: positionEvidence, reportedProgress: reportedProgress)
     }
 
     public func reading(chapters: [BookPreprocessor.Chapter], map: BookMap, scope: KnowledgeScope, statistics: BookStatistics? = nil) throws -> ScopedReading {

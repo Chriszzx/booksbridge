@@ -36,6 +36,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
     private let structureJobs = StructureJobs()
+    private let positionTracker = BookPositionTracker()
     private var selectionCandidate: ConfirmedReference?
     private var pendingSourceImport: (id: String, book: BooksBridgeCore.Book, source: BookSourceIdentity, matches: [String])?
     private var pendingBookIdentification: (id: String, snapshot: AccessibilityReader.Snapshot, books: [BooksBridgeCore.Book])?
@@ -126,6 +127,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         settings = SettingsStore()
         summaryJobs.onUpdate = { [weak self] _ in self?.pushState(message: "书籍摘要状态已更新") }
         structureJobs.onUpdate = { [weak self] _ in self?.pushState(message: "书籍章节状态已更新") }
+        positionTracker.onVerified = { [weak self] snapshot in
+            guard let self else { return }
+            let canonical = self.store.canonicalAssetID(snapshot.assetID)
+            let verified = snapshot.identified(by: canonical)
+            if self.store.saveVerifiedPosition(assetID: canonical, snapshot: verified) {
+                if let active = self.store.state.lastActive, active.assetID == canonical, let id = active.conversationID,
+                   let conversation = self.store.conversation(assetID: canonical, conversationID: id),
+                   conversation.archivedAt == nil, conversation.readingSnapshot?.page == nil,
+                   self.latestContext?.book.assetID == canonical {
+                    self.store.updateReading(assetID: canonical, conversationID: id, snapshot: verified)
+                }
+                self.pushState(message: "本书阅读位置已验证，可供新对话使用")
+            }
+        }
         assistant.update(settings: settings.settings, apiKey: settings.apiKey)
         writeReport()
 
@@ -290,6 +305,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reconnectBooks(requestAccessibility: Bool) {
         connectionRequested = true
         connectionGeneration += 1
+        positionTracker.reset()
         coordinator?.stop()
         coordinator = nil
         latestContext = nil
@@ -308,6 +324,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        positionTracker.reset()
         cancelPendingAnswer()
         bridge?.webView.configuration.userContentController
             .removeScriptMessageHandler(forName: WebBridge.handlerName)
@@ -510,6 +527,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             if store.state.lastActive?.assetID == assetID { cancelPendingAnswer(); selectionCandidate = nil }
             structureJobs.cancel(assetID, store: store)
             summaryJobs.cancel(assetID: assetID, store: store)
+            positionTracker.forget(store.book(assetID: assetID)?.sourceAssetIDs ?? [assetID])
             assistant.forgetBook(assetID: assetID)
             do {
                 try BookDataRemoval(directory: AppPaths.supportDirectory).removeBook(assetID: assetID, store: store)
@@ -666,6 +684,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         if let existing = store.book(assetID: assetID) { enterBook(assetID: existing.assetID); return }
         cancelPendingAnswer()
         pendingSourceImport = nil
+        positionTask?.cancel()
         positionTask = Task { @MainActor in
             do {
                 guard let book = try await Task.detached(operation: { try BooksStore().book(assetID: assetID) }).value else { throw ReadingAssistant.AssistantError.notLoaded }
@@ -863,8 +882,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         try Task.checkCancellation()
         guard store.conversation(assetID: assetID, conversationID: conversationID) != nil else { throw CancellationError() }
         store.bindSource(assetID: assetID, identity: fresh.2)
+        let observed = await positionTracker.position(for: sourceIDs, canonicalID: assetID)
+        try Task.checkCancellation()
+        guard store.book(assetID: assetID)?.libraryID == stored.libraryID,
+              store.conversation(assetID: assetID, conversationID: conversationID) != nil else { throw CancellationError() }
+        let blocked = fresh.1?.book.assetID == assetID && positionTracker.hasUnverifiedObservation(for: sourceIDs)
+        let shared = blocked ? nil : [observed, store.book(assetID: assetID)?.verifiedPosition].compactMap { $0 }.max { $0.capturedAt < $1.capturedAt }
         var snapshot: ReadingSnapshot
-        do { snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: previous) }
+        do { snapshot = try await assistant.refresh(book: fresh.0, live: fresh.1, previous: blocked ? nil : previous, shared: shared) }
         catch {
             // Page recognition can fail while the local book statistics remain valid.
             if !Task.isCancelled, assistant.currentBook?.assetID == assetID, let statistics = assistant.currentStatistics {
@@ -876,11 +901,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         if let statistics = assistant.currentStatistics {
             guard store.updateStatistics(assetID: assetID, statistics: statistics) else { throw SummaryJobs.JobError.writeFailed }
         }
+        if let observed, observed.sourceHash == snapshot.sourceHash, !blocked { _ = store.saveVerifiedPosition(assetID: assetID, snapshot: observed) }
         if let study = store.book(assetID: assetID)?.study {
             assistant.useStatistics(study.statistics)
             if let page = snapshot.page, let section = study.statistics.sections.first(where: { $0.start < page && page <= $0.end }) {
                 snapshot = ReadingSnapshot(assetID: snapshot.assetID, sourceHash: snapshot.sourceHash, page: page, chapterTitle: section.title,
-                    progress: snapshot.progress, capturedAt: snapshot.capturedAt, reused: snapshot.reused)
+                    progress: snapshot.progress, capturedAt: snapshot.capturedAt, reused: snapshot.reused, positionEvidence: snapshot.positionEvidence, reportedProgress: snapshot.reportedProgress)
             }
         }
         try Task.checkCancellation()
@@ -961,7 +987,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                           let section = study.statistics.sections.first(where: { $0.start < page && page <= $0.end }) else { continue }
                     store.updateReading(assetID: assetID, conversationID: conversation.id,
                         snapshot: ReadingSnapshot(assetID: assetID, sourceHash: old.sourceHash, page: page, chapterTitle: section.title,
-                            progress: old.progress, capturedAt: old.capturedAt, reused: old.reused))
+                            progress: old.progress, capturedAt: old.capturedAt, reused: old.reused, positionEvidence: old.positionEvidence, reportedProgress: old.reportedProgress))
                 }
                 pushState(message: "章节结构已更新；整章模式需在各对话确认新的读取范围")
             } catch { pushState(message: "章节结构未应用：\(error.localizedDescription)") }
@@ -1113,6 +1139,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let userMessage = Conversation.Message(id: questionID ?? UUID().uuidString, role: .user, text: question, isPositionCard: request.isEmpty)
         if retryID == nil { store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: userMessage) }
         cancelPendingAnswer()
+        positionTask?.cancel()
         pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "", "", nil)
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1377,6 +1404,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // 回调在 coordinator 的队列上，切回主线程再碰 AppKit / WebView
             Task { @MainActor [weak self] in
                 guard let self, self.connectionGeneration == generation else { return }
+                self.positionTracker.observe(context)
                 self.latestSourceContext = context
                 self.latestContext = context.identified(by: self.store.canonicalAssetID(context.book.assetID))
                 self.detectionIssue = nil

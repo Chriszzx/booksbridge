@@ -71,6 +71,6 @@ public extension Book {
 
 public extension ReadingContext {
     func identified(by assetID: String) -> ReadingContext {
-        ReadingContext(book: book.identified(by: assetID), position: position, visibleText: visibleText, selection: selection, selectionIsExact: selectionIsExact, capturedAt: capturedAt)
+        ReadingContext(book: book.identified(by: assetID), position: position, visibleText: visibleText, selection: selection, selectionIsExact: selectionIsExact, capturedAt: capturedAt, pageIdentity: pageIdentity)
     }
 }

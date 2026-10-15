@@ -152,7 +152,8 @@ public final class ReadingCoordinator: @unchecked Sendable {
             position: position,
             visibleText: visible,
             selection: selection,
-            selectionIsExact: snapshot.selectionIsExact
+            selectionIsExact: snapshot.selectionIsExact,
+            pageIdentity: snapshot.pageIdentity
         )
     }
 
@@ -163,7 +164,7 @@ public final class ReadingCoordinator: @unchecked Sendable {
     private static func signature(of context: ReadingContext) -> String {
         let cfi = context.position?.cfi ?? context.position?.raw ?? "-"
         let sel = context.selection ?? "-"
-        return "\(context.book.assetID)|\(context.book.progress)|\(cfi)|\(context.visibleText.joined())|\(sel)"
+        return "\(context.book.assetID)|\(context.pageIdentity ?? "-")|\(context.position?.updated?.timeIntervalSince1970 ?? 0)|\(context.book.progress)|\(cfi)|\(context.visibleText.joined())|\(sel)"
     }
 
     // MARK: - 派生：可喂给 LLM 的章节正文

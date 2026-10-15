@@ -105,6 +105,8 @@ public struct ReadingPosition: Sendable, Equatable {
 ///
 /// 这是喂给 LLM 的上下文来源，也是 UI 渲染的唯一数据源。
 public struct ReadingContext: Sendable {
+    /// Visible page labels from the reader chrome, not a source-text offset.
+    public let pageIdentity: String?
     public let book: Book
     public let position: ReadingPosition?
     /// 屏幕上此刻可见的正文（来自辅助功能 API），可能为 nil（未授权或不在阅读视图）。
@@ -120,7 +122,8 @@ public struct ReadingContext: Sendable {
         visibleText: [String],
         selection: String?,
         selectionIsExact: Bool = false,
-        capturedAt: Date = Date()
+        capturedAt: Date = Date(),
+        pageIdentity: String? = nil
     ) {
         self.book = book
         self.position = position
@@ -128,5 +131,6 @@ public struct ReadingContext: Sendable {
         self.selection = selection
         self.selectionIsExact = selectionIsExact
         self.capturedAt = capturedAt
+        self.pageIdentity = pageIdentity
     }
 }

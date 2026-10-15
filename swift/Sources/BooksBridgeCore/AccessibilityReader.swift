@@ -45,6 +45,7 @@ public struct AccessibilityReader: Sendable {
         public let windowTitles: [String]
         public let documentURLs: [URL]
         public let windowIdentity: String?
+        public let pageIdentity: String?
         /// 可见正文段落，按 AX 树顺序。
         public let visibleText: [String]
         /// 用户当前划选的文本。
@@ -69,7 +70,8 @@ public struct AccessibilityReader: Sendable {
             selectionRange: NSRange? = nil,
             selectionFrame: CGRect? = nil,
             documentURLs: [URL] = [],
-            windowIdentity: String? = nil
+            windowIdentity: String? = nil,
+            pageIdentity: String? = nil
         ) {
             self.windowTitles = windowTitles
             self.visibleText = visibleText
@@ -79,6 +81,7 @@ public struct AccessibilityReader: Sendable {
             self.selectionFrame = selectionFrame
             self.documentURLs = documentURLs
             self.windowIdentity = windowIdentity
+            self.pageIdentity = pageIdentity
         }
 
         /// 是否处于阅读视图（而非书库列表）。
@@ -163,8 +166,22 @@ public struct AccessibilityReader: Sendable {
             selectionRange: selectionInfo?.range,
             selectionFrame: selectionInfo?.frame,
             documentURLs: Array(Set(documentURLs)),
-            windowIdentity: "\(app.processIdentifier):\(CFHash(window))"
+            windowIdentity: "\(app.processIdentifier):\(CFHash(window))",
+            pageIdentity: Self.pageIdentity(from: pageLabels(window))
         )
+    }
+
+    /// Page labels are outside the WebKit body. Never treat arbitrary body text as a page marker.
+    private func pageLabels(_ element: AXUIElement, depth: Int = 0) -> [String] {
+        guard depth < 16, string(element, kAXRoleAttribute as String) != "AXWebArea" else { return [] }
+        let own = [kAXDescriptionAttribute as String, kAXValueAttribute as String].compactMap { string(element, $0) }
+        return own + (children(of: element) ?? []).prefix(100).flatMap { pageLabels($0, depth: depth + 1) }
+    }
+    public static func pageIdentity(from labels: [String]) -> String? {
+        let pattern = #"^(第\s*[0-9]+\s*[页頁]|(?i:page)\s+[0-9]+(?:\s+(?i:of)\s+[0-9]+)?)$"#
+        let pages = Set(labels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.range(of: pattern, options: .regularExpression) != nil }).sorted()
+        return pages.isEmpty ? nil : pages.joined(separator: "|")
     }
 
     /// 划选相关的原始信息。
@@ -255,8 +272,10 @@ public struct AccessibilityReader: Sendable {
     /// while its descendant text uses correct screen coordinates. Never discard
     /// those descendants based solely on the container frame.
     static func readingViewport(reader: CGRect, window: CGRect) -> CGRect {
-        let intersection = reader.intersection(window)
-        return !intersection.isNull && intersection.width > 20 && intersection.height > 20 ? intersection : window
+        // A partially translated container is just as unreliable as an entirely
+        // offscreen one (notably in two-page spreads). Use the window to clip
+        // descendant geometry; never expand a text node beyond that window.
+        return !reader.isEmpty && window.contains(reader) ? reader : window
     }
 
     private func visibleFragments(_ element: AXUIElement, value: String,

@@ -18,6 +18,7 @@ public struct StoredBook: Codable, Sendable, Equatable, Identifiable {
     public var sourceAliases: [String]?
     public var libraryID: UUID?
     public var study: BookStudy?
+    public var verifiedPosition: ReadingSnapshot?
 
     public var id: String { assetID }
     public var displayTitle: String { customTitle ?? title }
@@ -482,8 +483,20 @@ public final class ConversationStore {
         return requested
     }
 
+    @discardableResult
+    public func saveVerifiedPosition(assetID: String, snapshot: ReadingSnapshot) -> Bool {
+        guard snapshot.assetID == assetID, snapshot.page != nil, !snapshot.reused,
+              let index = state.books.firstIndex(where: { $0.assetID == assetID }) else { return false }
+        if let old = state.books[index].verifiedPosition, old.capturedAt > snapshot.capturedAt { return false }
+        if state.books[index].verifiedPosition == snapshot { return true }
+        let previous = state
+        state.books[index].verifiedPosition = snapshot
+        return persistOrRollback(previous)
+    }
+
     public func updateReading(assetID: String, conversationID: String, snapshot: ReadingSnapshot) {
         guard snapshot.assetID == assetID else { return }
+        if !snapshot.reused { _ = saveVerifiedPosition(assetID: assetID, snapshot: snapshot) }
         updateConversation(assetID: assetID, conversationID: conversationID) {
             $0.readingSnapshot = snapshot
             if $0.titleProgress == nil, snapshot.page != nil {
