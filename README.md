@@ -37,6 +37,10 @@ Each chat stays bound to one book and one reading mode: through the current page
 
 Use the **+** menu for reading actions. The composer keeps only the reading mode, model, send controls, and a compact position/summary status line. Selected text appears as a confirmation card; summary progress, coverage, and results open in a separate panel.
 
+Press **Enter** to send and **Shift+Enter** for a new line. While generating, click the stop icon or press **Esc twice within 500 ms**. Stopping keeps any partial answer; stopping a retry preserves the original answer.
+
+Small buttons below messages let you copy, edit, or delete a user message, and retry or delete an assistant reply. Editing saves locally; use retry to generate a new answer. A retry refreshes the reading position and uses only history preceding its question, replacing that reply after success. Later messages remain visible after edits, deletions, or retries, but dependent old context is excluded from future model requests. Archived chats are read-only.
+
 Type `/` at the beginning of the input to browse commands. Use the arrow keys and Enter or Tab to select a command, and Esc to dismiss the list.
 
 | Command | Action |

@@ -29,13 +29,11 @@ public final class PageWindowController: NSWindowController {
     }
 
     private let mode: Mode
-    private let onEscape: () -> Void
     /// 记住用户调整过的窗口大小，下次打开沿用。
     private var lastWindowedFrame: NSRect?
 
-    public init(mode: Mode, onEscape: @escaping () -> Void) {
+    public init(mode: Mode) {
         self.mode = mode
-        self.onEscape = onEscape
 
         let window = NSWindow(
             contentRect: PageWindowController.defaultContentRect(),
@@ -56,8 +54,7 @@ public final class PageWindowController: NSWindowController {
 
         super.init(window: window)
 
-        // Esc 是全屏下的主要出口，必须在原生层兜住
-        installEscapeHandler()
+        // Web UI arbitrates Escape for dialogs, editing and the double-Escape stop shortcut.
     }
 
     @available(*, unavailable)
@@ -177,19 +174,4 @@ public final class PageWindowController: NSWindowController {
         """
     }
 
-    // MARK: - Esc
-
-    private func installEscapeHandler() {
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return event }
-            // 53 = Escape。仅全屏时用 Esc 退出；窗口化下 Esc 不该关掉整个窗口。
-            if event.keyCode == 53,
-               self.isVisible,
-               self.window?.styleMask.contains(.fullScreen) == true {
-                self.onEscape()
-                return nil
-            }
-            return event
-        }
-    }
 }

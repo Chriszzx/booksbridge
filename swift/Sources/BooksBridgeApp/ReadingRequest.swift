@@ -18,6 +18,13 @@ struct ConfirmedReference {
     let conversationID: String
     let sourceHash: String
     let text: String
+    /// Persisted quotes must still be inside the refreshed scope when retrying an older turn.
+    static func canReplay(question: String, reading: ScopedReading) -> Bool {
+        guard let marker = question.range(of: "\n\n引用：\n") else { return true }
+        let quote = ScopedReading.normalized(String(question[marker.upperBound...]))
+        return !quote.isEmpty && reading.chapters.contains { ScopedReading.normalized($0.text).contains(quote) }
+    }
+
     func validated(token: String, confirmed: Bool, snapshot: ReadingSnapshot,
                    conversationID: String, reading: ScopedReading) -> String? {
         guard confirmed, token == self.token, assetID == snapshot.assetID,

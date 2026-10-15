@@ -518,6 +518,92 @@
     return body;
   }
 
+  const messageIcons = {
+    copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4"/>',
+    edit: '<path d="m16 3 5 5M3 21l5-1L21 7a2 2 0 0 0-5-5L3 15v6Z"/>',
+    delete: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
+    retry: '<path d="M3 10a9 9 0 1 1 2 8M3 3v7h7"/>',
+  };
+  let retryBackup = null;
+  function messagePayload(id) {
+    return {assetID: state.active.assetID, conversationID: state.active.conversationID, messageID: id};
+  }
+  function attachMessageActions(wrap, message) {
+    wrap.dataset.messageId = message.id || "";
+    wrap.dataset.rawText = message.text;
+    wrap.dataset.positionCard = String(!!message.isPositionCard);
+    wrap.querySelector('.msg-actions')?.remove();
+    if (!message.id) return;
+    const bar = document.createElement('div'); bar.className = 'msg-actions';
+    const actions = message.role === 'user' ? [['copy','复制'], ...(!message.isPositionCard ? [['edit','修改']] : []), ['delete','删除']]
+      : [...(message.canRetry ? [['retry','重试']] : []), ['delete','删除']];
+    for (const [action, label] of actions) {
+      const button = document.createElement('button'); button.className = 'message-action';
+      button.dataset.messageAction = action; button.title = label; button.setAttribute('aria-label',label);
+      button.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${messageIcons[action]}</svg>`;
+      button.addEventListener('click', () => {
+        if (action !== 'copy' && (chatState.streaming || state.active?.archived)) return;
+        if (action === 'edit') { editMessage(wrap, message); return; }
+        if (action === 'retry') {
+          retryBackup = {wrap, original: wrap.cloneNode(true), message};
+          startStreaming(); chatState.streamText = ''; chatState.streamReasoning = null;
+          chatState.streamNode = wrap.querySelector('.msg-body');
+          wrap.querySelector('.msg-reasoning')?.remove(); wrap.querySelector('.msg-meta')?.remove();
+          chatState.streamNode.textContent = '正在思考…';
+        }
+        invoke(action + 'Message', messagePayload(message.id));
+        if (action === 'copy') { button.title = '已复制'; button.setAttribute('aria-label','已复制'); }
+      });
+      bar.append(button);
+    }
+    wrap.append(bar); renderMessageActions();
+  }
+  function renderMessageActions() {
+    for (const button of document.querySelectorAll('[data-message-action]')) {
+      button.disabled = button.dataset.messageAction !== 'copy' && (chatState.streaming || !!state.active?.archived);
+    }
+  }
+  function editMessage(wrap, message) {
+    if (wrap.querySelector('.msg-editor')) return;
+    const body = wrap.querySelector('.msg-body'), bar = wrap.querySelector('.msg-actions');
+    body.hidden = true; bar.hidden = true;
+    const editor = document.createElement('div'); editor.className = 'msg-editor';
+    const input = document.createElement('textarea'); input.value = message.text; input.setAttribute('aria-label','修改消息');
+    const hint = document.createElement('div'); hint.className = 'msg-editor-hint'; hint.textContent = '保存后可重试原回答；后续旧回答保留显示，不再作为模型上下文。';
+    const footer = document.createElement('div'); footer.className = 'msg-editor-footer';
+    const cancel = document.createElement('button'); cancel.className = 'btn-plain'; cancel.textContent = '取消';
+    const save = document.createElement('button'); save.className = 'btn-plain'; save.textContent = '保存'; save.dataset.saveMessage = message.id;
+    const close = () => { editor.remove(); body.hidden = false; bar.hidden = false; };
+    cancel.onclick = close;
+    save.onclick = () => { if (!input.value.trim() || chatState.streaming) return; if (input.value.trim() === message.text) { close(); return; } invoke('editMessage', {...messagePayload(message.id), text: input.value.trim()}); };
+    input.addEventListener('input', () => { save.disabled = !input.value.trim(); });
+    input.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape' && !e.isComposing) { e.preventDefault(); close(); } });
+    footer.append(cancel,save); editor.append(input,hint,footer); wrap.append(editor); input.focus();
+  }
+  function restoreRetry() {
+    if (!retryBackup) return;
+    const {wrap,original,message} = retryBackup;
+    wrap.replaceWith(original); attachMessageActions(original,message); retryBackup = null;
+  }
+  function syncMessages() {
+    if (chatState.streaming) return;
+    const messages = state.active?.messages ?? [];
+    const signature = JSON.stringify(messages);
+    if (signature === renderedMessagesSignature) return;
+    renderedMessagesSignature = signature;
+    const existing = [...els.messages.querySelectorAll('.msg')];
+    for (const message of messages) {
+      let wrap = existing.find(el => message.id && el.dataset.messageId === message.id);
+      if (!wrap) wrap = existing.find(el => !el.dataset.messageId && el.classList.contains(message.role) && (el.dataset.rawText ?? el.querySelector('.msg-body')?.textContent) === message.text);
+      if (!wrap || (wrap.dataset.rawText !== undefined && wrap.dataset.rawText !== message.text)) {
+        wrap = appendMessage(message.role, message.text, {roleLabel: message.isPositionCard ? '阅读位置' : undefined}).closest('.msg');
+      }
+      const index = existing.indexOf(wrap); if (index >= 0) existing.splice(index,1);
+      attachMessageActions(wrap,message); els.messages.append(wrap);
+    }
+    existing.forEach(el => el.remove());
+  }
+
   function appendError(text) {
     const box = document.createElement("div");
     box.className = "msg-error";
@@ -596,6 +682,7 @@
     els.input.disabled = !hasConversation() || !!state.active?.archived;
     $("archive-banner").hidden = !state.active?.archived;
     renderActionAvailability();
+    renderMessageActions();
 
     if (!configured) {
       els.input.placeholder = "输入 / 使用阅读命令；提问前请配置 API Key";
@@ -655,6 +742,7 @@
 
       case "error":
         showCursor(false);
+        if (retryBackup) { restoreRetry(); chatState.streamNode = null; }
         if (chatState.streamNode && !chatState.streamText) {
           // 还没出内容就失败，把空助手气泡撤掉
           chatState.streamNode.closest(".msg")?.remove();
@@ -691,6 +779,7 @@
   function finishAssistantMessage(event) {
     showCursor(false);
     if (chatState.streamNode) {
+      chatState.streamNode.closest(".msg").dataset.rawText = event.text ?? chatState.streamText;
       if (event.roleLabel) chatState.streamNode.closest(".msg").querySelector(".msg-role").textContent = event.roleLabel;
       renderMarkdown(chatState.streamNode, event.text ?? chatState.streamText);
       // 在气泡下方补一行出处与用量
@@ -712,6 +801,7 @@
         els.usageChip.textContent = `${event.usage.prompt} → ${event.usage.completion} tok`;
       }
     }
+    if (retryBackup) { chatState.streamNode.closest('.msg').dataset.rawText = event.text ?? chatState.streamText; retryBackup = null; }
     endStreaming();
   }
 
@@ -724,6 +814,7 @@
   }
 
   function startStreaming() {
+    lastStopEscape = 0;
     chatState.streaming = true;
     renderComposerState();
     renderScopePicker();
@@ -878,6 +969,7 @@
   /** 当前会话标识，用于判断是否需要整段重绘历史。 */
   let selectedQuote = null;
   let renderedConversationKey = null;
+  let renderedMessagesSignature = null;
 
   /** 切换会话时把历史消息整段重绘。 */
   function syncConversation() {
@@ -888,7 +980,8 @@
       ? settingsState.settings?.defaultScope ?? "upToProgress" : chatState.scope);
     renderScopePicker();
     // 会话没变就不动 DOM——流式渲染正在进行时更不能重绘
-    if (key === renderedConversationKey) return;
+    if (key === renderedConversationKey) { syncMessages(); return; }
+    retryBackup = null; renderedMessagesSignature = null;
     renderedConversationKey = key;
     clearSelection(); closeMenus(); hideCommands();
     for (const id of ["reading-panel", "prepare-confirm"]) if ($(id).open) $(id).close();
@@ -906,12 +999,7 @@
     chatState.streamReasoning = null;
     chatState.streamText = "";
 
-    // 历史消息随 active 一起推送（library 里只有计数，不带正文）
-    for (const message of state.active?.messages ?? []) {
-      appendMessage(message.role, message.text, {
-        roleLabel: message.isPositionCard ? "阅读位置" : message.role === "user" ? "我" : settingsState.settings?.model ?? "助手",
-      });
-    }
+    syncMessages();
     renderThreadShell();
   }
 
@@ -930,7 +1018,12 @@
       if (payload.detectionState) state.detectionState = payload.detectionState;
 
       // --- 设置 ---
-      if (payload.settings) settingsState.settings = payload.settings;
+      if (payload.settings) {
+        settingsState.settings = payload.settings;
+        for (const wrap of document.querySelectorAll('.msg.assistant')) {
+          if (wrap.dataset.positionCard !== 'true') wrap.querySelector('.msg-role').textContent = payload.settings.model ?? '助手';
+        }
+      }
       if (Array.isArray(payload.providers)) settingsState.providers = payload.providers;
       if (Array.isArray(payload.knowledgeScopes)) settingsState.knowledgeScopes = payload.knowledgeScopes;
       if (Array.isArray(payload.thinkingLevels)) settingsState.thinkingLevels = payload.thinkingLevels;
@@ -946,6 +1039,7 @@
 
       // 问答事件（流式增量等）
       if (payload.chatEvent) handleChatEvent(payload.chatEvent);
+      if (payload.messageActionError) appendError(payload.messageActionError);
 
       if (payload.readingPosition !== undefined) {
         $("reading-position").textContent = (chatState.streaming ? "本轮读取 · " : "") + payload.readingPosition;
@@ -1157,11 +1251,15 @@
   }
 
   els.sendBtn.addEventListener("click", send);
-  els.cancelBtn.addEventListener("click", () => {
+  function stopGeneration() {
+    if (!chatState.streaming) return;
     invoke("cancelAnswer"); showCursor(false);
-    if (chatState.streamNode && !chatState.streamText) chatState.streamNode.textContent = "已停止";
+    if (retryBackup) restoreRetry();
+    else if (chatState.streamNode && !chatState.streamText) chatState.streamNode.textContent = "已停止";
     endStreaming();
-  });
+  }
+  els.cancelBtn.addEventListener('click', stopGeneration);
+  for (const button of [els.sendBtn, els.cancelBtn]) button.addEventListener('mousedown', e => e.preventDefault());
   els.scopePicker.addEventListener("change", () => {
     if (!state.active?.scope) chatState.scope = els.scopePicker.value;
     renderScopePicker();
@@ -1288,7 +1386,17 @@
 
   // ---------- 键盘 ----------
 
+  let lastStopEscape = 0;
+  window.addEventListener('blur', () => { lastStopEscape = 0; });
   window.addEventListener("keydown", (event) => {
+    if (chatState.streaming) {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.repeat || event.isComposing || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || document.querySelector('dialog[open]') || !els.viewSettings.hidden) { lastStopEscape = 0; return; }
+      event.preventDefault();
+      const now = performance.now();
+      if (lastStopEscape && now - lastStopEscape <= 500) { lastStopEscape = 0; stopGeneration(); }
+      else lastStopEscape = now;
+      return;
+    }
     const isSettings = !els.viewSettings.hidden;
 
     if (event.key === "Escape" && document.querySelector("dialog[open]")) return;

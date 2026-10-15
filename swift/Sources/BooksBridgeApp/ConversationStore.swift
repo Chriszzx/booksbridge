@@ -60,6 +60,16 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         self.scopeHistoryStartIndex = nil
     }
 
+    /// Resolve legacy replies by order; new replies retain their question identity after deletion.
+    public func retryQuestion(for replyID: String) -> Message? {
+        guard let index = messages.firstIndex(where: { $0.id == replyID }),
+              messages[index].role == .assistant, messages[index].isPositionCard != true else { return nil }
+        if let id = messages[index].inReplyTo {
+            return messages[..<index].first { $0.id == id && $0.role == .user && $0.isPositionCard != true }
+        }
+        return messages[..<index].last { $0.role == .user && $0.isPositionCard != true }
+    }
+
     /// 骨架期只有这两个角色，接入 LLM 后直接复用。
     public struct Message: Codable, Sendable, Equatable, Identifiable {
         public enum Role: String, Codable, Sendable {
@@ -74,6 +84,7 @@ public struct Conversation: Codable, Sendable, Equatable, Identifiable {
         public var boundary: ReadingBoundary?
         public var sourceHash: String?
         public var isPositionCard: Bool?
+        public var inReplyTo: String?
 
         public init(id: String = UUID().uuidString, role: Role, text: String, createdAt: Date = Date(), boundary: ReadingBoundary? = nil, sourceHash: String? = nil, isPositionCard: Bool = false) {
             self.id = id
@@ -351,6 +362,45 @@ public final class ConversationStore {
         change(&value)
         state.books[bi].conversations[ci] = value
         persist()
+    }
+
+    /// Keep visible later messages, but never reuse answers derived from edited/deleted context.
+    @discardableResult
+    public func changeMessage(assetID: String, conversationID: String, messageID: String, text: String? = nil) -> Bool {
+        guard let c = conversation(assetID: assetID, conversationID: conversationID), c.archivedAt == nil,
+              let index = c.messages.firstIndex(where: { $0.id == messageID }),
+              text == nil || (c.messages[index].role == .user && c.messages[index].isPositionCard != true && !text!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) else { return false }
+        updateConversation(assetID: assetID, conversationID: conversationID) { value in
+            // Bind legacy replies before removing a question, avoiding accidental retries of another turn.
+            for i in value.messages.indices where value.messages[i].role == .assistant && value.messages[i].inReplyTo == nil {
+                value.messages[i].inReplyTo = c.retryQuestion(for: value.messages[i].id)?.id
+            }
+            for i in index..<value.messages.count { value.messages[i].boundary = nil; value.messages[i].sourceHash = nil }
+            if let text { value.messages[index].text = text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            else {
+                value.messages.remove(at: index)
+                if let start = value.scopeHistoryStartIndex, index < start { value.scopeHistoryStartIndex = start - 1 }
+            }
+            value.updatedAt = Date()
+        }
+        return true
+    }
+
+    public func saveAnswer(assetID: String, conversationID: String, questionID: String, replacing replyID: String?, answer: Conversation.Message) {
+        updateConversation(assetID: assetID, conversationID: conversationID) { value in
+            guard let qi = value.messages.firstIndex(where: { $0.id == questionID }) else { return }
+            var reply = answer
+            reply.inReplyTo = questionID
+            if let replyID {
+                guard let ri = value.messages.firstIndex(where: { $0.id == replyID }), value.retryQuestion(for: replyID)?.id == questionID else { return }
+                reply.id = replyID
+                value.messages[ri] = reply
+                for i in (ri + 1)..<value.messages.count { value.messages[i].boundary = nil; value.messages[i].sourceHash = nil }
+            } else { value.messages.append(reply) }
+            value.messages[qi].boundary = answer.boundary
+            value.messages[qi].sourceHash = answer.sourceHash
+            value.updatedAt = Date()
+        }
     }
 
     public func markLastQuestion(assetID: String, conversationID: String, boundary: ReadingBoundary?, sourceHash: String? = nil) {

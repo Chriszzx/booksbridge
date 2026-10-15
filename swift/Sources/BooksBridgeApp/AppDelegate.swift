@@ -31,6 +31,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var apiTestTask: Task<Void, Never>?
     private var apiTestGeneration = 0
     private var answerStream: Task<Void, Never>?
+    private var pendingReply: (assetID: String, conversationID: String, questionID: String, retryID: String?, text: String)?
     private var positionTask: Task<Void, Never>?
     private let summaryJobs = SummaryJobs()
     private var selectionCandidate: ConfirmedReference?
@@ -130,9 +131,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         writeReport()
 
 
-        page = PageWindowController(mode: windowMode) { [weak self] in
-            self?.returnToReader()
-        }
+        page = PageWindowController(mode: windowMode)
         bridge = WebBridge()
         bridge.onInvocation = { [weak self] invocation in
             self?.handle(invocation)
@@ -483,6 +482,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case "ask":
             ask(invocation.payload)
 
+        case "copyMessage", "editMessage", "deleteMessage", "retryMessage":
+            handleMessageAction(invocation.type, payload: invocation.payload)
+
         case "cancelAnswer":
             cancelPendingAnswer()
             pushState(message: "已中断")
@@ -650,8 +652,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 助手在 AppDelegate 创建时就有效；取消操作不依赖是否已进入一本书。
     func cancelPendingAnswer() {
         answerStream?.cancel()
+        answerStream = nil
         positionTask?.cancel()
         assistant.cancelAnswer()
+        if let pending = pendingReply, pending.retryID == nil, !pending.text.isEmpty {
+            store.saveAnswer(assetID: pending.assetID, conversationID: pending.conversationID, questionID: pending.questionID, replacing: nil,
+                answer: .init(role: .assistant, text: pending.text, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash))
+        }
+        pendingReply = nil
     }
 
     // MARK: - 阅读问答
@@ -780,7 +788,33 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func ask(_ payload: [String: Any]) {
+    private func handleMessageAction(_ action: String, payload: [String: Any]) {
+        guard let active = store.state.lastActive, let cid = active.conversationID,
+              payload["assetID"] as? String == active.assetID, payload["conversationID"] as? String == cid,
+              let id = payload["messageID"] as? String,
+              let conversation = store.conversation(assetID: active.assetID, conversationID: cid),
+              let message = conversation.messages.first(where: { $0.id == id }) else { return }
+        if action == "copyMessage" {
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(message.text, forType: .string); return
+        }
+        guard conversation.archivedAt == nil, answerStream == nil else { return }
+        if action == "retryMessage" {
+            guard let question = conversation.retryQuestion(for: id) else { return }
+            ask(["question": question.text], retryID: id, questionID: question.id)
+        } else {
+            let text = payload["text"] as? String
+            if action == "editMessage" {
+                guard let text, text.count <= max(500, settings.settings.maxContextCharacters / 4) else {
+                    bridge.push(["messageActionError": "修改内容超过请求预算，请缩短后保存"]); return
+                }
+            }
+            if store.changeMessage(assetID: active.assetID, conversationID: cid, messageID: id, text: action == "editMessage" ? text : nil) {
+                pushState(message: action == "editMessage" ? "修改已保存，可点击回答下方的重试重新生成" : "消息已删除")
+            }
+        }
+    }
+
+    private func ask(_ payload: [String: Any], retryID: String? = nil, questionID: String? = nil) {
         guard let question = (payload["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !question.isEmpty,
               let active = store.state.lastActive, let conversationID = active.conversationID,
@@ -795,20 +829,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let command = ReadingCommand(question)
         let isNow = command.refreshOnlyOrFirst
         let request = command.question
+        if retryID != nil && request.isEmpty {
+            bridge.push(["chatEvent": ["kind": "error", "text": "这条消息只有本地命令，请先修改为问题再重试"]]); return
+        }
         let requested = (payload["scope"] as? String).flatMap(KnowledgeScope.init(rawValue:)) ?? settings.settings.defaultScope
         let scope = request.isEmpty ? requested : store.lockScope(assetID: active.assetID, conversationID: conversationID, requested: requested) ?? requested
         let conversation = store.conversation(assetID: active.assetID, conversationID: conversationID)!
-        let previous = Array(conversation.messages.dropFirst(conversation.scopeHistoryStartIndex ?? 0)).filter { $0.isPositionCard != true }
+        let end = questionID.flatMap { id in conversation.messages.firstIndex { $0.id == id } } ?? conversation.messages.count
+        let previous = Array(conversation.messages.prefix(end).dropFirst(conversation.scopeHistoryStartIndex ?? 0)).filter { $0.isPositionCard != true }
         let history: [ChatMessage] = previous.map { $0.role == .user ? .user($0.text) : .assistant($0.text) }
-        store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: .init(role: .user, text: question, isPositionCard: request.isEmpty))
+        let userMessage = Conversation.Message(id: questionID ?? UUID().uuidString, role: .user, text: question, isPositionCard: request.isEmpty)
+        if retryID == nil { store.appendMessage(assetID: active.assetID, conversationID: conversationID, message: userMessage) }
         cancelPendingAnswer()
+        pendingReply = (active.assetID, conversationID, userMessage.id, retryID, "")
         answerStream = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { if !Task.isCancelled { answerStream = nil; pendingReply = nil } }
             do {
                 let assetID = active.assetID
                 let (book, snapshot, live) = try await refreshConversation(assetID: assetID, conversationID: conversationID)
-                guard store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == conversationID else { return }
-                if isNow {
+                guard !Task.isCancelled, store.state.lastActive?.assetID == assetID, store.state.lastActive?.conversationID == conversationID else { return }
+                if isNow && retryID == nil {
                     store.appendMessage(assetID: assetID, conversationID: conversationID, message: .init(role: .assistant, text: snapshot.label, isPositionCard: true))
                     if request.isEmpty {
                         bridge.push(["chatEvent": ["kind": "finished", "text": snapshot.label, "roleLabel": "阅读位置（本地）"]])
@@ -817,6 +858,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     bridge.push(["positionCard": snapshot.label])
                 }
                 let allowed = try assistant.reading(snapshot: snapshot, scope: scope)
+                if retryID != nil, !ConfirmedReference.canReplay(question: question, reading: allowed) { throw SelectionError.invalid }
                 var prompt = request
                 if let token = payload["selectionToken"] as? String {
                     guard let selection = selectionCandidate,
@@ -838,12 +880,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 for await event in stream {
                     guard !Task.isCancelled, store.state.lastActive?.assetID == assetID,
                           store.state.lastActive?.conversationID == conversationID else { break }
-                    handleAssistantEvent(event)
+                    handleAssistantEvent(event, questionID: userMessage.id, retryID: retryID)
                 }
             } catch is CancellationError {} catch {
                 guard !Task.isCancelled, store.state.lastActive?.assetID == active.assetID,
                       store.state.lastActive?.conversationID == conversationID else { return }
-                handleAssistantEvent(.failed(String(describing: error)))
+                handleAssistantEvent(.failed(String(describing: error)), questionID: userMessage.id, retryID: retryID)
             }
         }
     }
@@ -854,7 +896,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 把助手事件转成前端可消费的推送。
-    private func handleAssistantEvent(_ event: ReadingAssistant.Event) {
+    private func handleAssistantEvent(_ event: ReadingAssistant.Event, questionID: String, retryID: String?) {
         switch event {
         case .contextPrepared(let text):
             bridge.push(["chatEvent": ["kind": "status", "text": text]])
@@ -862,18 +904,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             bridge.push(["chatEvent": ["kind": "reasoning", "text": delta]])
 
         case .answerDelta(let delta):
+            pendingReply?.text += delta
             bridge.push(["chatEvent": ["kind": "delta", "text": delta]])
 
         case .finished(let answer, let scopeDescription, let usage):
+            pendingReply = nil
             // 落盘助手回答
             if let active = store.state.lastActive,
                let conversationID = active.conversationID {
-                store.markLastQuestion(assetID: active.assetID, conversationID: conversationID, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash)
-                store.appendMessage(
-                    assetID: active.assetID,
-                    conversationID: conversationID,
-                    message: Conversation.Message(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash)
-                )
+                store.saveAnswer(assetID: active.assetID, conversationID: conversationID, questionID: questionID, replacing: retryID,
+                    answer: .init(role: .assistant, text: answer, boundary: assistant.lastBoundary, sourceHash: assistant.lastSourceHash))
             }
             var payload: [String: Any] = [
                 "kind": "finished",
@@ -891,6 +931,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             pushState(message: "回答完成")
 
         case .failed(let message):
+            pendingReply = nil
             bridge.push(["chatEvent": ["kind": "error", "text": message]])
             pushState(message: "问答失败")
         }
@@ -1229,6 +1270,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                     payload["archived"] = conversation.archivedAt != nil
                     payload["messages"] = conversation.messages.map { message in
                         [
+                            "id": message.id,
+                            "canRetry": conversation.retryQuestion(for: message.id) != nil,
                             "role": message.role.rawValue,
                             "text": message.text,
                             "createdAt": ISO8601DateFormatter().string(from: message.createdAt),

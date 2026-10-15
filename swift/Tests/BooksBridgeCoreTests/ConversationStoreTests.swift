@@ -274,3 +274,33 @@ final class ConversationStoreTests: XCTestCase {
         XCTAssertEqual(messages?.first?.role, .user)
     }
 }
+
+extension ConversationStoreTests {
+    func testEditDeleteAndRetryPreserveIdentityAndInvalidateDependentContext() throws {
+        let store = makeStore(); store.addBook(assetID: "A", title: "书", author: "")
+        let c = try XCTUnwrap(store.createConversation(assetID: "A"))
+        let boundary = ReadingBoundary(chapter: 0, end: 10)
+        for (id,role) in [("q1",Conversation.Message.Role.user),("a1",.assistant),("q2",.user),("a2",.assistant)] {
+            store.appendMessage(assetID: "A", conversationID: c.id, message: .init(id: id, role: role, text: id, boundary: boundary, sourceHash: "hash"))
+        }
+        store.lockScope(assetID: "A", conversationID: c.id, requested: .upToProgress)
+        XCTAssertTrue(store.changeMessage(assetID: "A", conversationID: c.id, messageID: "q1", text: "修改"))
+        var saved = try XCTUnwrap(makeStore().conversation(assetID: "A", conversationID: c.id))
+        XCTAssertEqual(saved.messages.count, 4); XCTAssertEqual(saved.messages[0].text, "修改")
+        XCTAssertTrue(saved.messages.allSatisfy { $0.boundary == nil && $0.sourceHash == nil })
+        XCTAssertEqual(saved.retryQuestion(for: "a1")?.text, "修改")
+        store.saveAnswer(assetID: "A", conversationID: c.id, questionID: "q1", replacing: "a1", answer: .init(role: .assistant, text: "新回答", boundary: boundary, sourceHash: "hash"))
+        saved = try XCTUnwrap(makeStore().conversation(assetID: "A", conversationID: c.id))
+        XCTAssertEqual(saved.messages.map(\.id), ["q1","a1","q2","a2"])
+        XCTAssertEqual(saved.messages[1].text,"新回答"); XCTAssertEqual(saved.messages[0].boundary,boundary)
+        XCTAssertNil(saved.messages[2].boundary)
+        XCTAssertTrue(store.changeMessage(assetID: "A", conversationID: c.id, messageID: "q2"))
+        saved = try XCTUnwrap(makeStore().conversation(assetID: "A", conversationID: c.id))
+        XCTAssertNil(saved.retryQuestion(for: "a2"), "Deleted question must not retry a different preceding question")
+        XCTAssertEqual(saved.scopeHistoryStartIndex, 3); XCTAssertEqual(saved.scope, .upToProgress)
+        XCTAssertFalse(store.changeMessage(assetID: "A", conversationID: c.id, messageID: "a1", text: "不允许修改助手"))
+        XCTAssertFalse(store.changeMessage(assetID: "A", conversationID: c.id, messageID: "q1", text: " "))
+        store.setArchived(assetID: "A", conversationID: c.id, archived: true)
+        XCTAssertFalse(store.changeMessage(assetID: "A", conversationID: c.id, messageID: "q1"))
+    }
+}

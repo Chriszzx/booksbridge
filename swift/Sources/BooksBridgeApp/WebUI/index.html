@@ -102,8 +102,8 @@
             <span id="composer-model" class="composer-model"></span>
             <span class="spacer"></span>
             <span id="usage-chip" class="chip chip-tiny" hidden></span>
-            <button id="cancel-btn" class="btn-plain" hidden>停止</button>
-            <button id="send-btn" class="btn-send">发送</button>
+            <button id="cancel-btn" class="btn-send" aria-label="停止生成" title="停止生成（Esc, Esc）" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx="3" fill="currentColor"/></svg></button>
+            <button id="send-btn" class="btn-send" aria-label="发送消息" title="发送消息（Enter）；Shift+Enter 换行"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 14V2M2.5 7.5 8 2l5.5 5.5" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
           </div>
         </div>
         <div class="reading-status" aria-live="polite"><span id="reading-position">尚未取得有效阅读位置</span><span id="summary-status">未生成摘要</span></div>

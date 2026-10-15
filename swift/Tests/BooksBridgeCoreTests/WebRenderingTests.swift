@@ -71,11 +71,12 @@ extension WebRenderingTests {
           document.getElementById('prepare-no').click();
           booksbridge.onState({detected:null,detectionState:'booksNotRunning'});
           const clear = !document.getElementById('rc-title').textContent.includes('当前书');
+          const markdown = !!document.querySelector('.msg-body h2');
           booksbridge.onState({active:{assetID:'A',conversationID:'C',scope:'upToProgress',messages:[]}});
           return {confirmation, clear, locked:document.getElementById('scope-picker').disabled,
             emptyHidden:getComputedStyle(document.getElementById('thread-empty')).display === 'none',
             model:document.getElementById('composer-model').textContent,
-            markdown:!!document.querySelector('.msg-body h2'),options:document.getElementById('scope-picker').options.length};
+            markdown,options:document.getElementById('scope-picker').options.length};
         })()
         """) as! [String: Any]
         XCTAssertEqual(result["confirmation"] as? Bool, true)
@@ -283,5 +284,84 @@ extension WebRenderingTests {
             """) as! [String: Any]
             for key in ["within", "compact", "progress", "result"] { XCTAssertEqual(result[key] as? Bool, true, "\(size): \(key)") }
         }
+    }
+}
+
+@MainActor
+extension WebRenderingTests {
+    func testMessageActionsPersistedRefreshAndRetryCancellation() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const $ = id => document.getElementById(id);
+          const messages = [{id:'q',role:'user',text:'原问题'},{id:'a',role:'assistant',text:'**原回答**',canRetry:true}];
+          const active = {assetID:'A',conversationID:'C',scope:'upToProgress',messages};
+          booksbridge.onState({active});
+          const action = name => document.querySelector(`[data-message-action="${name}"]`);
+          booksbridge.onState({settings:{model:'updated-model',isConfigured:true}});
+          const model = document.querySelector('.msg.assistant .msg-role').textContent === 'updated-model';
+          const controls = document.querySelectorAll('.message-action').length === 5;
+          const size = action('copy').getBoundingClientRect().width === 28 && action('copy').querySelector('svg').getBoundingClientRect().width === 16;
+          action('copy').click(); action('edit').click();
+          let editor = document.querySelector('.msg-editor textarea'); editor.value = '修改后的问题';
+          document.querySelector('[data-save-message]').click();
+          booksbridge.onState({active:{...active,messages:[{...messages[0],text:'修改后的问题'},messages[1]]}});
+          const edited = !document.querySelector('.msg-editor') && $('messages').textContent.includes('修改后的问题');
+          action('retry').click();
+          const thinking = $('messages').textContent.includes('正在思考') && document.querySelectorAll('.msg').length === 2 && action('delete').disabled;
+          const escape = () => window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',cancelable:true}));
+          escape(); const single = !$('cancel-btn').hidden; escape();
+          const restored = $('messages').textContent.includes('原回答') && !!document.querySelector('.msg-body strong') && $('cancel-btn').hidden;
+          action('retry').click(); booksbridge.onState({chatEvent:{kind:'error',text:'模拟网络失败'}});
+          const failureRestored = $('messages').textContent.includes('原回答') && !action('retry').disabled;
+          action('retry').click(); booksbridge.onState({chatEvent:{kind:'finished',text:'新回答'}});
+          booksbridge.onState({active:{...active,messages:[{...messages[0],text:'修改后的问题'},{...messages[1],text:'新回答'}]}});
+          const replaced = document.querySelectorAll('.msg').length === 2 && $('messages').textContent.includes('新回答');
+          document.querySelector('.msg.assistant [data-message-action="delete"]').click();
+          booksbridge.onState({active:{...active,messages:[messages[0]]}});
+          const deleted = document.querySelectorAll('.msg').length === 1;
+          booksbridge.onState({active:{...active,archived:true}});
+          return {model,controls,size,edited,thinking,single,restored,failureRestored,replaced,deleted,readOnly:action('edit').disabled && !action('copy').disabled};
+        })()
+        """) as! [String: Any]
+        for (key, value) in result { XCTAssertEqual(value as? Bool, true, key) }
+        try await Task.sleep(for: .milliseconds(100))
+        for type in ["copyMessage", "editMessage", "deleteMessage", "retryMessage"] {
+            let payload = try XCTUnwrap(calls.calls.first { $0["type"] as? String == type }?["payload"] as? [String: Any])
+            XCTAssertEqual(payload["assetID"] as? String, "A"); XCTAssertEqual(payload["conversationID"] as? String, "C")
+        }
+        XCTAssertEqual(calls.calls.filter { $0["type"] as? String == "cancelAnswer" }.count, 1)
+        XCTAssertFalse(calls.calls.contains { $0["type"] as? String == "returnToReader" })
+        XCTAssertEqual((calls.calls.first { $0["type"] as? String == "editMessage" }?["payload"] as? [String: Any])?["text"] as? String, "修改后的问题")
+    }
+
+    func testSendKeyboardAndStopSequenceIsolation() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const input = document.getElementById('input'); input.value = '新问题'; input.dispatchEvent(new Event('input'));
+          const key = (target, name, options={}) => target.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true,...options}));
+          const newline = key(input,'Enter',{shiftKey:true});
+          key(input,'Enter',{isComposing:true});
+          const composing = document.getElementById('cancel-btn').hidden;
+          key(input,'Enter');
+          const started = !document.getElementById('cancel-btn').hidden;
+          key(window,'Escape'); key(window,'a'); key(window,'Escape');
+          const interrupted = !document.getElementById('cancel-btn').hidden;
+          key(window,'Escape',{repeat:true}); key(window,'Escape');
+          const repeated = !document.getElementById('cancel-btn').hidden;
+          document.getElementById('reading-panel').showModal(); key(window,'Escape'); document.getElementById('reading-panel').close(); key(window,'Escape');
+          const modal = !document.getElementById('cancel-btn').hidden;
+          document.getElementById('cancel-btn').click();
+          return {newline,composing,started,interrupted,repeated,modal,stopped:document.getElementById('cancel-btn').hidden,
+            size:document.getElementById('send-btn').getBoundingClientRect().width === 34};
+        })()
+        """) as! [String: Any]
+        for (key,value) in result { XCTAssertEqual(value as? Bool, true, key) }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(calls.calls.filter { $0["type"] as? String == "ask" }.count, 1)
+        XCTAssertEqual(calls.calls.filter { $0["type"] as? String == "cancelAnswer" }.count, 1)
     }
 }

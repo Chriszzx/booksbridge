@@ -81,6 +81,9 @@ final class BookMapTests: XCTestCase {
         let text = "这是已经阅读过的足够长的唯一定位文字。"
         let source = [BookPreprocessor.Chapter(spineIndex: 1, href: "a", text: text + "后续秘密")]
         let reading = try ScopedReading.resolve(chapters: source, current: nil, scope: .upToProgress, visible: [text])
+        XCTAssertTrue(ConfirmedReference.canReplay(question: "普通问题", reading: reading))
+        XCTAssertTrue(ConfirmedReference.canReplay(question: "解释\n\n引用：\n" + text, reading: reading))
+        XCTAssertFalse(ConfirmedReference.canReplay(question: "解释\n\n引用：\n后续秘密", reading: reading))
         let snapshot = ReadingSnapshot(assetID: "A", sourceHash: "hash", page: reading.boundary, chapterTitle: "章", progress: 0.2)
         let quote = ConfirmedReference(token: "token", assetID: "A", conversationID: "C", sourceHash: "hash", text: text)
         XCTAssertNil(quote.validated(token: "token", confirmed: false, snapshot: snapshot, conversationID: "C", reading: reading))
