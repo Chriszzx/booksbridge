@@ -14,7 +14,7 @@ import Foundation
 /// 也不用 `NSPanel`/`.nonactivatingPanel`：输入框必须能正常成为 key window，
 /// 而"返回图书"已实测不影响图书 App 的状态，无需靠不激活来规避。
 @MainActor
-public final class PageWindowController: NSWindowController {
+public final class PageWindowController: NSWindowController, NSWindowDelegate {
     public enum Mode: String {
         /// 标准窗口（默认）。
         case windowed
@@ -31,8 +31,9 @@ public final class PageWindowController: NSWindowController {
     private let mode: Mode
     /// 记住用户调整过的窗口大小，下次打开沿用。
     private var lastWindowedFrame: NSRect?
-    /// 与 WebUI 的 --window-drag-height 一致；这条区域只承载原生窗口操作。
-    static let dragRegionHeight: CGFloat = 28
+    /// 与 WebUI 的 --topbar-h 一致。
+    static let dragRegionHeight: CGFloat = 40
+    private weak var dragRegion: WindowDragRegion?
 
     public init(mode: Mode) {
         self.mode = mode
@@ -56,6 +57,7 @@ public final class PageWindowController: NSWindowController {
         window.tabbingMode = .disallowed
 
         super.init(window: window)
+        window.delegate = self
 
         // Web UI arbitrates Escape for dialogs, editing and the double-Escape stop shortcut.
     }
@@ -73,6 +75,7 @@ public final class PageWindowController: NSWindowController {
         content.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(content)
         let dragRegion = WindowDragRegion()
+        self.dragRegion = dragRegion
         dragRegion.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(dragRegion)
         NSLayoutConstraint.activate([
@@ -86,7 +89,26 @@ public final class PageWindowController: NSWindowController {
             dragRegion.heightAnchor.constraint(equalToConstant: Self.dragRegionHeight),
         ])
         window.contentView = container
+        alignWindowButtons()
     }
+
+    public func setTitlebarHitRegions(draggable: [NSRect], interactive: [NSRect]) {
+        dragRegion?.draggableRects = draggable
+        dragRegion?.interactiveRects = interactive
+    }
+
+    private func alignWindowButtons() {
+        guard let window, !window.styleMask.contains(.fullScreen), let content = window.contentView else { return }
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(kind), let parent = button.superview else { continue }
+            let center = content.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), from: button)
+            let target = parent.convert(NSPoint(x: center.x, y: content.bounds.maxY - Self.dragRegionHeight / 2), from: content)
+            button.setFrameOrigin(NSPoint(x: button.frame.minX, y: target.y - button.frame.height / 2))
+        }
+    }
+
+    public func windowDidResize(_ notification: Notification) { alignWindowButtons() }
+    public func windowDidExitFullScreen(_ notification: Notification) { alignWindowButtons() }
 
     // MARK: - 尺寸
 
@@ -140,6 +162,7 @@ public final class PageWindowController: NSWindowController {
             window.setFrame(lastWindowedFrame ?? Self.defaultContentRect(), display: false)
             clampToVisibleScreen()
             window.makeKeyAndOrderFront(nil)
+            alignWindowButtons()
             NSApp.activate()
 
         case .fullscreen:
@@ -202,9 +225,20 @@ public final class PageWindowController: NSWindowController {
 
 }
 
-/// 透明且仅覆盖顶部留白，原生窗口按钮仍由标题栏承载。
+/// 原生拖动层穿透网页按钮；命中区域由可见顶栏的实际布局同步。
 @MainActor
 final class WindowDragRegion: NSView {
+    override var isFlipped: Bool { true }
+    var draggableRects: [NSRect] = []
+    var interactiveRects: [NSRect] = []
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local), draggableRects.contains(where: { $0.contains(local) }),
+              !interactiveRects.contains(where: { $0.contains(local) }) else { return nil }
+        return self
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {

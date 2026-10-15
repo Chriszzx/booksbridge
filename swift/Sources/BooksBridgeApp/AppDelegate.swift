@@ -407,6 +407,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handle(_ invocation: WebBridge.Invocation) {
         switch invocation.type {
+        case "setTitlebarHitRegions":
+            func rects(_ key: String) -> [NSRect] {
+                (invocation.payload[key] as? [[String: Double]] ?? []).compactMap { rect in
+                    guard let x = rect["x"], let y = rect["y"], let width = rect["width"], let height = rect["height"],
+                          x.isFinite, y.isFinite, width.isFinite, height.isFinite, width >= 0, height >= 0 else { return nil }
+                    return NSRect(x: x, y: y, width: width, height: height)
+                }
+            }
+            page.setTitlebarHitRegions(draggable: rects("draggable"), interactive: rects("interactive"))
+
         case "ready":
             frontendReady = true
             NSLog("[BooksBridge] 收到前端 ready 指令，开通状态推送")

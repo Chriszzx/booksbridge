@@ -28,12 +28,19 @@ final class PageWindowControllerTests: XCTestCase {
             XCTAssertEqual(dragRegion.frame.height, PageWindowController.dragRegionHeight)
             XCTAssertEqual(dragRegion.frame.width, container.bounds.width)
             XCTAssertFalse(dragRegion.frame.contains(NSPoint(x: 120, y: container.bounds.maxY - 50)))
+            page.setTitlebarHitRegions(
+                draggable: [NSRect(x: 0, y: 0, width: size.width, height: 40)],
+                interactive: [NSRect(x: 300, y: 5, width: 100, height: 30)]
+            )
+            XCTAssertTrue(dragRegion.hitTest(NSPoint(x: 150, y: container.bounds.maxY - 20)) === dragRegion)
+            XCTAssertNil(dragRegion.hitTest(NSPoint(x: 350, y: container.bounds.maxY - 20)))
             for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
                 let control = try XCTUnwrap(window.standardWindowButton(kind))
                 XCTAssertFalse(control.isHidden)
                 let rect = container.convert(control.bounds, from: control)
                 XCTAssertLessThan(rect.maxX, 210)
                 XCTAssertGreaterThanOrEqual(rect.minY, dragRegion.frame.minY)
+                XCTAssertEqual(container.bounds.maxY - rect.midY, 20, accuracy: 1)
             }
         }
     }

@@ -1460,5 +1460,27 @@
   // 离开页面前保存（关窗口时宿主会直接隐藏，这里尽力而为）
   window.addEventListener("beforeunload", collectAndSave);
 
+  // 原生拖动层只接管顶栏空白和标题，保留按钮的点击与悬停。
+  let titlebarSignature = "";
+  function syncTitlebarHitRegions() {
+    const rect = el => {
+      const {x,y,width,height} = el.getBoundingClientRect();
+      return {x,y,width,height};
+    };
+    const visible = el => el.getClientRects().length > 0;
+    const modalOpen = !!document.querySelector('dialog[open]');
+    const payload = {
+      draggable: modalOpen ? [] : [...document.querySelectorAll('.side-head,.topbar')].filter(visible).map(rect),
+      interactive: [...document.querySelectorAll('.topbar button,.topbar select,.topbar input')].filter(visible).map(rect),
+    };
+    const signature = JSON.stringify(payload);
+    if (signature !== titlebarSignature) { titlebarSignature = signature; invoke('setTitlebarHitRegions', payload); }
+  }
+  const titlebarObserver = new ResizeObserver(syncTitlebarHitRegions);
+  document.querySelectorAll('.side-head,.topbar,.topbar button,.topbar .crumb,.reading-status').forEach(el => titlebarObserver.observe(el));
+  const titlebarModalObserver = new MutationObserver(syncTitlebarHitRegions);
+  document.querySelectorAll('dialog').forEach(el => titlebarModalObserver.observe(el, {attributes:true,attributeFilter:['open']}));
+  window.addEventListener('resize', syncTitlebarHitRegions);
+
   invoke("ready");
 })();

@@ -4,6 +4,31 @@ import WebKit
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
+    func testTitlebarDragRegionsFollowControlsAndModalState() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        try await Task.sleep(for: .milliseconds(80))
+        func latestRegions() throws -> [String: Any] {
+            try XCTUnwrap(calls.calls.last { $0["type"] as? String == "setTitlebarHitRegions" }?["payload"] as? [String: Any])
+        }
+        let initial = try latestRegions()
+        XCTAssertEqual((initial["draggable"] as? [[String: Double]])?.count, 2)
+        let controls = try XCTUnwrap(initial["interactive"] as? [[String: Double]])
+        XCTAssertEqual(controls.count, 3)
+        for rect in controls {
+            XCTAssertGreaterThanOrEqual(rect["y"] ?? -1, 0)
+            XCTAssertLessThanOrEqual((rect["y"] ?? 0) + (rect["height"] ?? 0), 40)
+        }
+        _ = try await view.evaluateJavaScript("document.getElementById('summary-status').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 0)
+        _ = try await view.evaluateJavaScript("document.getElementById('reading-panel').close(); document.getElementById('settings-btn').click(); undefined;")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 2)
+        XCTAssertTrue((try latestRegions()["interactive"] as? [[String: Double]])?.isEmpty == true)
+        XCTAssertFalse(calls.calls.contains { ["ask", "retryMessage", "testAPI", "reprocessBook"].contains($0["type"] as? String ?? "") })
+    }
+
     func testMarkdownRenderingAndUnsafeContent() async throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/BooksBridgeApp/WebUI")

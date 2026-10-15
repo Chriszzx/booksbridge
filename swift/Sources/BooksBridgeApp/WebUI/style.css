@@ -986,9 +986,10 @@ button { cursor: pointer; }
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* DSH-style chat proportions: a centered transcript and compact composer controls. */
-:root { --side-w: 248px; --window-drag-height: 28px; --topbar-h: 72px; }
-.side-head { height: var(--topbar-h); padding: var(--window-drag-height) 14px 0; }
-.topbar { padding-top: var(--window-drag-height); border-bottom: 0; }
+:root { --side-w: 248px; --topbar-h: 40px; }
+.side-head { height: var(--topbar-h); padding: 0 10px 0 86px; border-bottom: 1px solid var(--border); }
+.topbar { border-bottom: 1px solid var(--border); }
+.topbar .btn-primary { padding: 3px 8px; font-size: 12px; }
 .thread { padding: 28px 32px; }
 .messages { width: min(100%, 760px); margin: 0 auto; gap: 28px; }
 .msg { width: 100%; }
