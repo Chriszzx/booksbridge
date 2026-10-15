@@ -92,7 +92,6 @@
 
     settingsBtn: $("settings-btn"),
     settingsBadge: $("settings-badge"),
-    hideBtn: $("hide-btn"),
 
     viewChat: $("view-chat"),
     viewSettings: $("view-settings"),
@@ -1250,7 +1249,6 @@
     else showView("chat");
   });
 
-  els.hideBtn.addEventListener("click", () => invoke("hidePage"));
 
   // ---------- 交互：对话 ----------
 
