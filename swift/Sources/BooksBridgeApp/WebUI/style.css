@@ -987,9 +987,16 @@ button { cursor: pointer; }
 
 /* DSH-style chat proportions: a centered transcript and compact composer controls. */
 :root { --side-w: 248px; --topbar-h: 40px; }
-.side-head { height: var(--topbar-h); padding: 0 10px 0 86px; border-bottom: 1px solid var(--border); }
+.side-head { height: var(--topbar-h); padding: 0 40px 0 86px; border-bottom: 1px solid var(--border); }
 .topbar { border-bottom: 1px solid var(--border); }
 .topbar .btn-primary { padding: 3px 8px; font-size: 12px; }
+.sidebar-toggle { position: fixed; top: 6px; left: calc(var(--side-w) - 34px); z-index: 10; width: 28px; height: 28px; border-radius: 6px; color: var(--fg-dim); }
+.sidebar-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+#app.sidebar-collapsed #sidebar { display: none; }
+#app.sidebar-collapsed .sidebar-toggle { left: 86px; }
+#app.sidebar-collapsed .sidebar-toggle path { transform: translateX(20px) scaleX(-1); }
+#app.sidebar-collapsed .topbar { padding-left: 124px; }
+@media (max-width: 800px) { .side-head .brand { font-size: 11px; letter-spacing: -.2px; } }
 .thread { padding: 28px 32px; }
 .messages { width: min(100%, 760px); margin: 0 auto; gap: 28px; }
 .msg { width: 100%; }
@@ -1076,6 +1083,9 @@ button:disabled { cursor: default; opacity: .45; }
 .archive-title { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--fg); text-align: left; overflow-wrap: anywhere; }
 #archives-list h4 { font-size: 12px; color: var(--fg-dim); margin: 18px 0 6px; }
 .book-row { gap: 3px; cursor: grab; }
+.book-disclosure { width: 20px; height: 24px; flex: 0 0 20px; padding: 0; color: var(--fg-dim); border-radius: 5px; }
+.book-disclosure svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; transform: rotate(-90deg); }
+.book-disclosure[aria-expanded="true"] svg { transform: rotate(0); }
 .book-title { flex: 1; min-width: 0; padding: 0; border: 0; background: transparent; color: var(--fg); font-weight: 550; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-action { flex: 0 0 22px; width: 22px; opacity: 0; }
 .book-row:hover .row-action, .conversation-row:hover .row-action, .book-row:focus-within .row-action, .conversation-row:focus-within .row-action { opacity: 1; }

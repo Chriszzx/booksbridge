@@ -21,6 +21,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private var coordinator: ReadingCoordinator!
     /// 用户自己的书库与对话（持久化在 AppPaths.storeFile）。
     private var store: ConversationStore!
+    private let sidebarLayout = SidebarLayoutStore()
     /// 图书 App 的书库数据源，用于回查书名等元数据。
     private let booksStore = BooksStore()
     /// 应用设置（服务商、模型、上下文范围）与 API Key。
@@ -407,6 +408,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handle(_ invocation: WebBridge.Invocation) {
         switch invocation.type {
+        case "setSidebarCollapsed":
+            guard let collapsed = invocation.payload["collapsed"] as? Bool else { return }
+            sidebarLayout.setCollapsed(collapsed)
+            pushState(message: "侧栏显示已保存")
+
+        case "setBookCollapsed":
+            guard let assetID = invocation.payload["assetID"] as? String,
+                  store.state.books.contains(where: { $0.assetID == assetID }),
+                  let collapsed = invocation.payload["collapsed"] as? Bool else { return }
+            sidebarLayout.setBookCollapsed(assetID: assetID, collapsed: collapsed)
+            pushState(message: "对话列表显示已保存")
+
         case "setTitlebarHitRegions":
             func rects(_ key: String) -> [NSRect] {
                 (invocation.payload[key] as? [[String: Double]] ?? []).compactMap { rect in
@@ -1215,7 +1228,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let status = conversation.summaryStatus else { return nil }
             return ["title": book.title + " · " + conversation.title, "status": status]
         } }
-        var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": jobs]
+        var body: [String: Any] = ["message": message, "facts": facts, "preparationJobs": jobs, "sidebarLayout": sidebarLayout.payload]
         body["assistant"] = ["preparation": "本地章节地图 · 摘要按需生成", "ready": false]
         body["readingPosition"] = "尚未取得有效阅读位置"
         body["scopeSummary"] = ""

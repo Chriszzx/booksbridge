@@ -16,7 +16,10 @@
   // ---------- 与宿主通信 ----------
 
   function invoke(type, payload) {
-    if (["openBook", "selectConversation", "newConversation", "restoreConversation"].includes(type)) showView("chat");
+    if (["openBook", "selectConversation", "newConversation", "restoreConversation"].includes(type)) {
+      if (payload?.assetID && collapsedBooks.has(payload.assetID)) setBookCollapsed(payload.assetID, false);
+      showView("chat");
+    }
     const handler = window.webkit?.messageHandlers?.booksbridge;
     if (!handler) {
       console.warn("[booksbridge] 宿主桥未就绪:", type);
@@ -137,10 +140,37 @@
   };
 
   let activeSection = "general";
+  let sidebarCollapsed = false;
+  let collapsedBooks = new Set();
+
+  function renderSidebarLayout() {
+    const toggle = $("sidebar-toggle");
+    const hadSidebarFocus = $("sidebar").contains(document.activeElement);
+    $("app").classList.toggle("sidebar-collapsed", sidebarCollapsed);
+    $("sidebar").inert = sidebarCollapsed;
+    const label = sidebarCollapsed ? "展开侧栏" : "收起侧栏";
+    toggle.setAttribute("aria-expanded", String(!sidebarCollapsed));
+    toggle.setAttribute("aria-label", label); toggle.title = label;
+    if (sidebarCollapsed && hadSidebarFocus) toggle.focus({preventScroll:true});
+    syncTitlebarHitRegions();
+  }
+
+  $("sidebar-toggle").addEventListener("click", () => {
+    sidebarCollapsed = !sidebarCollapsed;
+    closeMenus(); hideCommands(); renderSidebarLayout();
+    invoke("setSidebarCollapsed", {collapsed:sidebarCollapsed});
+  });
+
+  function setBookCollapsed(assetID, collapsed) {
+    if (collapsed) collapsedBooks.add(assetID); else collapsedBooks.delete(assetID);
+    renderLibrary();
+    invoke("setBookCollapsed", {assetID,collapsed});
+  }
 
   // ---------- 渲染：侧栏 ----------
 
   function renderSidebar() {
+    renderSidebarLayout();
     renderNowReading();
     renderLibrary();
     renderSettingsBadge();
@@ -324,9 +354,10 @@
     showMenu(menu, anchor); menu.querySelector("button:not(:disabled)")?.focus();
   }
   function renderLibrary() {
-    const signature = JSON.stringify([state.library, state.active?.assetID, state.active?.conversationID]);
+    const signature = JSON.stringify([state.library, state.active?.assetID, state.active?.conversationID, [...collapsedBooks].sort()]);
     if (signature === librarySignature || draggingBook) return;
     librarySignature = signature;
+    const focusedBook = document.activeElement?.closest('.book-disclosure')?.dataset.assetId;
     const list = els.libraryList; list.replaceChildren();
     els.libraryEmpty.hidden = state.library.length > 0;
     for (const [index, book] of state.library.entries()) {
@@ -334,6 +365,14 @@
       group.dataset.assetId = book.assetID;
       const bookRow = document.createElement("div"); bookRow.className = "book-row";
       bookRow.draggable = true; bookRow.title = "拖动调整书籍顺序";
+      const collapsed = collapsedBooks.has(book.assetID);
+      const disclosure = button("", "icon-btn book-disclosure", () => setBookCollapsed(book.assetID, !collapsed));
+      disclosure.innerHTML = '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg>';
+      disclosure.dataset.assetId = book.assetID;
+      disclosure.setAttribute("aria-expanded", String(!collapsed));
+      disclosure.setAttribute("aria-controls", `book-conversations-${index}`);
+      disclosure.setAttribute("aria-label", `${collapsed ? "展开" : "折叠"}《${book.title}》的对话`);
+      disclosure.title = collapsed ? "展开对话" : "折叠对话";
       const title = button(book.title, "book-title", () => invoke("openBook", {assetID: book.assetID}));
       title.title = book.title;
       const add = button("＋", "icon-btn row-action", () => invoke("newConversation", {assetID: book.assetID}));
@@ -343,7 +382,7 @@
         {label:"下移", disabled:index === state.library.length - 1, run:() => moveRelative(book.assetID, 1)},
       ]));
       more.setAttribute("aria-label", `移动《${book.title}》`); more.setAttribute("aria-haspopup", "menu");
-      bookRow.append(title, add, more);
+      bookRow.append(disclosure, title, add, more);
       bookRow.addEventListener("dragstart", e => {
         draggingBook = book.assetID; e.dataTransfer.setData("text/plain", book.assetID); e.dataTransfer.effectAllowed = "move";
         group.classList.add("dragging"); closeMenus();
@@ -365,6 +404,7 @@
         invoke("moveBook", {assetID, beforeAssetID: after ? state.library[index + 1]?.assetID ?? null : book.assetID});
       });
       const convList = document.createElement("div"); convList.className = "conv-list";
+      convList.id = `book-conversations-${index}`; convList.hidden = collapsed;
       for (const conversation of book.conversations.filter(c => !c.archived)) {
         const wrap = document.createElement("div"); wrap.className = "conversation-row";
         const row = button(conversation.title, "conv-row", () => invoke("selectConversation", {assetID:book.assetID, conversationID:conversation.id}));
@@ -381,6 +421,7 @@
       }
       group.append(bookRow, convList); list.append(group);
     }
+    if (focusedBook && !sidebarCollapsed) [...list.querySelectorAll('.book-disclosure')].find(el => el.dataset.assetId === focusedBook)?.focus({preventScroll:true});
     renderArchives();
   }
   function renderArchives() {
@@ -1045,6 +1086,10 @@
   // 按 payload 里出现了哪些字段来决定更新什么。
   window.booksbridge = {
     onState(payload) {
+      if (payload.sidebarLayout) {
+        sidebarCollapsed = payload.sidebarLayout.collapsed === true;
+        collapsedBooks = new Set(Array.isArray(payload.sidebarLayout.collapsedBooks) ? payload.sidebarLayout.collapsedBooks : []);
+      }
       // --- 阅读状态 ---
       if (payload.detected !== undefined) state.detected = payload.detected;
       if (Array.isArray(payload.library)) state.library = payload.library;
@@ -1471,13 +1516,13 @@
     const modalOpen = !!document.querySelector('dialog[open]');
     const payload = {
       draggable: modalOpen ? [] : [...document.querySelectorAll('.side-head,.topbar')].filter(visible).map(rect),
-      interactive: [...document.querySelectorAll('.topbar button,.topbar select,.topbar input')].filter(visible).map(rect),
+      interactive: [...document.querySelectorAll('#sidebar-toggle,.topbar button,.topbar select,.topbar input')].filter(visible).map(rect),
     };
     const signature = JSON.stringify(payload);
     if (signature !== titlebarSignature) { titlebarSignature = signature; invoke('setTitlebarHitRegions', payload); }
   }
   const titlebarObserver = new ResizeObserver(syncTitlebarHitRegions);
-  document.querySelectorAll('.side-head,.topbar,.topbar button,.topbar .crumb,.reading-status').forEach(el => titlebarObserver.observe(el));
+  document.querySelectorAll('#sidebar-toggle,.side-head,.topbar,.topbar button,.topbar .crumb,.reading-status').forEach(el => titlebarObserver.observe(el));
   const titlebarModalObserver = new MutationObserver(syncTitlebarHitRegions);
   document.querySelectorAll('dialog').forEach(el => titlebarModalObserver.observe(el, {attributes:true,attributeFilter:['open']}));
   window.addEventListener('resize', syncTitlebarHitRegions);

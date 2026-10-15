@@ -14,7 +14,7 @@ final class WebRenderingTests: XCTestCase {
         let initial = try latestRegions()
         XCTAssertEqual((initial["draggable"] as? [[String: Double]])?.count, 2)
         let controls = try XCTUnwrap(initial["interactive"] as? [[String: Double]])
-        XCTAssertEqual(controls.count, 3)
+        XCTAssertEqual(controls.count, 4)
         for rect in controls {
             XCTAssertGreaterThanOrEqual(rect["y"] ?? -1, 0)
             XCTAssertLessThanOrEqual((rect["y"] ?? 0) + (rect["height"] ?? 0), 40)
@@ -25,7 +25,7 @@ final class WebRenderingTests: XCTestCase {
         _ = try await view.evaluateJavaScript("document.getElementById('reading-panel').close(); document.getElementById('settings-btn').click(); undefined;")
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 2)
-        XCTAssertTrue((try latestRegions()["interactive"] as? [[String: Double]])?.isEmpty == true)
+        XCTAssertEqual((try latestRegions()["interactive"] as? [[String: Double]])?.count, 1)
         XCTAssertFalse(calls.calls.contains { ["ask", "retryMessage", "testAPI", "reprocessBook"].contains($0["type"] as? String ?? "") })
     }
 
@@ -173,6 +173,79 @@ extension WebRenderingTests {
 }
 
 extension WebRenderingTests {
+    func testSidebarAndBookFoldingPreservesChatAndRestoresLayout() async throws {
+        let suite = "BooksBridge.FoldingUI.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let layout = SidebarLayoutStore(defaults: defaults)
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        calls.onCall = { call in
+            let payload = call["payload"] as? [String: Any] ?? [:]
+            if call["type"] as? String == "setSidebarCollapsed", let collapsed = payload["collapsed"] as? Bool {
+                layout.setCollapsed(collapsed)
+            }
+            if call["type"] as? String == "setBookCollapsed", let id = payload["assetID"] as? String, let collapsed = payload["collapsed"] as? Bool {
+                layout.setBookCollapsed(assetID: id, collapsed: collapsed)
+            }
+        }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const group = id => [...document.querySelectorAll('.book-group')].find(el => el.dataset.assetId === id);
+          const message = document.querySelector('.msg');
+          document.getElementById('input').value = '尚未发送的草稿';
+          group('A').querySelector('.book-disclosure').click();
+          const folded = group('A').querySelector('.conv-list').hidden && group('A').querySelector('.book-disclosure').getAttribute('aria-expanded') === 'false';
+          const independent = !group('B').querySelector('.conv-list').hidden;
+          booksbridge.onState({library:fixtureBooks,readingPosition:'第一章 · 21%'});
+          const survivesRefresh = group('A').querySelector('.conv-list').hidden;
+          document.getElementById('sidebar-toggle').click();
+          return {folded,independent,survivesRefresh,
+            chat:message === document.querySelector('.msg') && document.querySelector('.msg').textContent.includes('已有回答'),
+            draft:document.getElementById('input').value === '尚未发送的草稿',
+            collapsed:document.getElementById('sidebar').inert && document.getElementById('sidebar-toggle').getAttribute('aria-expanded') === 'false'};
+        })()
+        """) as! [String: Any]
+        for (key, value) in result { XCTAssertEqual(value as? Bool, true, key) }
+        for size in [CGSize(width:720,height:460), CGSize(width:1440,height:900)] {
+            view.frame.size = size
+            try await Task.sleep(for: .milliseconds(50))
+            let fits = try await view.evaluateJavaScript("""
+            (() => {
+              const toggle = document.getElementById('sidebar-toggle').getBoundingClientRect();
+              const main = document.getElementById('main').getBoundingClientRect();
+              const composer = document.querySelector('.composer').getBoundingClientRect();
+              return main.left === 0 && toggle.left >= 80 && toggle.right < innerWidth && composer.left >= 0 && composer.right <= innerWidth;
+            })()
+            """) as? Bool
+            XCTAssertEqual(fits, true)
+        }
+        XCTAssertTrue(layout.isCollapsed)
+        XCTAssertEqual(layout.collapsedBooks, ["A"])
+        let (restored, restoredCalls) = try await workspaceFixture()
+        defer { restored.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let data = try JSONSerialization.data(withJSONObject: ["sidebarLayout": SidebarLayoutStore(defaults: defaults).payload])
+        _ = try await restored.evaluateJavaScript("booksbridge.onState(\(String(decoding:data,as:UTF8.self))); undefined;")
+        let restoredState = try await restored.evaluateJavaScript("""
+        (() => {
+          const folded = document.querySelector('.conv-list').hidden;
+          const collapsed = document.getElementById('app').classList.contains('sidebar-collapsed');
+          document.getElementById('sidebar-toggle').click();
+          const reopened = !document.getElementById('sidebar').inert && document.querySelector('.conv-list').hidden;
+          document.querySelector('.book-disclosure').click();
+          const expanded = !document.querySelector('.conv-list').hidden;
+          document.querySelector('.book-disclosure').click();
+          document.querySelector('.book-row .row-action').click();
+          return folded && collapsed && reopened && expanded && !document.querySelector('.conv-list').hidden;
+        })()
+        """) as? Bool
+        XCTAssertEqual(restoredState, true)
+        try await Task.sleep(for: .milliseconds(50))
+        for log in [calls.calls, restoredCalls.calls] {
+            XCTAssertFalse(log.contains { ["ask", "retryMessage", "testAPI", "reprocessBook", "archiveConversation"].contains($0["type"] as? String ?? "") })
+        }
+    }
+
     private func workspaceFixture() async throws -> (WKWebView, UIInvocations) {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/BooksBridgeApp/WebUI")
