@@ -136,7 +136,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         bridge.onInvocation = { [weak self] invocation in
             self?.handle(invocation)
         }
-        page.window?.contentView = bridge.webView
+        page.installContentView(bridge.webView)
         if bridge.load() {
             NSLog("[BooksBridge] 前端资源已加载")
         } else {

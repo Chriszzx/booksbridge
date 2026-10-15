@@ -4,7 +4,7 @@ import Foundation
 /// 页面窗口。
 ///
 /// 两种模式：
-/// - **窗口化（windowed，默认）**：标准 macOS 窗口，有标题栏与红黄绿按钮，
+/// - **窗口化（windowed，默认）**：内容延伸到透明标题栏，保留原生红黄绿按钮，
 ///   可拖动、可缩放、可最小化。用 `visibleFrame` 居中摆放，不与菜单栏/Dock 重叠。
 /// - **全屏（fullscreen）**：原生 macOS 全屏空间。
 ///
@@ -31,6 +31,8 @@ public final class PageWindowController: NSWindowController {
     private let mode: Mode
     /// 记住用户调整过的窗口大小，下次打开沿用。
     private var lastWindowedFrame: NSRect?
+    /// 与 WebUI 的 --window-drag-height 一致；这条区域只承载原生窗口操作。
+    static let dragRegionHeight: CGFloat = 28
 
     public init(mode: Mode) {
         self.mode = mode
@@ -43,9 +45,10 @@ public final class PageWindowController: NSWindowController {
         )
 
         window.title = "BooksBridge"
-        // 有可见标题栏：用户能拖、能缩、能关，也清楚这是个普通窗口
-        window.titlebarAppearsTransparent = false
-        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = false
         window.collectionBehavior = [.fullScreenPrimary, .canJoinAllSpaces]
         // 防止被压到布局塌陷的尺寸
         window.contentMinSize = NSSize(width: 720, height: 460)
@@ -60,6 +63,29 @@ public final class PageWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) 未实现")
+    }
+
+    /// 网页背景覆盖整个窗口，顶部空白区域由 AppKit 处理拖动。
+    /// 不把整个 WKWebView 设为可拖动，以免干扰文字选择与输入。
+    public func installContentView(_ content: NSView) {
+        guard let window else { return }
+        let container = NSView(frame: window.contentView?.bounds ?? .zero)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(content)
+        let dragRegion = WindowDragRegion()
+        dragRegion.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(dragRegion)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            content.topAnchor.constraint(equalTo: container.topAnchor),
+            content.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            dragRegion.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            dragRegion.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            dragRegion.topAnchor.constraint(equalTo: container.topAnchor),
+            dragRegion.heightAnchor.constraint(equalToConstant: Self.dragRegionHeight),
+        ])
+        window.contentView = container
     }
 
     // MARK: - 尺寸
@@ -167,11 +193,28 @@ public final class PageWindowController: NSWindowController {
         模式=\(mode.rawValue) 可见=\(window.isVisible) 全屏=\(window.styleMask.contains(.fullScreen))
         窗口 frame  = \(Int(frame.width))×\(Int(frame.height)) @ (\(Int(frame.origin.x)),\(Int(frame.origin.y)))
         屏幕可见区  = \(Int(visible.width))×\(Int(visible.height)) @ (\(Int(visible.origin.x)),\(Int(visible.origin.y)))
-        标题栏      = \(window.styleMask.contains(.titled) ? "有（标准窗口）" : "无（无边框）")
+        标题栏      = 一体式（保留原生窗口按钮）
         可缩放      = \(window.styleMask.contains(.resizable) ? "是" : "否")
         完全在屏内  = \(inside ? "是" : "否")
         最小尺寸    = \(Int(window.contentMinSize.width))×\(Int(window.contentMinSize.height))
         """
     }
 
+}
+
+/// 透明且仅覆盖顶部留白，原生窗口按钮仍由标题栏承载。
+@MainActor
+final class WindowDragRegion: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        if event.clickCount == 2 {
+            let action = UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick")
+            if action == "Minimize" { window.performMiniaturize(nil) }
+            else if action != "None" { window.performZoom(nil) }
+        } else {
+            window.performDrag(with: event)
+        }
+    }
 }
