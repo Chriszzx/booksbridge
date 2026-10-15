@@ -142,12 +142,26 @@
   let activeSection = "general";
   let sidebarCollapsed = false;
   let collapsedBooks = new Set();
+  const sidebarDefaultWidth = 248, sidebarMinWidth = 210, sidebarMaxWidth = 480, chatMinWidth = 440;
+  let sidebarPreferredWidth = sidebarDefaultWidth;
+  let sidebarResize = null;
+  const sidebarResizer = $("sidebar-resizer");
+
+  function sidebarWidthLimit() { return Math.max(sidebarMinWidth, Math.min(sidebarMaxWidth, Math.floor(innerWidth - chatMinWidth))); }
+  function applySidebarWidth() {
+    const width = Math.round(Math.max(sidebarMinWidth, Math.min(sidebarWidthLimit(), sidebarPreferredWidth)));
+    document.documentElement.style.setProperty("--side-w", `${width}px`);
+    sidebarResizer.setAttribute("aria-valuemax", String(sidebarWidthLimit()));
+    sidebarResizer.setAttribute("aria-valuenow", String(width));
+    sidebarResizer.setAttribute("aria-valuetext", `${width} 像素`);
+  }
 
   function renderSidebarLayout() {
     const toggle = $("sidebar-toggle");
     const hadSidebarFocus = $("sidebar").contains(document.activeElement);
     $("app").classList.toggle("sidebar-collapsed", sidebarCollapsed);
     $("sidebar").inert = sidebarCollapsed;
+    applySidebarWidth();
     const label = sidebarCollapsed ? "展开侧栏" : "收起侧栏";
     toggle.setAttribute("aria-expanded", String(!sidebarCollapsed));
     toggle.setAttribute("aria-label", label); toggle.title = label;
@@ -155,7 +169,58 @@
     syncTitlebarHitRegions();
   }
 
+  function saveSidebarWidth(width) {
+    sidebarPreferredWidth = Math.round(Math.max(sidebarMinWidth, Math.min(sidebarWidthLimit(), width)));
+    applySidebarWidth(); syncTitlebarHitRegions();
+    invoke("setSidebarWidth", {width:sidebarPreferredWidth});
+  }
+
+  function finishSidebarResize(cancelled = false) {
+    if (!sidebarResize) return;
+    const {pointerId, originalWidth, moved} = sidebarResize;
+    sidebarResize = null;
+    $("app").classList.remove("sidebar-resizing");
+    if (sidebarResizer.hasPointerCapture(pointerId)) sidebarResizer.releasePointerCapture(pointerId);
+    if (cancelled) sidebarPreferredWidth = originalWidth;
+    applySidebarWidth(); syncTitlebarHitRegions();
+    if (!cancelled && moved) invoke("setSidebarWidth", {width:sidebarPreferredWidth});
+  }
+
+  sidebarResizer.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || sidebarCollapsed || document.querySelector('dialog[open]')) return;
+    event.preventDefault(); closeMenus(); hideCommands();
+    sidebarResize = {pointerId:event.pointerId, startX:event.clientX, startWidth:$("sidebar").getBoundingClientRect().width, originalWidth:sidebarPreferredWidth, moved:false};
+    $("app").classList.add("sidebar-resizing");
+    sidebarResizer.focus({preventScroll:true});
+    // Window listeners also cover engines or interrupted gestures without pointer capture.
+    try { sidebarResizer.setPointerCapture(event.pointerId); } catch (_) {}
+  });
+  window.addEventListener("pointermove", event => {
+    if (!sidebarResize || event.pointerId !== sidebarResize.pointerId) return;
+    const delta = event.clientX - sidebarResize.startX;
+    if (!sidebarResize.moved && Math.abs(delta) < 1) return;
+    sidebarResize.moved = true;
+    sidebarPreferredWidth = Math.round(Math.max(sidebarMinWidth, Math.min(sidebarWidthLimit(), sidebarResize.startWidth + delta)));
+    applySidebarWidth(); syncTitlebarHitRegions();
+  });
+  window.addEventListener("pointerup", event => { if (event.pointerId === sidebarResize?.pointerId) finishSidebarResize(); });
+  window.addEventListener("pointercancel", event => { if (event.pointerId === sidebarResize?.pointerId) finishSidebarResize(true); });
+  sidebarResizer.addEventListener("lostpointercapture", () => finishSidebarResize(true));
+  window.addEventListener("blur", () => finishSidebarResize(true));
+  window.addEventListener("resize", () => { finishSidebarResize(true); applySidebarWidth(); syncTitlebarHitRegions(); });
+  window.addEventListener("keydown", event => {
+    if (sidebarResize && event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation(); finishSidebarResize(true); }
+  }, true);
+  sidebarResizer.addEventListener("dblclick", () => saveSidebarWidth(sidebarDefaultWidth));
+  sidebarResizer.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const width = Number(sidebarResizer.getAttribute("aria-valuenow"));
+    saveSidebarWidth(event.key === "Home" ? sidebarMinWidth : event.key === "End" ? sidebarWidthLimit() : width + (event.key === "ArrowLeft" ? -10 : 10));
+  });
+
   $("sidebar-toggle").addEventListener("click", () => {
+    finishSidebarResize(true);
     sidebarCollapsed = !sidebarCollapsed;
     closeMenus(); hideCommands(); renderSidebarLayout();
     invoke("setSidebarCollapsed", {collapsed:sidebarCollapsed});
@@ -1087,8 +1152,9 @@
   window.booksbridge = {
     onState(payload) {
       if (payload.sidebarLayout) {
-        sidebarCollapsed = payload.sidebarLayout.collapsed === true;
-        collapsedBooks = new Set(Array.isArray(payload.sidebarLayout.collapsedBooks) ? payload.sidebarLayout.collapsedBooks : []);
+        if (typeof payload.sidebarLayout.collapsed === "boolean") sidebarCollapsed = payload.sidebarLayout.collapsed;
+        if (Array.isArray(payload.sidebarLayout.collapsedBooks)) collapsedBooks = new Set(payload.sidebarLayout.collapsedBooks);
+        if (!sidebarResize && Number.isFinite(payload.sidebarLayout.width)) sidebarPreferredWidth = Math.round(Math.max(sidebarMinWidth, Math.min(sidebarMaxWidth, payload.sidebarLayout.width)));
       }
       // --- 阅读状态 ---
       if (payload.detected !== undefined) state.detected = payload.detected;
@@ -1510,13 +1576,13 @@
   function syncTitlebarHitRegions() {
     const rect = el => {
       const {x,y,width,height} = el.getBoundingClientRect();
-      return {x,y,width,height};
+      return {x,y,width,height:Math.min(height, parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--topbar-h')))};
     };
     const visible = el => el.getClientRects().length > 0;
     const modalOpen = !!document.querySelector('dialog[open]');
     const payload = {
       draggable: modalOpen ? [] : [...document.querySelectorAll('.side-head,.topbar')].filter(visible).map(rect),
-      interactive: [...document.querySelectorAll('#sidebar-toggle,.topbar button,.topbar select,.topbar input')].filter(visible).map(rect),
+      interactive: [...document.querySelectorAll('#sidebar-toggle,#sidebar-resizer,.topbar button,.topbar select,.topbar input')].filter(visible).map(rect),
     };
     const signature = JSON.stringify(payload);
     if (signature !== titlebarSignature) { titlebarSignature = signature; invoke('setTitlebarHitRegions', payload); }

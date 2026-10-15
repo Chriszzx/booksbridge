@@ -4,6 +4,69 @@ import WebKit
 
 @MainActor
 final class WebRenderingTests: XCTestCase {
+    func testSidebarResizeCommitCancelAndViewportClamping() async throws {
+        let (view, calls) = try await workspaceFixture()
+        defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
+        let result = try await view.evaluateJavaScript("""
+        (() => {
+          const handle = document.getElementById('sidebar-resizer');
+          const width = () => document.getElementById('sidebar').getBoundingClientRect().width;
+          const pointer = (type,x) => (type === 'pointerdown' ? handle : window).dispatchEvent(new PointerEvent(type,{pointerId:7,clientX:x,button:0,buttons:type === 'pointerup' ? 0 : 1,bubbles:true}));
+          booksbridge.onState({sidebarLayout:{width:300}});
+          const message = document.querySelector('.msg');
+          document.getElementById('input').value = '调整宽度时的草稿';
+          pointer('pointerdown',300); pointer('pointermove',370);
+          booksbridge.onState({sidebarLayout:{width:300},readingPosition:'第一章 · 21%'});
+          const live = width() === 370;
+          pointer('pointerup',370);
+          pointer('pointerdown',370); pointer('pointermove',430);
+          window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',cancelable:true}));
+          const cancelled = width() === 370 && !document.getElementById('app').classList.contains('sidebar-resizing');
+          pointer('pointerdown',370); pointer('pointermove',450); pointer('pointercancel',450);
+          const pointerCancelled = width() === 370;
+          pointer('pointerdown',370); pointer('pointermove',10000); pointer('pointerup',10000);
+          return {live,cancelled,pointerCancelled,maximum:width() === 480,
+            chat:document.querySelector('.msg') === message,
+            draft:document.getElementById('input').value === '调整宽度时的草稿'};
+        })()
+        """) as! [String: Any]
+        for (key, value) in result { XCTAssertEqual(value as? Bool, true, key) }
+        view.frame.size = CGSize(width:720,height:460)
+        try await Task.sleep(for: .milliseconds(60))
+        let narrow = try await view.evaluateJavaScript("""
+        (() => {
+          const main = document.getElementById('main').getBoundingClientRect();
+          const composer = document.querySelector('.composer').getBoundingClientRect();
+          return document.getElementById('sidebar').getBoundingClientRect().width === 280 && main.width >= 440 && composer.right <= innerWidth;
+        })()
+        """) as? Bool
+        XCTAssertEqual(narrow, true)
+        view.frame.size = CGSize(width:1000,height:700)
+        try await Task.sleep(for: .milliseconds(60))
+        let restored = try await view.evaluateJavaScript("document.getElementById('sidebar').getBoundingClientRect().width") as? Double
+        XCTAssertEqual(restored, 480)
+        let widths = calls.calls.filter { $0["type"] as? String == "setSidebarWidth" }.compactMap { ($0["payload"] as? [String: Any])?["width"] as? Double }
+        XCTAssertEqual(widths, [370,480])
+        let controls = try await view.evaluateJavaScript("""
+        (() => {
+          const handle = document.getElementById('sidebar-resizer');
+          document.getElementById('sidebar-toggle').click();
+          const hidden = handle.getClientRects().length === 0;
+          document.getElementById('sidebar-toggle').click();
+          const preserved = document.getElementById('sidebar').getBoundingClientRect().width === 480;
+          handle.dispatchEvent(new KeyboardEvent('keydown',{key:'Home',cancelable:true}));
+          const minimum = handle.getAttribute('aria-valuenow') === '210';
+          handle.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',cancelable:true}));
+          const keyboard = handle.getAttribute('aria-valuenow') === '220';
+          handle.dispatchEvent(new MouseEvent('dblclick'));
+          return hidden && preserved && minimum && keyboard && handle.getAttribute('aria-valuenow') === '248';
+        })()
+        """) as? Bool
+        XCTAssertEqual(controls, true)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(calls.calls.contains { ["ask", "retryMessage", "testAPI", "reprocessBook", "returnToReader"].contains($0["type"] as? String ?? "") })
+    }
+
     func testTitlebarDragRegionsFollowControlsAndModalState() async throws {
         let (view, calls) = try await workspaceFixture()
         defer { view.configuration.userContentController.removeScriptMessageHandler(forName: "booksbridge") }
@@ -14,7 +77,7 @@ final class WebRenderingTests: XCTestCase {
         let initial = try latestRegions()
         XCTAssertEqual((initial["draggable"] as? [[String: Double]])?.count, 2)
         let controls = try XCTUnwrap(initial["interactive"] as? [[String: Double]])
-        XCTAssertEqual(controls.count, 4)
+        XCTAssertEqual(controls.count, 5)
         for rect in controls {
             XCTAssertGreaterThanOrEqual(rect["y"] ?? -1, 0)
             XCTAssertLessThanOrEqual((rect["y"] ?? 0) + (rect["height"] ?? 0), 40)
@@ -25,7 +88,7 @@ final class WebRenderingTests: XCTestCase {
         _ = try await view.evaluateJavaScript("document.getElementById('reading-panel').close(); document.getElementById('settings-btn').click(); undefined;")
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual((try latestRegions()["draggable"] as? [[String: Double]])?.count, 2)
-        XCTAssertEqual((try latestRegions()["interactive"] as? [[String: Double]])?.count, 1)
+        XCTAssertEqual((try latestRegions()["interactive"] as? [[String: Double]])?.count, 2)
         XCTAssertFalse(calls.calls.contains { ["ask", "retryMessage", "testAPI", "reprocessBook"].contains($0["type"] as? String ?? "") })
     }
 

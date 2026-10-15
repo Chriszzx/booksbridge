@@ -408,6 +408,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handle(_ invocation: WebBridge.Invocation) {
         switch invocation.type {
+        case "setSidebarWidth":
+            guard let width = invocation.payload["width"] as? Double, width.isFinite else { return }
+            sidebarLayout.setWidth(width)
+            pushState(message: "侧栏宽度已保存")
+
         case "setSidebarCollapsed":
             guard let collapsed = invocation.payload["collapsed"] as? Bool else { return }
             sidebarLayout.setCollapsed(collapsed)

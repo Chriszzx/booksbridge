@@ -992,7 +992,12 @@ button { cursor: pointer; }
 .topbar .btn-primary { padding: 3px 8px; font-size: 12px; }
 .sidebar-toggle { position: fixed; top: 6px; left: calc(var(--side-w) - 34px); z-index: 10; width: 28px; height: 28px; border-radius: 6px; color: var(--fg-dim); }
 .sidebar-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.sidebar-resizer { position: fixed; left: var(--side-w); top: 0; bottom: 0; width: 8px; margin-left: -4px; z-index: 12; cursor: col-resize; touch-action: none; }
+.sidebar-resizer::after { content: ""; position: absolute; left: 3px; top: 0; bottom: 0; width: 2px; background: var(--accent); opacity: 0; transition: opacity .12s; }
+.sidebar-resizer:hover::after, .sidebar-resizer:focus-visible::after, #app.sidebar-resizing .sidebar-resizer::after { opacity: .65; }
+#app.sidebar-resizing, #app.sidebar-resizing * { cursor: col-resize !important; user-select: none !important; -webkit-user-select: none !important; }
 #app.sidebar-collapsed #sidebar { display: none; }
+#app.sidebar-collapsed .sidebar-resizer { display: none; }
 #app.sidebar-collapsed .sidebar-toggle { left: 86px; }
 #app.sidebar-collapsed .sidebar-toggle path { transform: translateX(20px) scaleX(-1); }
 #app.sidebar-collapsed .topbar { padding-left: 124px; }
@@ -1025,7 +1030,7 @@ button { cursor: pointer; }
 dialog { max-width: 440px; border: 1px solid var(--border); border-radius: 16px; padding: 24px; background: var(--bg); color: var(--fg); }
 dialog::backdrop { background: #0005; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
-@media (max-width: 800px) { :root { --side-w: 210px; } .composer-model { max-width: 100px; } .thread { padding: 18px; } }
+@media (max-width: 800px) { .composer-model { max-width: 100px; } .thread { padding: 18px; } }
 
 #preparation-jobs { white-space: pre-line; max-height: 160px; overflow-y: auto; }
 
